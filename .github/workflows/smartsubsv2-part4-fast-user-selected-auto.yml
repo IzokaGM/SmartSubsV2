@@ -1,0 +1,626 @@
+name: SmartSubsV2 Part 4 - Fast User Selected Auto
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smartsubsv2-part4-fast-user-selected-auto
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout SmartSubsV2
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify Part 3.1 baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f src/translator.js
+          test -f src/cloudflare-worker.mjs
+          test -f wrangler.jsonc
+          test -f package-lock.json
+
+          grep -Fq "Math.min(3, explicitConcurrency)" src/translator.js
+          grep -Fq "function queueTranslationProfile(env, attempts = 1)" src/cloudflare-worker.mjs
+          grep -Fq "function queueTranslationOptions(env, attempts = 1)" src/cloudflare-worker.mjs
+          grep -Fq "player-translation-queued" src/cloudflare-worker.mjs
+          grep -Fq "queueProfile" src/cloudflare-worker.mjs || true
+          grep -Fq '"QUEUE_FINAL_CONCURRENCY": "3"' wrangler.jsonc
+
+      - name: Apply isolated fast user-selected profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          import json
+
+          # translator.js
+          translator_path = Path("src/translator.js")
+          translator = translator_path.read_text()
+
+          old_explicit = """  const concurrency = Number.isFinite(explicitConcurrency) && explicitConcurrency > 0
+              ? Math.max(1, Math.min(3, explicitConcurrency))
+              : configuredConcurrency"""
+
+          new_explicit = """  const concurrency = Number.isFinite(explicitConcurrency) && explicitConcurrency > 0
+              ? Math.max(1, Math.min(4, explicitConcurrency))
+              : configuredConcurrency"""
+
+          if "Math.min(4, explicitConcurrency)" not in translator:
+              if old_explicit not in translator:
+                  raise SystemExit("translator explicit concurrency guard failed")
+              translator = translator.replace(old_explicit, new_explicit, 1)
+
+          translator_path.write_text(translator)
+
+          # cloudflare-worker.mjs
+          worker_path = Path("src/cloudflare-worker.mjs")
+          worker = worker_path.read_text()
+
+          # Separate user-selected profile from background Queue profiles.
+          profile_anchor = "function queueTranslationProfile(env, attempts = 1) {"
+          profile_new = """function normaliseRequestedQueueProfile(value) {
+            return String(value || '') === 'user-selected-fast'
+              ? 'user-selected-fast'
+              : ''
+          }
+
+          function queueTranslationProfile(env, attempts = 1, requestedProfile = '') {
+            const attempt = Math.max(1, Number(attempts || 1))
+            const requested = normaliseRequestedQueueProfile(requestedProfile)
+            if (attempt === 1 && requested === 'user-selected-fast') return 'user-selected-fast'"""
+
+          if "function normaliseRequestedQueueProfile(" not in worker:
+              if profile_anchor not in worker:
+                  raise SystemExit("queueTranslationProfile anchor failed")
+              worker = worker.replace(profile_anchor, profile_new, 1)
+              # The old function now has a duplicate opening line removed by the replacement.
+              old_body_start = """  if (queueFinalEnabled(env, attempts)) return 'quota-safe-final'
+            if (queueParallelEnabled(env, attempts)) return 'parallel-3'
+            return Math.max(1, Number(attempts || 1)) > 1 ? 'fallback-stable' : 'm16-compatible'
+          }"""
+              new_body = """  if (queueFinalEnabled(env, attempts)) return 'quota-safe-final'
+            if (queueParallelEnabled(env, attempts)) return 'parallel-3'
+            return attempt > 1 ? 'fallback-stable' : 'm16-compatible'
+          }"""
+              if old_body_start not in worker:
+                  raise SystemExit("queueTranslationProfile body guard failed")
+              worker = worker.replace(old_body_start, new_body, 1)
+
+          options_anchor = "function queueTranslationOptions(env, attempts = 1) {"
+          options_new = """function queueTranslationOptions(env, attempts = 1, requestedProfile = '') {
+            const retryAttempt = Math.max(1, Number(attempts || 1))
+            const requested = normaliseRequestedQueueProfile(requestedProfile)
+
+            if (retryAttempt === 1 && requested === 'user-selected-fast') {
+              return {
+                maxItems: Math.max(140, Math.min(200, Number(env.QUEUE_USER_SELECTED_CHUNK_ITEMS || 160))),
+                maxChars: Math.max(16000, Math.min(24000, Number(env.QUEUE_USER_SELECTED_CHUNK_CHARS || 20000))),
+                concurrency: Math.max(1, Math.min(4, Number(env.QUEUE_USER_SELECTED_CONCURRENCY || 4)))
+              }
+            }"""
+
+          if "QUEUE_USER_SELECTED_CONCURRENCY" not in worker:
+              if options_anchor not in worker:
+                  raise SystemExit("queueTranslationOptions anchor failed")
+              worker = worker.replace(options_anchor, options_new, 1)
+              duplicate_retry = "  const retryAttempt = Math.max(1, Number(attempts || 1))\n"
+              first = worker.find(options_new)
+              duplicate_pos = worker.find(duplicate_retry, first + len(options_new))
+              if duplicate_pos >= 0:
+                  worker = worker[:duplicate_pos] + worker[duplicate_pos + len(duplicate_retry):]
+
+          # enqueuePrefetchTranslation now carries only a known safe requested profile.
+          enqueue_anchor = """  const translationToken = parseAutoTranslationToken(autoUrl)
+            const cacheKey = String(options.cacheKey || '')"""
+
+          enqueue_new = """  const translationToken = parseAutoTranslationToken(autoUrl)
+            const cacheKey = String(options.cacheKey || '')
+            const requestedProfile = normaliseRequestedQueueProfile(options.queueProfile)"""
+
+          if "const requestedProfile = normaliseRequestedQueueProfile(options.queueProfile)" not in worker:
+              if enqueue_anchor not in worker:
+                  raise SystemExit("enqueue profile guard failed")
+              worker = worker.replace(enqueue_anchor, enqueue_new, 1)
+
+          send_anchor = """      cacheKey: validTranslationCacheKey(cacheKey) ? cacheKey : '',
+                queuedAt: Date.now()"""
+
+          send_new = """      cacheKey: validTranslationCacheKey(cacheKey) ? cacheKey : '',
+                profile: requestedProfile,
+                queuedAt: Date.now()"""
+
+          if "profile: requestedProfile" not in worker:
+              if send_anchor not in worker:
+                  raise SystemExit("Queue message profile guard failed")
+              worker = worker.replace(send_anchor, send_new, 1)
+
+          diagnostic_anchor = """    await diagnosticFn(env.SMARTSUBS_CACHE, configId, {
+                event: 'queue-enqueued',
+                status: 'queued'
+              }).catch(() => {})"""
+
+          diagnostic_new = """    await diagnosticFn(env.SMARTSUBS_CACHE, configId, {
+                event: 'queue-enqueued',
+                status: 'queued',
+                profile: requestedProfile || 'background-default'
+              }).catch(() => {})"""
+
+          if "profile: requestedProfile || 'background-default'" not in worker:
+              if diagnostic_anchor not in worker:
+                  raise SystemExit("queue-enqueued diagnostic guard failed")
+              worker = worker.replace(diagnostic_anchor, diagnostic_new, 1)
+
+          # Queue consumer selects the profile from the message only on first attempt.
+          consumer_anchor = """  const queuedAt = Number(payload.queuedAt || 0)
+            const queueDelayMs = queuedAt > 0 ? Math.max(0, roundMs(epochNowFn() - queuedAt)) : 0
+            const queueProfile = queueTranslationOptions(env, attempts)
+            const queueProfileName = queueTranslationProfile(env, attempts)"""
+
+          consumer_new = """  const queuedAt = Number(payload.queuedAt || 0)
+            const queueDelayMs = queuedAt > 0 ? Math.max(0, roundMs(epochNowFn() - queuedAt)) : 0
+            const requestedProfile = normaliseRequestedQueueProfile(payload.profile)
+            const queueProfile = queueTranslationOptions(env, attempts, requestedProfile)
+            const queueProfileName = queueTranslationProfile(env, attempts, requestedProfile)"""
+
+          if "const requestedProfile = normaliseRequestedQueueProfile(payload.profile)" not in worker:
+              if consumer_anchor not in worker:
+                  raise SystemExit("Queue consumer profile guard failed")
+              worker = worker.replace(consumer_anchor, consumer_new, 1)
+
+          # Only the Queue created by an actual translated VTT request uses the fast profile.
+          selected_anchor = """          configToken: token,
+                    configId,
+                    cacheKey
+                  })"""
+
+          selected_new = """          configToken: token,
+                    configId,
+                    cacheKey,
+                    queueProfile: 'user-selected-fast'
+                  })"""
+
+          selected_route_pos = worker.find("const translationMatch =")
+          selected_enqueue_pos = worker.find("const queued = await enqueuePrefetchTranslation({", selected_route_pos)
+          if selected_enqueue_pos < 0:
+              raise SystemExit("Selected Auto enqueue anchor failed")
+
+          selected_block_end = worker.find("        })", selected_enqueue_pos)
+          selected_block = worker[selected_enqueue_pos:selected_block_end + len("        })")]
+
+          if "queueProfile: 'user-selected-fast'" not in selected_block:
+              local_anchor_pos = worker.find(selected_anchor, selected_enqueue_pos, selected_block_end + len("        })"))
+              if local_anchor_pos < 0:
+                  raise SystemExit("Selected Auto enqueue arguments guard failed")
+              worker = worker[:local_anchor_pos] + worker[local_anchor_pos:].replace(selected_anchor, selected_new, 1)
+
+          # Export profile helpers for focused tests.
+          export_anchor = "queueTranslationOptions, translationCacheKey"
+          if "normaliseRequestedQueueProfile, queueTranslationProfile, queueTranslationOptions" not in worker:
+              if export_anchor not in worker:
+                  raise SystemExit("Worker export guard failed")
+              worker = worker.replace(
+                  export_anchor,
+                  "normaliseRequestedQueueProfile, queueTranslationProfile, queueTranslationOptions, translationCacheKey",
+                  1
+              )
+
+          worker_path.write_text(worker)
+
+          # wrangler.jsonc
+          wrangler_path = Path("wrangler.jsonc")
+          config = json.loads(wrangler_path.read_text())
+
+          vars_ = config.setdefault("vars", {})
+          vars_["QUEUE_USER_SELECTED_CHUNK_ITEMS"] = "160"
+          vars_["QUEUE_USER_SELECTED_CHUNK_CHARS"] = "20000"
+          vars_["QUEUE_USER_SELECTED_CONCURRENCY"] = "4"
+
+          wrangler_path.write_text(json.dumps(config, indent=2) + "\n")
+          PY
+
+      - name: Add Part 4 regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > test/v2-part4-fast-user-selected-auto.test.js <<'TEST'
+          'use strict'
+
+          const test = require('node:test')
+          const assert = require('node:assert/strict')
+          const fs = require('node:fs')
+          const { translateCues } = require('../src/translator')
+          const { createTranslationToken } = require('../src/token')
+          const { createUserConfigToken } = require('../src/user-config')
+
+          function cue(i) {
+            return {
+              time: `00:00:${String(i % 60).padStart(2, '0')}.000 --> 00:00:59.000`,
+              text: `line-${i}`
+            }
+          }
+
+          test('Part 4 explicit translation profile can run four chunks concurrently', async () => {
+            const cues = Array.from({ length: 653 }, (_, i) => cue(i))
+            let active = 0
+            let maxActive = 0
+            let calls = 0
+            let stats
+
+            const output = await translateCues(cues, {
+              maxItems: 160,
+              maxChars: 20000,
+              concurrency: 4,
+              translateTextsFn: async (texts, options) => {
+                calls++
+                active++
+                maxActive = Math.max(maxActive, active)
+                await new Promise(resolve => setTimeout(resolve, 4))
+                active--
+                await options.onTranslationStats({
+                  expected: texts.length,
+                  received: texts.length,
+                  missing: 0,
+                  retryRecovered: 0,
+                  fallbackCount: 0,
+                  final: texts.length,
+                  semanticRetriesUsed: 0
+                })
+                return texts.map(text => `BM:${text}`)
+              },
+              onTranslationStats: value => {
+                stats = value
+              }
+            })
+
+            assert.equal(calls, 5)
+            assert.equal(maxActive, 4)
+            assert.equal(output.length, 653)
+            assert.equal(stats.chunks, 5)
+            assert.equal(stats.concurrency, 4)
+            assert.equal(stats.chunkItems, 160)
+            assert.equal(stats.chunkChars, 20000)
+          })
+
+          test('Part 4 user-selected Queue gets fast profile only on first attempt', async () => {
+            const {
+              queueTranslationOptions,
+              queueTranslationProfile
+            } = await import('../src/cloudflare-worker.mjs')
+
+            const env = {
+              QUEUE_USER_SELECTED_CHUNK_ITEMS: '160',
+              QUEUE_USER_SELECTED_CHUNK_CHARS: '20000',
+              QUEUE_USER_SELECTED_CONCURRENCY: '4',
+              QUEUE_FINAL_CHUNK_ITEMS: '160',
+              QUEUE_FINAL_CHUNK_CHARS: '20000',
+              QUEUE_FINAL_CONCURRENCY: '3',
+              QUEUE_FALLBACK_CHUNK_ITEMS: '180',
+              QUEUE_FALLBACK_CHUNK_CHARS: '24000',
+              QUEUE_FALLBACK_CONCURRENCY: '2'
+            }
+
+            assert.equal(
+              queueTranslationProfile(env, 1, 'user-selected-fast'),
+              'user-selected-fast'
+            )
+            assert.deepEqual(
+              queueTranslationOptions(env, 1, 'user-selected-fast'),
+              { maxItems: 160, maxChars: 20000, concurrency: 4 }
+            )
+
+            assert.equal(
+              queueTranslationProfile(env, 2, 'user-selected-fast'),
+              'fallback-stable'
+            )
+            assert.deepEqual(
+              queueTranslationOptions(env, 2, 'user-selected-fast'),
+              { maxItems: 180, maxChars: 24000, concurrency: 2 }
+            )
+          })
+
+          test('Part 4 background Queue profile remains unchanged', async () => {
+            const {
+              queueTranslationOptions,
+              queueTranslationProfile
+            } = await import('../src/cloudflare-worker.mjs')
+
+            const env = {
+              QUEUE_FINAL_CHUNK_ITEMS: '160',
+              QUEUE_FINAL_CHUNK_CHARS: '20000',
+              QUEUE_FINAL_CONCURRENCY: '3',
+              QUEUE_FALLBACK_CHUNK_ITEMS: '180',
+              QUEUE_FALLBACK_CHUNK_CHARS: '24000',
+              QUEUE_FALLBACK_CONCURRENCY: '2'
+            }
+
+            assert.equal(queueTranslationProfile(env, 1), 'quota-safe-final')
+            assert.deepEqual(
+              queueTranslationOptions(env, 1),
+              { maxItems: 160, maxChars: 20000, concurrency: 3 }
+            )
+          })
+
+          test('Part 4 enqueue serialises only the approved user-selected profile', async () => {
+            const { enqueuePrefetchTranslation } = await import('../src/cloudflare-worker.mjs')
+
+            const secret = 'part4-secret'
+            const configToken = createUserConfigToken('A'.repeat(32), {
+              secret,
+              model: 'gemini-test'
+            })
+            const translationToken = createTranslationToken(
+              'https://example.test/source.srt',
+              secret,
+              'part4-source'
+            )
+
+            let sent = null
+            const ok = await enqueuePrefetchTranslation({
+              autoUrl: `https://smartsubsv2.example/c/x/translated/${translationToken}.vtt`,
+              env: {
+                SMARTSUBS_TRANSLATION_QUEUE: {
+                  async send(body) {
+                    sent = body
+                  }
+                }
+              },
+              configToken,
+              configId: 'part4-config',
+              cacheKey: '',
+              queueProfile: 'user-selected-fast',
+              diagnosticFn: async () => true
+            })
+
+            assert.equal(ok, true)
+            assert.equal(sent.profile, 'user-selected-fast')
+          })
+
+          test('Part 4 Queue consumer exposes fast profile in Diagnose and translation options', async () => {
+            const { processQueueMessage } = await import('../src/cloudflare-worker.mjs')
+
+            const secret = 'part4-consumer-secret'
+            const configToken = createUserConfigToken('B'.repeat(32), {
+              secret,
+              model: 'gemini-test'
+            })
+            const translationToken = createTranslationToken(
+              'https://example.test/source.srt',
+              secret,
+              'part4-consumer-source'
+            )
+
+            const events = []
+            let translateOptions = null
+
+            await processQueueMessage({
+              v: 1,
+              configToken,
+              translationToken,
+              configId: 'part4-consumer',
+              profile: 'user-selected-fast'
+            }, {
+              SMARTSUBS_SECRET: secret,
+              SMARTSUBS_CACHE: {},
+              SMARTSUBS_CACHE_VERSION: 'part4',
+              QUEUE_USER_SELECTED_CHUNK_ITEMS: '160',
+              QUEUE_USER_SELECTED_CHUNK_CHARS: '20000',
+              QUEUE_USER_SELECTED_CONCURRENCY: '4',
+              QUEUE_FALLBACK_CHUNK_ITEMS: '180',
+              QUEUE_FALLBACK_CHUNK_CHARS: '24000',
+              QUEUE_FALLBACK_CONCURRENCY: '2'
+            }, {
+              attempts: 1,
+              diagnosticFn: async (_kv, _configId, event) => {
+                events.push(event)
+                return true
+              },
+              getOrTranslateFn: async options => {
+                translateOptions = options.translateOptions
+                return {
+                  vtt: 'WEBVTT\n',
+                  cacheKey: 'a'.repeat(64),
+                  status: 'MISS',
+                  translationStats: {
+                    expected: 653,
+                    received: 653,
+                    missing: 0,
+                    retryRecovered: 0,
+                    fallbackCount: 0,
+                    final: 653,
+                    semanticRetriesUsed: 0,
+                    chunks: 5,
+                    geminiCalls: 5,
+                    rateLimits: 0,
+                    transientRetries: 0,
+                    retryWaitMs: 0,
+                    chunkItems: options.translateOptions.maxItems,
+                    chunkChars: options.translateOptions.maxChars,
+                    concurrency: options.translateOptions.concurrency
+                  }
+                }
+              }
+            })
+
+            assert.deepEqual(
+              translateOptions,
+              { maxItems: 160, maxChars: 20000, concurrency: 4 }
+            )
+
+            const started = events.find(event => event.event === 'queue-translation-start')
+            const completed = events.find(event => event.event === 'queue-translation-complete')
+
+            assert.equal(started.profile, 'user-selected-fast')
+            assert.equal(started.concurrency, 4)
+            assert.equal(completed.profile, 'user-selected-fast')
+            assert.equal(completed.concurrency, 4)
+          })
+
+          test('Part 4 selected translated route explicitly requests fast profile', () => {
+            const source = fs.readFileSync('src/cloudflare-worker.mjs', 'utf8')
+            const routeStart = source.indexOf("const translationMatch =")
+            const routeEnd = source.indexOf("if (request.method === 'GET')", routeStart)
+            const route = source.slice(routeStart, routeEnd)
+
+            assert.match(route, /queueProfile: 'user-selected-fast'/)
+          })
+
+          test('Part 4 Wrangler keeps background profile and adds isolated fast profile', () => {
+            const config = JSON.parse(fs.readFileSync('wrangler.jsonc', 'utf8'))
+
+            assert.equal(config.vars.QUEUE_FINAL_CONCURRENCY, '3')
+            assert.equal(config.vars.QUEUE_USER_SELECTED_CHUNK_ITEMS, '160')
+            assert.equal(config.vars.QUEUE_USER_SELECTED_CHUNK_CHARS, '20000')
+            assert.equal(config.vars.QUEUE_USER_SELECTED_CONCURRENCY, '4')
+            assert.equal(config.queues.consumers[0].max_concurrency, 1)
+          })
+          TEST
+
+      - name: Add Part 4 notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs
+          cat > docs/V2_PART4_FAST_USER_SELECTED_AUTO.md <<'DOC'
+          # SmartSubsV2 Part 4: Fast User Selected Auto
+
+          Part 4 speeds up only the translation that the user explicitly asks for.
+
+          ## Why
+
+          The Part 3.1 live test completed 653 cues correctly, but the Queue translation took
+          about 27.8 seconds. The translation used five chunks with concurrency 3.
+
+          Part 4 keeps the same 160 cue and 20,000 character chunk profile, but lets the
+          user-selected Queue run up to four chunks concurrently.
+
+          ## Isolation
+
+          Background and no-native pretranslation remain on the existing quota-safe-final
+          profile with concurrency 3.
+
+          Only the Queue job created from a real translated VTT request carries:
+
+          `profile = user-selected-fast`
+
+          First attempt:
+
+          - chunkItems 160
+          - chunkChars 20000
+          - concurrency 4
+
+          If Cloudflare Queue retries the job after a transient failure or Gemini pressure,
+          the same message automatically uses the existing fallback-stable profile:
+
+          - chunkItems 180
+          - chunkChars 24000
+          - concurrency 2
+
+          ## Quota behaviour
+
+          Part 3 quota protection remains unchanged.
+
+          Weak native Malay does not trigger Gemini in the background. The fast profile is
+          used only after the user selects Malay Auto.
+
+          The number of normal chunks is not intentionally increased. For the 653 cue live
+          sample, the plan remains five chunks. Part 4 changes parallelism, not the amount of
+          subtitle content translated.
+
+          ## Diagnose
+
+          Existing Queue diagnostics already preserve `profile`, `chunkItems`, `chunkChars`,
+          `concurrency`, Gemini call counts, statuses, prompt sizes, wall time, retries and
+          failures.
+
+          A successful Part 4 live run should show:
+
+          - profile=user-selected-fast
+          - concurrency=4
+          - chunks around the same count as before
+          - rateLimits=0 ideally
+          - lower translationWallMs than the Part 3.1 baseline
+
+          All Malaysia time and raw diagnostic events remain unchanged.
+          DOC
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Focused Part 4 tests
+        run: node --test test/v2-part4-fast-user-selected-auto.test.js
+
+      - name: Full regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run check
+          npm test
+          git diff --check
+
+      - name: Verify patch scope and safety
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          grep -Fq "Math.min(4, explicitConcurrency)" src/translator.js
+          grep -Fq "user-selected-fast" src/cloudflare-worker.mjs
+          grep -Fq "QUEUE_USER_SELECTED_CONCURRENCY" src/cloudflare-worker.mjs
+          grep -Fq "queueProfile: 'user-selected-fast'" src/cloudflare-worker.mjs
+          grep -Fq '"QUEUE_USER_SELECTED_CONCURRENCY": "4"' wrangler.jsonc
+          grep -Fq '"QUEUE_FINAL_CONCURRENCY": "3"' wrangler.jsonc
+          grep -Fq "Raw recent events" src/cloudflare-worker.mjs
+          grep -Fq "Malaysia time (MYT, Asia/Kuala_Lumpur)" src/cloudflare-worker.mjs
+
+          unexpected="$(
+            git status --porcelain |
+            awk '{print $2}' |
+            grep -Ev '^(src/translator\.js|src/cloudflare-worker\.mjs|wrangler\.jsonc|test/v2-part4-fast-user-selected-auto\.test\.js|docs/V2_PART4_FAST_USER_SELECTED_AUTO\.md)$' || true
+          )"
+
+          if [[ -n "$unexpected" ]]; then
+            echo "Unexpected files changed:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+      - name: Commit verified Part 4
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            src/translator.js \
+            src/cloudflare-worker.mjs \
+            wrangler.jsonc \
+            test/v2-part4-fast-user-selected-auto.test.js \
+            docs/V2_PART4_FAST_USER_SELECTED_AUTO.md
+
+          if git diff --cached --quiet; then
+            echo "Part 4 is already applied."
+            exit 0
+          fi
+
+          git commit -m "Speed up user-selected Malay Auto"
+          git push origin HEAD:main
