@@ -1,0 +1,486 @@
+name: SmartSubsV2 Part 3.1 - Selected Auto Queue Fix v2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smartsubsv2-part3-1-selected-auto-queue-v2
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout SmartSubsV2
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify exact current Part 3 baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f src/cloudflare-worker.mjs
+          test -f src/diagnostics.js
+          test -f package-lock.json
+
+          grep -Fq "function queueJoinMaxMs" src/cloudflare-worker.mjs
+          grep -Fq "function queueJoinPollMs" src/cloudflare-worker.mjs
+          grep -Fq "const translationMatch =" src/cloudflare-worker.mjs
+          grep -Fq "const cached = await cache.get(cacheKey).catch(() => null)" src/cloudflare-worker.mjs
+          grep -Fq "const totalMs = roundMs(nowMs() - startedAt)" src/cloudflare-worker.mjs
+          grep -Fq "auto-prefetch-skipped" src/cloudflare-worker.mjs
+          grep -Fq "function shouldPrefetchAutoResult" src/cloudflare-worker.mjs
+
+      - name: Apply durable selected Auto Queue path
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          worker_path = Path("src/cloudflare-worker.mjs")
+          text = worker_path.read_text()
+
+          # 1. Add a short, bounded player wait plus a retryable response.
+          poll_anchor = """function queueJoinPollMs(env) {
+            return Math.max(500, Math.min(5000, Number(env.QUEUE_JOIN_POLL_MS || 1500)))
+          }
+          """
+
+          poll_replacement = """function queueJoinPollMs(env) {
+            return Math.max(500, Math.min(5000, Number(env.QUEUE_JOIN_POLL_MS || 1500)))
+          }
+
+          function playerQueueWaitMaxMs(env) {
+            return Math.max(2000, Math.min(10000, Number(env.PLAYER_QUEUE_WAIT_MAX_MS || 5000)))
+          }
+
+          function translationPreparingResponse() {
+            return send(
+              503,
+              'text/plain; charset=utf-8',
+              'Malay translation is being prepared. Retry shortly.',
+              {
+                noStore: true,
+                headers: {
+                  'retry-after': '3',
+                  'x-smartsubs-error': 'translation-preparing',
+                  'x-smartsubs-build': BUILD_ID
+                }
+              }
+            )
+          }
+          """
+
+          if "function playerQueueWaitMaxMs(" not in text:
+              if poll_anchor not in text:
+                  raise SystemExit("queueJoinPollMs anchor failed")
+              text = text.replace(poll_anchor, poll_replacement, 1)
+
+          # 2. Replace only the translated-route cache and generation core.
+          route_marker = "  const translationMatch = request.method === 'GET' && suffix.match(/^\\/translated\\/([A-Za-z0-9_.-]+)\\.vtt$/)"
+          route_pos = text.find(route_marker)
+          if route_pos < 0:
+              raise SystemExit("translated route marker failed")
+
+          core_start_marker = "      const cached = await cache.get(cacheKey).catch(() => null)"
+          core_end_marker = "      const totalMs = roundMs(nowMs() - startedAt)"
+
+          core_start = text.find(core_start_marker, route_pos)
+          core_end = text.find(core_end_marker, core_start)
+
+          if core_start < 0 or core_end < 0 or core_end <= core_start:
+              raise SystemExit("translated route core markers failed")
+
+          new_core = """      const cached = await cache.get(cacheKey).catch(() => null)
+                if (cached) {
+                  result = {
+                    vtt: cached,
+                    cacheKey,
+                    status: 'HIT',
+                    translationStats: null
+                  }
+                  joinStatus = 'cache-hit'
+                } else {
+                  const job = await readQueueJobState(env, cacheKey)
+                  if (queueJobActive(job)) {
+                    await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+                      event: 'queue-join-start',
+                      status: job.state
+                    }).catch(() => {})
+
+                    const joined = await waitForQueueCache({
+                      env,
+                      cache,
+                      cacheKey,
+                      initialJob: job,
+                      maxWaitMs: playerQueueWaitMaxMs(env)
+                    })
+
+                    joinWaitMs = joined.waitMs
+                    joinPolls = joined.polls
+                    joinStatus = joined.outcome
+
+                    if (joined.vtt) {
+                      result = {
+                        vtt: joined.vtt,
+                        cacheKey,
+                        status: 'QUEUE_JOIN',
+                        translationStats: null
+                      }
+                      await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+                        event: 'queue-join-hit',
+                        status: joined.jobStatus,
+                        waitMs: joinWaitMs,
+                        polls: joinPolls
+                      }).catch(() => {})
+                    } else if (joined.outcome !== 'failed') {
+                      await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+                        event: 'translation-pending',
+                        status: joined.jobStatus,
+                        waitMs: joinWaitMs,
+                        polls: joinPolls,
+                        reason: joined.outcome
+                      }).catch(() => {})
+
+                      return translationPreparingResponse()
+                    }
+                  }
+                }
+
+                if (!result) {
+                  if (!await rateLimitAllowed(env.SMARTSUBS_GENERATE_LIMITER, `generate:${configId}`)) {
+                    return rateLimitedResponse('translation generation')
+                  }
+
+                  const queued = await enqueuePrefetchTranslation({
+                    autoUrl: request.url,
+                    env,
+                    configToken: token,
+                    configId,
+                    cacheKey
+                  })
+
+                  if (queued) {
+                    await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+                      event: 'player-translation-queued',
+                      status: 'queued'
+                    }).catch(() => {})
+
+                    const joined = await waitForQueueCache({
+                      env,
+                      cache,
+                      cacheKey,
+                      maxWaitMs: playerQueueWaitMaxMs(env)
+                    })
+
+                    joinWaitMs = joined.waitMs
+                    joinPolls = joined.polls
+                    joinStatus = joined.outcome === 'hit'
+                      ? 'player-queue-hit'
+                      : `player-queue-${joined.outcome}`
+
+                    if (joined.vtt) {
+                      result = {
+                        vtt: joined.vtt,
+                        cacheKey,
+                        status: 'QUEUE_JOIN',
+                        translationStats: null
+                      }
+                    } else if (joined.outcome !== 'failed') {
+                      await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+                        event: 'translation-pending',
+                        status: joined.jobStatus || 'queued',
+                        waitMs: joinWaitMs,
+                        polls: joinPolls,
+                        reason: joined.outcome
+                      }).catch(() => {})
+
+                      return translationPreparingResponse()
+                    }
+                  }
+
+                  if (!result) {
+                    joinStatus = joinStatus || 'direct-fallback'
+                    result = await cfGetOrTranslate({
+                      cache,
+                      upstreamUrl: tokenData.url,
+                      sourceId: tokenData.cacheId,
+                      model: userConfig.model,
+                      apiKey: userConfig.apiKey,
+                      cacheVersion: cacheVersion(env)
+                    })
+                  }
+                }
+          """
+
+          text = text[:core_start] + new_core + text[core_end:]
+
+          # 3. Friendly Diagnose status for Queue preparation.
+          map_anchor = """    TRANSLATION_REQUESTED_WAITING_FOR_RESULT: ['Translation requested', 'warn', 'The player requested Malay Auto and SmartSubsV2 is waiting for the result.'],"""
+          map_replacement = """    TRANSLATION_REQUESTED_WAITING_FOR_RESULT: ['Translation requested', 'warn', 'The player requested Malay Auto and SmartSubsV2 is waiting for the result.'],
+              TRANSLATION_PREPARING_IN_QUEUE: ['Translation preparing', 'warn', 'Malay Auto is translating safely in Cloudflare Queue. Retry or select Malay Auto again shortly.'],"""
+
+          if "TRANSLATION_PREPARING_IN_QUEUE:" not in text:
+              if map_anchor not in text:
+                  raise SystemExit("Friendly Diagnose verdict map anchor failed")
+              text = text.replace(map_anchor, map_replacement, 1)
+
+          # Keep the machine verdict discoverable in the collapsed reference.
+          ref_anchor = "<span><code>QUEUE_JOIN_WAITING</code></span>"
+          if "TRANSLATION_PREPARING_IN_QUEUE</code>" not in text:
+              if ref_anchor not in text:
+                  raise SystemExit("Verdict reference anchor failed")
+              text = text.replace(
+                  ref_anchor,
+                  ref_anchor + "<span><code>TRANSLATION_PREPARING_IN_QUEUE</code></span>",
+                  1
+              )
+
+          # 4. Export helpers for focused regression tests.
+          export_anchor = "rateLimitAllowed, rateLimitedResponse, publicReady, shouldPrefetchAutoResult }"
+          export_replacement = "rateLimitAllowed, rateLimitedResponse, publicReady, shouldPrefetchAutoResult, playerQueueWaitMaxMs, translationPreparingResponse }"
+
+          if "translationPreparingResponse }" not in text:
+              if export_anchor not in text:
+                  raise SystemExit("Worker export anchor failed")
+              text = text.replace(export_anchor, export_replacement, 1)
+
+          worker_path.write_text(text)
+
+          # 5. Diagnose verdict should prefer the durable Queue preparation state.
+          diag_path = Path("src/diagnostics.js")
+          diag = diag_path.read_text()
+
+          request_anchor = """  const lastTranslationRequest = rows.find(
+              item => item.event === 'translation-request' && item.status !== 'prefetch'
+            )"""
+
+          if "const lastTranslationPending" not in diag:
+              if request_anchor not in diag:
+                  raise SystemExit("Diagnostics translation request anchor failed")
+              diag = diag.replace(
+                  request_anchor,
+                  request_anchor + """
+            const lastTranslationPending = rows.find(item => item.event === 'translation-pending')
+            const lastPlayerTranslationQueued = rows.find(item => item.event === 'player-translation-queued')""",
+                  1
+              )
+
+          verdict_anchor = """  if (lastQueueJoinStart && Number(lastQueueJoinStart.ts) >= Number(lastSubtitle.ts)) return 'QUEUE_JOIN_WAITING'
+            if (lastTranslationRequest && Number(lastTranslationRequest.ts) >= Number(lastSubtitle.ts)) return 'TRANSLATION_REQUESTED_WAITING_FOR_RESULT'"""
+
+          verdict_replacement = """  if (lastTranslationPending && Number(lastTranslationPending.ts) >= Number(lastSubtitle.ts)) return 'TRANSLATION_PREPARING_IN_QUEUE'
+            if (lastPlayerTranslationQueued && Number(lastPlayerTranslationQueued.ts) >= Number(lastSubtitle.ts)) return 'TRANSLATION_PREPARING_IN_QUEUE'
+            if (lastQueueJoinStart && Number(lastQueueJoinStart.ts) >= Number(lastSubtitle.ts)) return 'QUEUE_JOIN_WAITING'
+            if (lastTranslationRequest && Number(lastTranslationRequest.ts) >= Number(lastSubtitle.ts)) return 'TRANSLATION_REQUESTED_WAITING_FOR_RESULT'"""
+
+          if "return 'TRANSLATION_PREPARING_IN_QUEUE'" not in diag:
+              if verdict_anchor not in diag:
+                  raise SystemExit("Diagnostics verdict anchor failed")
+              diag = diag.replace(verdict_anchor, verdict_replacement, 1)
+
+          diag_path.write_text(diag)
+          PY
+
+      - name: Add Part 3.1 regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > test/v2-part3-1-selected-auto-queue-v2.test.js <<'TEST'
+          'use strict'
+
+          const test = require('node:test')
+          const assert = require('node:assert/strict')
+          const fs = require('node:fs')
+          const { deriveVerdict } = require('../src/diagnostics')
+
+          test('Part 3.1 uses a short bounded player Queue wait', async () => {
+            const { playerQueueWaitMaxMs } = await import('../src/cloudflare-worker.mjs')
+
+            assert.equal(playerQueueWaitMaxMs({}), 5000)
+            assert.equal(playerQueueWaitMaxMs({ PLAYER_QUEUE_WAIT_MAX_MS: 100 }), 2000)
+            assert.equal(playerQueueWaitMaxMs({ PLAYER_QUEUE_WAIT_MAX_MS: 60000 }), 10000)
+          })
+
+          test('Part 3.1 returns a retryable preparing response instead of hanging', async () => {
+            const { translationPreparingResponse } = await import('../src/cloudflare-worker.mjs')
+            const response = translationPreparingResponse()
+
+            assert.equal(response.status, 503)
+            assert.equal(response.headers.get('retry-after'), '3')
+            assert.equal(response.headers.get('x-smartsubs-error'), 'translation-preparing')
+            assert.match(await response.text(), /being prepared/i)
+          })
+
+          test('Part 3.1 translated route queues before synchronous fallback', () => {
+            const source = fs.readFileSync('src/cloudflare-worker.mjs', 'utf8')
+            const routeStart = source.indexOf("const translationMatch =")
+            const routeEnd = source.indexOf("if (request.method === 'GET')", routeStart)
+            const route = source.slice(routeStart, routeEnd)
+
+            assert.match(route, /player-translation-queued/)
+            assert.match(route, /enqueuePrefetchTranslation/)
+            assert.match(route, /playerQueueWaitMaxMs/)
+            assert.match(route, /translationPreparingResponse/)
+            assert.match(route, /direct-fallback/)
+
+            const queuePos = route.indexOf('enqueuePrefetchTranslation')
+            const directPos = route.indexOf('result = await cfGetOrTranslate')
+            assert.ok(queuePos >= 0)
+            assert.ok(directPos > queuePos)
+          })
+
+          test('Part 3.1 existing Queue joins also use the short player wait', () => {
+            const source = fs.readFileSync('src/cloudflare-worker.mjs', 'utf8')
+
+            assert.match(
+              source,
+              /initialJob: job,\s*maxWaitMs: playerQueueWaitMaxMs\(env\)/
+            )
+          })
+
+          test('Part 3.1 Diagnose reports durable Queue preparation', () => {
+            const now = Date.now()
+            const verdict = deriveVerdict([
+              {
+                ts: now,
+                event: 'subtitle-result',
+                result: 'native-malay-with-auto-fallback',
+                subtitleCount: 2,
+                autoReady: true
+              },
+              {
+                ts: now + 1,
+                event: 'translation-request',
+                status: 'player'
+              },
+              {
+                ts: now + 2,
+                event: 'player-translation-queued',
+                status: 'queued'
+              },
+              {
+                ts: now + 3,
+                event: 'translation-pending',
+                status: 'running',
+                reason: 'timeout'
+              }
+            ])
+
+            assert.equal(verdict, 'TRANSLATION_PREPARING_IN_QUEUE')
+          })
+          TEST
+
+      - name: Add Part 3.1 notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs
+          cat > docs/V2_PART3_1_SELECTED_AUTO_QUEUE_V2.md <<'DOC'
+          # SmartSubsV2 Part 3.1: Selected Auto Queue Fix v2
+
+          The live Part 3 test proved quota protection works, but selecting Malay Auto could
+          leave the player waiting on a long synchronous Gemini request.
+
+          Part 3.1 changes only the selected Malay Auto delivery path.
+
+          ## New flow
+
+          1. Check cache.
+          2. If an existing Queue job is active, wait up to 5 seconds.
+          3. If no job exists, selecting Malay Auto starts one deduplicated Queue job.
+          4. Wait up to 5 seconds for a fast Queue result.
+          5. If still translating, return HTTP 503 with Retry-After 3.
+          6. The Cloudflare Queue continues independently.
+          7. A later player retry or manual re-selection receives the cached VTT.
+          8. Synchronous Gemini remains only as a last-resort fallback when Queue cannot run
+             or a Queue job fails.
+
+          This preserves the Part 3 quota rule. Weak native Malay does not trigger Gemini in
+          the background. Gemini starts only after Malay Auto is selected.
+
+          Diagnose adds:
+
+          - player-translation-queued
+          - translation-pending
+          - TRANSLATION_PREPARING_IN_QUEUE
+
+          All previous Malaysia time, source selection, Queue, cache, Gemini timing, retry,
+          failure, verdict-reference and raw-event diagnostics remain available.
+          DOC
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Focused Part 3.1 tests
+        run: node --test test/v2-part3-1-selected-auto-queue-v2.test.js
+
+      - name: Full regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run check
+          npm test
+          git diff --check
+
+      - name: Verify patch scope and Diagnose preservation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          grep -Fq "function playerQueueWaitMaxMs" src/cloudflare-worker.mjs
+          grep -Fq "function translationPreparingResponse" src/cloudflare-worker.mjs
+          grep -Fq "player-translation-queued" src/cloudflare-worker.mjs
+          grep -Fq "translation-pending" src/cloudflare-worker.mjs
+          grep -Fq "TRANSLATION_PREPARING_IN_QUEUE" src/cloudflare-worker.mjs
+          grep -Fq "Malaysia time (MYT, Asia/Kuala_Lumpur)" src/cloudflare-worker.mjs
+          grep -Fq "Verdict reference" src/cloudflare-worker.mjs
+          grep -Fq "Raw recent events" src/cloudflare-worker.mjs
+
+          unexpected="$(
+            git status --porcelain |
+            awk '{print $2}' |
+            grep -Ev '^(src/cloudflare-worker\.mjs|src/diagnostics\.js|test/v2-part3-1-selected-auto-queue-v2\.test\.js|docs/V2_PART3_1_SELECTED_AUTO_QUEUE_V2\.md)$' || true
+          )"
+
+          if [[ -n "$unexpected" ]]; then
+            echo "Unexpected files changed:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+      - name: Commit verified Part 3.1
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            src/cloudflare-worker.mjs \
+            src/diagnostics.js \
+            test/v2-part3-1-selected-auto-queue-v2.test.js \
+            docs/V2_PART3_1_SELECTED_AUTO_QUEUE_V2.md
+
+          if git diff --cached --quiet; then
+            echo "Part 3.1 v2 is already applied."
+            exit 0
+          fi
+
+          git commit -m "Queue selected Malay Auto translation"
+          git push origin HEAD:main
