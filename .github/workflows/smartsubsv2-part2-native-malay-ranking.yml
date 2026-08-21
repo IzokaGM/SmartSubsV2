@@ -1,0 +1,458 @@
+name: SmartSubsV2 Part 2 - Native Malay Ranking
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smartsubsv2-part2-native-malay-ranking
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout SmartSubsV2
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify Part 1A baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f src/selector.js
+          test -f src/subtitles.js
+          test -f src/diagnostics.js
+          test -f package-lock.json
+          grep -Fq "function rankEnglishSubtitles" src/selector.js
+          grep -Fq "function englishSelectionDiagnostics" src/subtitles.js
+          grep -Fq "'englishSelectedId'" src/diagnostics.js
+
+      - name: Apply native Malay ranking and diagnose patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          # 1. selector.js: reuse the proven English release scoring for Malay candidates.
+          selector_path = Path("src/selector.js")
+          selector = selector_path.read_text()
+
+          old_import = "const { getEnglishSubtitles } = require('./languages')"
+          new_import = "const { getEnglishSubtitles, getMalaySubtitles } = require('./languages')"
+          if old_import in selector:
+              selector = selector.replace(old_import, new_import, 1)
+          elif new_import not in selector:
+              raise SystemExit("selector.js language import guard failed")
+
+          anchor = "function selectBestEnglish(subtitles, context = {}) {"
+          addition = """function scoreMalaySubtitle(subtitle, index = 0, context = {}) {
+            return scoreEnglishSubtitle(subtitle, index, context)
+          }
+
+          function rankMalaySubtitles(subtitles, context = {}) {
+            return getMalaySubtitles(subtitles)
+              .map((subtitle, index) => ({
+                subtitle,
+                score: scoreMalaySubtitle(subtitle, index, context)
+              }))
+              .sort((a, b) => b.score - a.score)
+          }
+
+          function selectBestMalay(subtitles, context = {}) {
+            return rankMalaySubtitles(subtitles, context)[0]?.subtitle || null
+          }
+
+          """
+          if "function rankMalaySubtitles(" not in selector:
+              if anchor not in selector:
+                  raise SystemExit("selector.js selectBestEnglish anchor failed")
+              selector = selector.replace(anchor, addition + anchor, 1)
+
+          old_exports = """  rankEnglishSubtitles,
+            selectBestEnglish
+          }"""
+          new_exports = """  rankEnglishSubtitles,
+            selectBestEnglish,
+            scoreMalaySubtitle,
+            rankMalaySubtitles,
+            selectBestMalay
+          }"""
+          if "rankMalaySubtitles," not in selector:
+              if old_exports not in selector:
+                  raise SystemExit("selector.js exports guard failed")
+              selector = selector.replace(old_exports, new_exports, 1)
+
+          selector_path.write_text(selector)
+
+          # 2. subtitles.js: rank native Malay before returning it and record that choice.
+          subtitles_path = Path("src/subtitles.js")
+          subtitles = subtitles_path.read_text()
+
+          old_selector_import = "const { selectBestEnglish, rankEnglishSubtitles } = require('./selector')"
+          new_selector_import = "const { selectBestEnglish, rankEnglishSubtitles, rankMalaySubtitles } = require('./selector')"
+          if old_selector_import in subtitles:
+              subtitles = subtitles.replace(old_selector_import, new_selector_import, 1)
+          elif new_selector_import not in subtitles:
+              raise SystemExit("subtitles.js selector import guard failed")
+
+          old_malay = "    const malay = dedupeSubtitles(getMalaySubtitles(upstream))"
+          new_malay = """    const rankedMalay = rankMalaySubtitles(
+                dedupeSubtitles(getMalaySubtitles(upstream)),
+                args.extra || {}
+              )
+              const malay = rankedMalay.map(item => item.subtitle)
+              const malaySelectionDiagnostic = {
+                malayCandidateCount: rankedMalay.length,
+                malaySelectedId: rankedMalay[0] ? diagnosticSubtitleId(rankedMalay[0].subtitle) : '',
+                malaySelectedScore: rankedMalay[0] ? rankedMalay[0].score : null,
+                malayTop: rankedMalay.slice(0, 5).map((item, index) =>
+                  `${index + 1}:${diagnosticSubtitleId(item.subtitle, index)}:${item.score}`
+                )
+              }"""
+          if "const rankedMalay = rankMalaySubtitles(" not in subtitles:
+              if old_malay not in subtitles:
+                  raise SystemExit("subtitles.js Malay source anchor failed")
+              subtitles = subtitles.replace(old_malay, new_malay, 1)
+
+          # Include Malay diagnostics in both native and auto paths.
+          native_anchor = """        malayCount: malay.length,
+                  englishFound: Boolean(english),
+                  ...selectionDiagnostic,"""
+          native_new = """        malayCount: malay.length,
+                  ...malaySelectionDiagnostic,
+                  englishFound: Boolean(english),
+                  ...selectionDiagnostic,"""
+          if native_anchor in subtitles:
+              subtitles = subtitles.replace(native_anchor, native_new)
+
+          auto_anchor = """      malayCount: 0,
+                englishFound: Boolean(english),"""
+          auto_new = """      malayCount: 0,
+                ...malaySelectionDiagnostic,
+                englishFound: Boolean(english),"""
+          if auto_anchor in subtitles:
+              subtitles = subtitles.replace(auto_anchor, auto_new)
+
+          subtitles_path.write_text(subtitles)
+
+          # 3. diagnostics.js: preserve native Malay selection details in the live diagnose history.
+          diag_path = Path("src/diagnostics.js")
+          diag = diag_path.read_text()
+
+          old_allowed = """    'upstreamCount', 'malayCount', 'subtitleCount',
+              'englishFound', 'byokConfigured', 'autoReady', 'languages', 'totalMs',"""
+          new_allowed = """    'upstreamCount', 'malayCount', 'subtitleCount',
+              'malayCandidateCount', 'malaySelectedId', 'malaySelectedScore', 'malayTop',
+              'englishFound', 'byokConfigured', 'autoReady', 'languages', 'totalMs',"""
+
+          if "'malaySelectedId'" not in diag:
+              if old_allowed not in diag:
+                  raise SystemExit("diagnostics.js allowed fields guard failed")
+              diag = diag.replace(old_allowed, new_allowed, 1)
+
+          diag_path.write_text(diag)
+          PY
+
+      - name: Add Part 2 regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > test/v2-part2-native-malay-ranking.test.js <<'TEST'
+          'use strict'
+
+          const test = require('node:test')
+          const assert = require('node:assert/strict')
+
+          const {
+            rankMalaySubtitles,
+            selectBestMalay,
+            selectBestEnglish
+          } = require('../src/selector')
+          const { handleSubtitles } = require('../src/subtitles')
+          const { sanitiseEvent } = require('../src/diagnostics')
+
+          function responseFor(subtitles) {
+            return async () => ({
+              ok: true,
+              status: 200,
+              json: async () => ({ subtitles })
+            })
+          }
+
+          test('Part 2 ranks a matching native Malay release above an earlier mismatched release', () => {
+            const candidates = [
+              {
+                id: 'malay-wrong',
+                lang: 'ms',
+                url: 'https://example.test/Show.S01E01.1080p.BluRay.x264-OTHER.srt'
+              },
+              {
+                id: 'malay-match',
+                lang: 'msa',
+                url: 'https://example.test/Show.S01E01.1080p.WEB-DL.x265-GROUP.srt'
+              }
+            ]
+
+            const context = {
+              filename: 'Show.S01E01.1080p.WEB-DL.x265-GROUP.mkv'
+            }
+
+            const ranked = rankMalaySubtitles(candidates, context)
+
+            assert.equal(ranked[0].subtitle.id, 'malay-match')
+            assert.ok(ranked[0].score > ranked[1].score)
+            assert.equal(selectBestMalay(candidates, context).id, 'malay-match')
+          })
+
+          test('Part 2 exact video hash wins native Malay ranking', () => {
+            const candidates = [
+              {
+                id: 'filename-match',
+                lang: 'ms',
+                url: 'https://example.test/Movie.2026.1080p.WEB-DL.x265-GROUP.srt'
+              },
+              {
+                id: 'hash-match',
+                lang: 'ms',
+                url: 'https://example.test/Movie.2026.1080p.BluRay.x264-OTHER.srt',
+                videoHash: 'abc123'
+              }
+            ]
+
+            const ranked = rankMalaySubtitles(candidates, {
+              filename: 'Movie.2026.1080p.WEB-DL.x265-GROUP.mkv',
+              videoHash: 'abc123'
+            })
+
+            assert.equal(ranked[0].subtitle.id, 'hash-match')
+          })
+
+          test('Part 2 keeps upstream Malay order when no useful metadata distinguishes candidates', () => {
+            const candidates = [
+              { id: 'first', lang: 'ms', url: 'https://example.test/a.srt' },
+              { id: 'second', lang: 'msa', url: 'https://example.test/b.srt' }
+            ]
+
+            const ranked = rankMalaySubtitles(candidates, {})
+
+            assert.deepEqual(ranked.map(item => item.subtitle.id), ['first', 'second'])
+          })
+
+          test('Part 2 returns the strongest native Malay candidate first and records diagnose evidence', async () => {
+            const upstream = [
+              {
+                id: 'malay-wrong',
+                lang: 'ms',
+                url: 'https://example.test/Show.S01E01.1080p.BluRay.x264-OTHER.srt'
+              },
+              {
+                id: 'malay-match',
+                lang: 'msa',
+                url: 'https://example.test/Show.S01E01.1080p.WEB-DL.x265-GROUP.srt'
+              },
+              {
+                id: 'english-match',
+                lang: 'eng',
+                url: 'https://example.test/Show.S01E01.1080p.WEB-DL.x265-GROUP.en.srt'
+              }
+            ]
+
+            const events = []
+            const result = await handleSubtitles({
+              type: 'series',
+              id: 'tt11198330:1:1',
+              extra: {
+                filename: 'Show.S01E01.1080p.WEB-DL.x265-GROUP.mkv'
+              }
+            }, {
+              fetchImpl: responseFor(upstream),
+              onDiagnostic: async event => events.push(event)
+            })
+
+            assert.equal(result.subtitles.length, 2)
+            assert.equal(result.subtitles[0].id, 'malay-match')
+            assert.equal(result.subtitles[1].id, 'malay-wrong')
+            assert.deepEqual(result.subtitles.map(item => item.lang), ['msa', 'msa'])
+
+            const event = events.find(item => item.event === 'subtitle-result')
+            assert.ok(event)
+            assert.equal(event.result, 'native-malay')
+            assert.equal(event.malayCandidateCount, 2)
+            assert.equal(event.malaySelectedId, 'malay-match')
+            assert.equal(typeof event.malaySelectedScore, 'number')
+            assert.match(event.malayTop[0], /^1:malay-match:/)
+          })
+
+          test('Part 2 does not change English Auto selection when native Malay is absent', async () => {
+            const upstream = [
+              {
+                id: 'english-wrong',
+                lang: 'eng',
+                url: 'https://example.test/Show.S01E01.1080p.BluRay.x264-OTHER.srt'
+              },
+              {
+                id: 'english-match',
+                lang: 'eng',
+                url: 'https://example.test/Show.S01E01.1080p.WEB-DL.x265-GROUP.srt'
+              }
+            ]
+
+            const extra = {
+              filename: 'Show.S01E01.1080p.WEB-DL.x265-GROUP.mkv'
+            }
+            const expectedEnglish = selectBestEnglish(upstream, extra)
+            const events = []
+
+            const result = await handleSubtitles({
+              type: 'series',
+              id: 'tt11198330:1:1',
+              extra
+            }, {
+              apiKey: 'test-key',
+              publicBaseUrl: 'https://smartsubsv2.example/c/test',
+              tokenSecret: 'test-secret',
+              fetchImpl: responseFor(upstream),
+              onDiagnostic: async event => events.push(event)
+            })
+
+            assert.equal(result.subtitles.length, 1)
+
+            const event = events.find(item => item.event === 'subtitle-result')
+            assert.ok(event)
+            assert.equal(event.result, 'auto-malay-ready')
+            assert.equal(event.malayCandidateCount, 0)
+            assert.equal(event.malaySelectedId, '')
+            assert.equal(event.englishSelectedId, expectedEnglish.id)
+            assert.equal(event.englishSelectedId, 'english-match')
+          })
+
+          test('Part 2 diagnostic sanitizer preserves native Malay ranking evidence', () => {
+            const clean = sanitiseEvent({
+              event: 'subtitle-result',
+              malayCount: 3,
+              malayCandidateCount: 3,
+              malaySelectedId: 'malay-best',
+              malaySelectedScore: 12345,
+              malayTop: [
+                '1:malay-best:12345',
+                '2:malay-next:11000',
+                '3:malay-third:10000'
+              ]
+            })
+
+            assert.equal(clean.malayCount, 3)
+            assert.equal(clean.malayCandidateCount, 3)
+            assert.equal(clean.malaySelectedId, 'malay-best')
+            assert.equal(clean.malaySelectedScore, 12345)
+            assert.deepEqual(clean.malayTop, [
+              '1:malay-best:12345',
+              '2:malay-next:11000',
+              '3:malay-third:10000'
+            ])
+          })
+          TEST
+
+      - name: Add Part 2 notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs
+          cat > docs/V2_PART2_NATIVE_MALAY_RANKING.md <<'DOC'
+          # SmartSubsV2 Part 2: Native Malay Ranking
+
+          Part 2 improves native Malay source ordering without changing Gemini or English Auto selection.
+
+          When OpenSubtitles returns multiple Malay subtitles, SmartSubsV2 now ranks them using the same release-aware evidence already used for English:
+
+          - exact video hash when available
+          - exact video size when available
+          - source type such as WEB-DL, WEBRip, BluRay and Remux
+          - resolution
+          - codec
+          - HDR and Dolby Vision markers
+          - release group
+          - penalties for forced, SDH, commentary and lyrics tracks
+
+          If no useful metadata distinguishes the candidates, upstream ordering remains the tie breaker.
+
+          Part 2 does not yet compare native Malay confidence against English confidence. If native Malay exists, SmartSubsV2 still returns native Malay.
+
+          Diagnose now preserves:
+
+          - malayCandidateCount
+          - malaySelectedId
+          - malaySelectedScore
+          - malayTop
+
+          `malayTop` uses `rank:subtitle-id:score` format, matching the English diagnostics.
+          DOC
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Focused Part 2 tests
+        run: node --test test/v2-part2-native-malay-ranking.test.js
+
+      - name: Full regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run check
+          npm test
+          git diff --check
+
+      - name: Verify patch scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fq "function rankMalaySubtitles" src/selector.js
+          grep -Fq "const rankedMalay = rankMalaySubtitles" src/subtitles.js
+          grep -Fq "'malaySelectedId'" src/diagnostics.js
+
+          unexpected="$(
+            git status --porcelain |
+            awk '{print $2}' |
+            grep -Ev '^(src/selector\.js|src/subtitles\.js|src/diagnostics\.js|test/v2-part2-native-malay-ranking\.test\.js|docs/V2_PART2_NATIVE_MALAY_RANKING\.md)$' || true
+          )"
+
+          if [[ -n "$unexpected" ]]; then
+            echo "Unexpected files changed:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+      - name: Commit verified Part 2
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            src/selector.js \
+            src/subtitles.js \
+            src/diagnostics.js \
+            test/v2-part2-native-malay-ranking.test.js \
+            docs/V2_PART2_NATIVE_MALAY_RANKING.md
+
+          if git diff --cached --quiet; then
+            echo "Part 2 is already applied."
+            exit 0
+          fi
+
+          git commit -m "Rank native Malay subtitle candidates"
+          git push origin HEAD:main
