@@ -1,0 +1,347 @@
+name: SmartSubsV2 Part 1A - English Source Diagnose
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smartsubsv2-part1a-english-source-diagnose
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout SmartSubsV2
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify current source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f src/selector.js
+          test -f src/subtitles.js
+          test -f src/diagnostics.js
+          test -f package-lock.json
+          grep -Fq "function rankEnglishSubtitles" src/selector.js
+          grep -Fq "const { selectBestEnglish } = require('./selector')" src/subtitles.js
+          grep -Fq "'englishFound', 'byokConfigured'" src/diagnostics.js
+
+      - name: Add English source observability
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("src/subtitles.js")
+          text = path.read_text()
+
+          old_import = "const { selectBestEnglish } = require('./selector')"
+          new_import = "const { selectBestEnglish, rankEnglishSubtitles } = require('./selector')"
+          if old_import in text:
+              text = text.replace(old_import, new_import, 1)
+          elif new_import not in text:
+              raise SystemExit("subtitles.js selector import guard failed")
+
+          helper_anchor = "function buildAutoSubtitle(englishSubtitle, options = {}) {"
+          helper_code = """function sourceFilename(extra = {}) {
+            const value = String(extra.filename || extra.fileName || extra.file_name || '').trim()
+            if (!value) return ''
+            return value.split(/[\\\\/]/).pop() || value
+          }
+
+          function diagnosticSubtitleId(subtitle, index = 0) {
+            if (!subtitle || typeof subtitle !== 'object') return `index-${index}`
+            const value = subtitle.id ?? subtitle.file_id ?? subtitle.fileId ?? subtitle.subtitle_id ?? subtitle.subtitleId
+            return value == null || value === '' ? `index-${index}` : String(value)
+          }
+
+          function englishSelectionDiagnostics(upstream, selectedEnglish, extra = {}) {
+            const ranked = rankEnglishSubtitles(upstream, extra)
+            const top = ranked.slice(0, 5)
+            const selectedEntry = ranked.find(item => item.subtitle === selectedEnglish) || null
+            const rankedWinner = ranked[0]?.subtitle || null
+
+            return {
+              sourceFilenameProvided: Boolean(extra && (extra.filename || extra.fileName || extra.file_name)),
+              sourceVideoHashProvided: Boolean(extra && extra.videoHash),
+              sourceVideoSizeProvided: Boolean(extra && extra.videoSize),
+              sourceFilename: sourceFilename(extra),
+              requestExtraKeys: Object.keys(extra || {}).sort().slice(0, 8),
+              englishCandidateCount: ranked.length,
+              englishSelectedId: selectedEnglish ? diagnosticSubtitleId(selectedEnglish) : '',
+              englishSelectedScore: selectedEntry ? selectedEntry.score : null,
+              englishSelectionStable: selectedEnglish === rankedWinner,
+              englishTop: top.map((item, index) =>
+                `${index + 1}:${diagnosticSubtitleId(item.subtitle, index)}:${item.score}`
+              )
+            }
+          }
+
+          """
+          if "function englishSelectionDiagnostics(" not in text:
+              if helper_anchor not in text:
+                  raise SystemExit("subtitles.js helper anchor failed")
+              text = text.replace(helper_anchor, helper_code + helper_anchor, 1)
+
+          selection_anchor = "    const english = selectBestEnglish(upstream, args.extra || {})"
+          selection_new = """    const english = selectBestEnglish(upstream, args.extra || {})
+              const selectionDiagnostic = englishSelectionDiagnostics(
+                upstream,
+                english,
+                args.extra || {}
+              )"""
+          if "const selectionDiagnostic = englishSelectionDiagnostics(" not in text:
+              if selection_anchor not in text:
+                  raise SystemExit("subtitles.js selection anchor failed")
+              text = text.replace(selection_anchor, selection_new, 1)
+
+          old_diag_block = """        sourceFilenameProvided: Boolean(args.extra && (args.extra.filename || args.extra.fileName || args.extra.file_name)),
+                  sourceVideoHashProvided: Boolean(args.extra && args.extra.videoHash),
+                  sourceVideoSizeProvided: Boolean(args.extra && args.extra.videoSize),"""
+          new_diag_block = "        ...selectionDiagnostic,"
+
+          count = text.count(old_diag_block)
+          if count:
+              text = text.replace(old_diag_block, new_diag_block)
+          elif text.count("...selectionDiagnostic,") < 2:
+              raise SystemExit("subtitles.js diagnostic payload guard failed")
+
+          old_exports = "module.exports = { dedupeSubtitles, buildAutoSubtitle, handleSubtitles }"
+          new_exports = "module.exports = { dedupeSubtitles, buildAutoSubtitle, handleSubtitles, englishSelectionDiagnostics }"
+          if old_exports in text:
+              text = text.replace(old_exports, new_exports, 1)
+          elif new_exports not in text:
+              raise SystemExit("subtitles.js exports guard failed")
+
+          path.write_text(text)
+
+          diag_path = Path("src/diagnostics.js")
+          diag = diag_path.read_text()
+
+          old_allowed = "    'englishFound', 'byokConfigured', 'autoReady', 'languages', 'totalMs',"
+          new_allowed = """    'englishFound', 'byokConfigured', 'autoReady', 'languages', 'totalMs',
+              'sourceFilenameProvided', 'sourceVideoHashProvided', 'sourceVideoSizeProvided',
+              'sourceFilename', 'requestExtraKeys', 'englishCandidateCount', 'englishSelectedId',
+              'englishSelectedScore', 'englishSelectionStable', 'englishTop',"""
+
+          if "'englishSelectedId'" not in diag:
+              if old_allowed not in diag:
+                  raise SystemExit("diagnostics.js allowed-list guard failed")
+              diag = diag.replace(old_allowed, new_allowed, 1)
+
+          diag_path.write_text(diag)
+          PY
+
+      - name: Add Part 1A regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > test/v2-part1a-english-source-diagnose.test.js <<'TEST'
+          'use strict'
+
+          const test = require('node:test')
+          const assert = require('node:assert/strict')
+          const {
+            handleSubtitles,
+            englishSelectionDiagnostics
+          } = require('../src/subtitles')
+          const { selectBestEnglish } = require('../src/selector')
+          const { sanitiseEvent } = require('../src/diagnostics')
+
+          const responseFor = subtitles => async () => ({
+            ok: true,
+            status: 200,
+            json: async () => ({ subtitles })
+          })
+
+          test('Part 1A reports the selected English ID and top candidates without changing selection', async () => {
+            const upstream = [
+              {
+                id: 'wrong-release',
+                lang: 'eng',
+                url: 'https://example.test/Show.S01E01.1080p.BluRay.x264-OTHER.srt'
+              },
+              {
+                id: 'matching-release',
+                lang: 'eng',
+                url: 'https://example.test/Show.S01E01.1080p.WEB-DL.x265-GROUP.srt'
+              }
+            ]
+
+            const extra = {
+              filename: 'Show.S01E01.1080p.WEB-DL.x265-GROUP.mkv'
+            }
+
+            const expected = selectBestEnglish(upstream, extra)
+            const events = []
+
+            const result = await handleSubtitles({
+              type: 'series',
+              id: 'tt11198330:1:1',
+              extra
+            }, {
+              apiKey: 'test-key',
+              publicBaseUrl: 'https://smartsubsv2.example/c/test',
+              tokenSecret: 'test-secret',
+              fetchImpl: responseFor(upstream),
+              onDiagnostic: async event => events.push(event)
+            })
+
+            const event = events.find(item => item.event === 'subtitle-result')
+            assert.ok(event)
+            assert.equal(result.subtitles.length, 1)
+            assert.equal(event.englishSelectedId, expected.id)
+            assert.equal(event.englishSelectedId, 'matching-release')
+            assert.equal(event.englishSelectionStable, true)
+            assert.equal(event.englishCandidateCount, 2)
+            assert.equal(event.sourceFilenameProvided, true)
+            assert.equal(event.sourceVideoHashProvided, false)
+            assert.equal(event.sourceVideoSizeProvided, false)
+            assert.equal(event.sourceFilename, extra.filename)
+            assert.deepEqual(event.requestExtraKeys, ['filename'])
+            assert.match(event.englishTop[0], /^1:matching-release:/)
+          })
+
+          test('Part 1A makes weak no-metadata selection visible', () => {
+            const upstream = [
+              { id: 'first', lang: 'eng', url: 'https://example.test/first.srt' },
+              { id: 'second', lang: 'eng', url: 'https://example.test/second.srt' }
+            ]
+
+            const selected = selectBestEnglish(upstream, {})
+            const info = englishSelectionDiagnostics(upstream, selected, {})
+
+            assert.equal(info.sourceFilenameProvided, false)
+            assert.equal(info.sourceVideoHashProvided, false)
+            assert.equal(info.sourceVideoSizeProvided, false)
+            assert.equal(info.englishSelectedId, 'first')
+            assert.equal(info.englishCandidateCount, 2)
+            assert.equal(info.englishSelectionStable, true)
+            assert.match(info.englishTop[0], /^1:first:/)
+          })
+
+          test('Part 1A diagnostic sanitizer keeps source-selection fields', () => {
+            const clean = sanitiseEvent({
+              event: 'subtitle-result',
+              sourceFilenameProvided: true,
+              sourceVideoHashProvided: false,
+              sourceVideoSizeProvided: true,
+              sourceFilename: 'Episode.S01E01.1080p.WEB-DL.mkv',
+              requestExtraKeys: ['filename', 'videoSize'],
+              englishCandidateCount: 8,
+              englishSelectedId: '9215159',
+              englishSelectedScore: 11120,
+              englishSelectionStable: true,
+              englishTop: ['1:9215159:11120', '2:9215154:10200']
+            })
+
+            assert.equal(clean.sourceFilenameProvided, true)
+            assert.equal(clean.sourceVideoHashProvided, false)
+            assert.equal(clean.sourceVideoSizeProvided, true)
+            assert.equal(clean.sourceFilename, 'Episode.S01E01.1080p.WEB-DL.mkv')
+            assert.deepEqual(clean.requestExtraKeys, ['filename', 'videoSize'])
+            assert.equal(clean.englishCandidateCount, 8)
+            assert.equal(clean.englishSelectedId, '9215159')
+            assert.equal(clean.englishSelectedScore, 11120)
+            assert.equal(clean.englishSelectionStable, true)
+            assert.deepEqual(clean.englishTop, ['1:9215159:11120', '2:9215154:10200'])
+          })
+          TEST
+
+      - name: Add Part 1A notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs
+          cat > docs/V2_PART1A_ENGLISH_SOURCE_DIAGNOSE.md <<'DOC'
+          # SmartSubsV2 Part 1A: English Source Diagnose
+
+          Part 1A changes observability only.
+
+          It does not change which English subtitle SmartSubs selects.
+
+          The configured Diagnose page now preserves:
+
+          - sourceFilenameProvided
+          - sourceVideoHashProvided
+          - sourceVideoSizeProvided
+          - sourceFilename
+          - requestExtraKeys
+          - englishCandidateCount
+          - englishSelectedId
+          - englishSelectedScore
+          - englishSelectionStable
+          - englishTop
+
+          `englishTop` contains up to five entries in `rank:subtitle-id:score` format.
+
+          This lets us determine whether an out-of-sync source is caused by missing player metadata or weak selector scoring before changing source-selection behaviour.
+          DOC
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Focused Part 1A tests
+        run: node --test test/v2-part1a-english-source-diagnose.test.js
+
+      - name: Full regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run check
+          npm test
+          git diff --check
+
+      - name: Verify patch scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fq "function englishSelectionDiagnostics" src/subtitles.js
+          grep -Fq "'englishSelectedId'" src/diagnostics.js
+
+          unexpected="$(
+            git status --porcelain |
+            awk '{print $2}' |
+            grep -Ev '^(src/subtitles\.js|src/diagnostics\.js|test/v2-part1a-english-source-diagnose\.test\.js|docs/V2_PART1A_ENGLISH_SOURCE_DIAGNOSE\.md)$' || true
+          )"
+
+          if [[ -n "$unexpected" ]]; then
+            echo "Unexpected files changed:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+      - name: Commit verified Part 1A
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            src/subtitles.js \
+            src/diagnostics.js \
+            test/v2-part1a-english-source-diagnose.test.js \
+            docs/V2_PART1A_ENGLISH_SOURCE_DIAGNOSE.md
+
+          if git diff --cached --quiet; then
+            echo "Part 1A is already applied."
+            exit 0
+          fi
+
+          git commit -m "Add SmartSubsV2 English source diagnostics"
+          git push origin HEAD:main
