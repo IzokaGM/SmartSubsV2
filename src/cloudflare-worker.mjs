@@ -606,10 +606,19 @@ function queueFinalEnabled(env, attempts = 1) {
 }
 
 
-function queueTranslationProfile(env, attempts = 1) {
+function normaliseRequestedQueueProfile(value) {
+  return String(value || '') === 'user-selected-fast'
+    ? 'user-selected-fast'
+    : ''
+}
+
+function queueTranslationProfile(env, attempts = 1, requestedProfile = '') {
+  const attempt = Math.max(1, Number(attempts || 1))
+  const requested = normaliseRequestedQueueProfile(requestedProfile)
+  if (attempt === 1 && requested === 'user-selected-fast') return 'user-selected-fast'
   if (queueFinalEnabled(env, attempts)) return 'quota-safe-final'
   if (queueParallelEnabled(env, attempts)) return 'parallel-3'
-  return Math.max(1, Number(attempts || 1)) > 1 ? 'fallback-stable' : 'm16-compatible'
+  return attempt > 1 ? 'fallback-stable' : 'm16-compatible'
 }
 
 function queueFailureStage(error) {
@@ -622,7 +631,17 @@ function queueFailureStage(error) {
   return 'unknown'
 }
 
-function queueTranslationOptions(env, attempts = 1) {
+function queueTranslationOptions(env, attempts = 1, requestedProfile = '') {
+  const retryAttempt = Math.max(1, Number(attempts || 1))
+  const requested = normaliseRequestedQueueProfile(requestedProfile)
+
+  if (retryAttempt === 1 && requested === 'user-selected-fast') {
+    return {
+      maxItems: Math.max(140, Math.min(200, Number(env.QUEUE_USER_SELECTED_CHUNK_ITEMS || 160))),
+      maxChars: Math.max(16000, Math.min(24000, Number(env.QUEUE_USER_SELECTED_CHUNK_CHARS || 20000))),
+      concurrency: Math.max(1, Math.min(4, Number(env.QUEUE_USER_SELECTED_CONCURRENCY || 4)))
+    }
+  }
   if (queueFinalEnabled(env, attempts)) {
     return {
       maxItems: Math.max(160, Math.min(220, Number(env.QUEUE_FINAL_CHUNK_ITEMS || 180))),
@@ -639,7 +658,6 @@ function queueTranslationOptions(env, attempts = 1) {
     }
   }
 
-  const retryAttempt = Math.max(1, Number(attempts || 1))
   if (retryAttempt > 1) {
     return {
       maxItems: Math.max(120, Math.min(240, Number(env.QUEUE_FALLBACK_CHUNK_ITEMS || 180))),
@@ -784,6 +802,7 @@ async function enqueuePrefetchTranslation(options = {}) {
   const diagnosticFn = options.diagnosticFn || recordDiagnostic
   const translationToken = parseAutoTranslationToken(autoUrl)
   const cacheKey = String(options.cacheKey || '')
+  const requestedProfile = normaliseRequestedQueueProfile(options.queueProfile)
 
   if (!translationToken || !configToken || !configId) return false
 
@@ -833,12 +852,14 @@ async function enqueuePrefetchTranslation(options = {}) {
       translationToken,
       configId,
       cacheKey: validTranslationCacheKey(cacheKey) ? cacheKey : '',
+      profile: requestedProfile,
       queuedAt: Date.now()
     })
 
     await diagnosticFn(env.SMARTSUBS_CACHE, configId, {
       event: 'queue-enqueued',
-      status: 'queued'
+      status: 'queued',
+      profile: requestedProfile || 'background-default'
     }).catch(() => {})
     return true
   } catch (error) {
@@ -869,8 +890,9 @@ async function processQueueMessage(body, env, options = {}) {
   const epochNowFn = typeof options.epochNowFn === 'function' ? options.epochNowFn : Date.now
   const queuedAt = Number(payload.queuedAt || 0)
   const queueDelayMs = queuedAt > 0 ? Math.max(0, roundMs(epochNowFn() - queuedAt)) : 0
-  const queueProfile = queueTranslationOptions(env, attempts)
-  const queueProfileName = queueTranslationProfile(env, attempts)
+  const requestedProfile = normaliseRequestedQueueProfile(payload.profile)
+  const queueProfile = queueTranslationOptions(env, attempts, requestedProfile)
+  const queueProfileName = queueTranslationProfile(env, attempts, requestedProfile)
 
   if (!secret) throw new Error('SmartSubs server secret is not configured')
   if (payload.v !== 1 || !configToken || !translationToken || !configId) {
@@ -1189,7 +1211,8 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
           env,
           configToken: token,
           configId,
-          cacheKey
+          cacheKey,
+          queueProfile: 'user-selected-fast'
         })
 
         if (queued) {
@@ -1506,4 +1529,4 @@ export default {
   }
 }
 
-export { BUILD_ID, handleRequest, parseSubtitleArgs, safeMessage, classifyTranslationError, renderConfiguredDiagnosePage, prefetchTranslation, parseAutoTranslationToken, enqueuePrefetchTranslation, processQueueMessage, handleQueue, queueTranslationOptions, translationCacheKey, readQueueJobState, writeQueueJobState, queueJobActive, waitForQueueCache, queueFailureStage, queueFinalEnabled, rateLimitAllowed, rateLimitedResponse, publicReady, shouldPrefetchAutoResult, playerQueueWaitMaxMs, translationPreparingResponse }
+export { BUILD_ID, handleRequest, parseSubtitleArgs, safeMessage, classifyTranslationError, renderConfiguredDiagnosePage, prefetchTranslation, parseAutoTranslationToken, enqueuePrefetchTranslation, processQueueMessage, handleQueue, normaliseRequestedQueueProfile, queueTranslationProfile, queueTranslationOptions, translationCacheKey, readQueueJobState, writeQueueJobState, queueJobActive, waitForQueueCache, queueFailureStage, queueFinalEnabled, rateLimitAllowed, rateLimitedResponse, publicReady, shouldPrefetchAutoResult, playerQueueWaitMaxMs, translationPreparingResponse }

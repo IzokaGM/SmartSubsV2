@@ -98,7 +98,7 @@ function createTranslationPlan(cues, options = {}) {
     : configuredChars
 
   const concurrency = Number.isFinite(explicitConcurrency) && explicitConcurrency > 0
-    ? Math.max(1, Math.min(3, explicitConcurrency))
+    ? Math.max(1, Math.min(4, explicitConcurrency))
     : configuredConcurrency
 
   return { maxItems, maxChars, concurrency, totalChars }
