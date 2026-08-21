@@ -1,9 +1,9 @@
 'use strict'
 
 module.exports = {
-  id: 'community.smartsubs',
+  id: 'community.smartsubsv2',
   version: '1.0.0',
-  name: 'SmartSubs',
+  name: 'SmartSubsV2',
   description: 'Smart Malay subtitles with OpenSubtitles v3 and Gemini BYOK translation',
   resources: [
     { name: 'subtitles', types: ['movie', 'series'], idPrefixes: ['tt'] }
