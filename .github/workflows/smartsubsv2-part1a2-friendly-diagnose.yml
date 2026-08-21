@@ -1,0 +1,233 @@
+name: SmartSubsV2 Part 1A.2 - Friendly Diagnose
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smartsubsv2-part1a2-friendly-diagnose
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout SmartSubsV2
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify Part 1A baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f src/cloudflare-worker.mjs
+          test -f src/diagnostics.js
+          test -f package-lock.json
+          grep -Fq "function renderConfiguredDiagnosePage(configId, events)" src/cloudflare-worker.mjs
+          grep -Fq "'englishSelectedId'" src/diagnostics.js
+
+      - name: Replace raw diagnose view with friendly dashboard
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("src/cloudflare-worker.mjs")
+          text = path.read_text()
+
+          start_marker = "function renderConfiguredDiagnosePage(configId, events) {"
+          end_marker = "\nasync function prefetchTranslation(options = {}) {"
+
+          start = text.find(start_marker)
+          end = text.find(end_marker)
+
+          if start < 0 or end < 0 or end <= start:
+              raise SystemExit("Diagnose renderer markers not found")
+
+          replacement = 'function formatMalaysiaTime(timestamp) {\n  const value = Number(timestamp || 0)\n  if (!Number.isFinite(value) || value <= 0) return \'Unknown time\'\n  try {\n    return `${new Intl.DateTimeFormat(\'en-MY\', {\n      timeZone: \'Asia/Kuala_Lumpur\',\n      year: \'numeric\',\n      month: \'2-digit\',\n      day: \'2-digit\',\n      hour: \'2-digit\',\n      minute: \'2-digit\',\n      second: \'2-digit\',\n      hour12: false\n    }).format(new Date(value))} MYT`\n  } catch {\n    return `${new Date(value).toISOString()} UTC`\n  }\n}\n\nfunction formatDuration(value) {\n  const ms = Number(value)\n  if (!Number.isFinite(ms) || ms < 0) return \'Not available\'\n  if (ms < 1000) return `${Math.round(ms)} ms`\n  return `${(ms / 1000).toFixed(ms < 10000 ? 2 : 1)} s`\n}\n\nfunction parseEnglishTop(values = []) {\n  if (!Array.isArray(values)) return []\n  return values.map(value => {\n    const text = String(value || \'\')\n    const match = text.match(/^(\\d+):([^:]+):(-?\\d+(?:\\.\\d+)?)$/)\n    if (!match) return { raw: text }\n    return {\n      rank: Number(match[1]),\n      id: match[2],\n      score: Number(match[3])\n    }\n  })\n}\n\nfunction syncAssessment(lastSubtitle) {\n  if (!lastSubtitle) {\n    return {\n      level: \'UNKNOWN\',\n      tone: \'neutral\',\n      reason: \'No subtitle request has been recorded yet.\'\n    }\n  }\n\n  const ranked = parseEnglishTop(lastSubtitle.englishTop)\n  const top = ranked[0]\n  const second = ranked[1]\n  const gap = top && second && Number.isFinite(top.score) && Number.isFinite(second.score)\n    ? top.score - second.score\n    : null\n  const candidates = Number(lastSubtitle.englishCandidateCount || ranked.length || 0)\n\n  if (lastSubtitle.sourceVideoHashProvided) {\n    return {\n      level: \'STRONG\',\n      tone: \'good\',\n      reason: \'Player supplied a video hash, which gives SmartSubs a strong sync signal.\'\n    }\n  }\n\n  if (lastSubtitle.sourceVideoSizeProvided && lastSubtitle.sourceFilenameProvided) {\n    return {\n      level: \'GOOD\',\n      tone: \'good\',\n      reason: \'Player supplied both filename and video size, giving the selector useful release evidence.\'\n    }\n  }\n\n  if (candidates > 1 && gap !== null && gap <= 5 && !lastSubtitle.sourceVideoSizeProvided) {\n    return {\n      level: \'HIGH RISK\',\n      tone: \'bad\',\n      reason: `Top English candidates are almost tied${gap !== null ? ` by only ${gap} point${gap === 1 ? \'\' : \'s\'}` : \'\'}, with no video hash or size. Sync may depend heavily on OpenSubtitles ordering.`\n    }\n  }\n\n  if (!lastSubtitle.sourceVideoHashProvided && !lastSubtitle.sourceVideoSizeProvided) {\n    return {\n      level: \'LIMITED\',\n      tone: \'warn\',\n      reason: lastSubtitle.sourceFilenameProvided\n        ? \'Only the player filename is available. If it is a provider label rather than a real release filename, sync confidence is limited.\'\n        : \'The player supplied no filename, video hash, or video size for release matching.\'\n    }\n  }\n\n  return {\n    level: \'MODERATE\',\n    tone: \'warn\',\n    reason: \'Some source metadata is available, but SmartSubs does not have a high-confidence video hash match.\'\n  }\n}\n\nfunction verdictPresentation(verdict) {\n  const map = {\n    NO_SUBTITLE_REQUEST_SEEN: [\'Waiting for subtitle request\', \'neutral\', \'The player has not requested this configured SmartSubsV2 addon yet.\'],\n    NATIVE_MALAY_RETURNED: [\'Native Malay returned\', \'good\', \'SmartSubsV2 returned an existing Malay subtitle without Gemini translation.\'],\n    SUBTITLE_REQUEST_FAILED: [\'Subtitle request failed\', \'bad\', \'SmartSubsV2 received the request but the subtitle request failed.\'],\n    NO_ENGLISH_SOURCE_FOUND: [\'No English source found\', \'bad\', \'OpenSubtitles returned no recognised English source for Malay Auto.\'],\n    BYOK_NOT_CONFIGURED: [\'Gemini key not configured\', \'bad\', \'Malay Auto cannot run until BYOK configuration is valid.\'],\n    SUBTITLE_REQUEST_RETURNED_ZERO: [\'No subtitle returned\', \'bad\', \'SmartSubsV2 was requested but returned zero subtitle tracks.\'],\n    TRANSLATION_DELIVERED: [\'Malay subtitle delivered\', \'good\', \'The translated Malay VTT was successfully returned to the player.\'],\n    TRANSLATION_FAILED: [\'Translation failed\', \'bad\', \'The Malay translation request failed. Check the error event below.\'],\n    QUEUE_JOIN_WAITING: [\'Waiting for queued translation\', \'warn\', \'The player selected Malay Auto while the background Queue job is still running.\'],\n    TRANSLATION_REQUESTED_WAITING_FOR_RESULT: [\'Translation requested\', \'warn\', \'The player requested Malay Auto and SmartSubsV2 is waiting for the result.\'],\n    QUEUE_PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION: [\'Malay Auto ready in cache\', \'good\', \'Background Queue translation finished before player selection.\'],\n    QUEUE_PREFETCH_FAILED_WAITING_FOR_PLAYER_SELECTION: [\'Background translation failed\', \'bad\', \'Queue prefetch failed. Selecting Malay Auto may still retry.\'],\n    QUEUE_PREFETCH_TRANSLATING: [\'Background translation running\', \'warn\', \'Cloudflare Queue is translating Malay Auto now.\'],\n    QUEUE_PREFETCH_QUEUED: [\'Translation queued\', \'warn\', \'The Malay Auto translation job is safely queued.\'],\n    PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION: [\'Malay Auto ready\', \'good\', \'Background translation completed and is waiting for player selection.\'],\n    PREFETCH_FAILED_WAITING_FOR_PLAYER_SELECTION: [\'Prefetch failed\', \'bad\', \'Background translation failed.\'],\n    PREFETCH_TRANSLATING: [\'Prefetch translating\', \'warn\', \'Malay Auto is translating in the background.\'],\n    SUBTITLE_RETURNED_WAITING_FOR_PLAYER_SELECTION: [\'Malay Auto offered\', \'good\', \'SmartSubsV2 returned a Malay Auto track to the player.\'],\n    SUBTITLE_RETURNED: [\'Subtitle returned\', \'good\', \'SmartSubsV2 returned a subtitle track.\']\n  }\n  const item = map[verdict] || [verdict, \'neutral\', \'See the recent events for more detail.\']\n  return { title: item[0], tone: item[1], explanation: item[2] }\n}\n\nfunction renderConfiguredDiagnosePage(configId, events) {\n  const sorted = [...events].sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0))\n  const verdict = deriveVerdict(sorted)\n  const status = verdictPresentation(verdict)\n  const lastSubtitle = sorted.find(item => item.event === \'subtitle-result\') || null\n  const lastDelivery = sorted.find(item => item.event === \'translation-delivered\') || null\n  const lastQueueComplete = sorted.find(item => item.event === \'queue-translation-complete\') || null\n  const lastTranslationComplete = lastQueueComplete ||\n    sorted.find(item => item.event === \'prefetch-complete\') ||\n    null\n  const lastFailure = sorted.find(item =>\n    [\'translation-failed\', \'queue-translation-failed\', \'prefetch-failed\'].includes(item.event)\n  ) || null\n  const latest = sorted[0] || null\n  const sync = syncAssessment(lastSubtitle)\n  const ranked = parseEnglishTop(lastSubtitle?.englishTop)\n  const selectedId = lastSubtitle?.englishSelectedId || \'Not available\'\n  const sourceName = lastSubtitle?.sourceFilename || \'Not provided\'\n  const candidateCount = Number(lastSubtitle?.englishCandidateCount || ranked.length || 0)\n  const topScore = Number(lastSubtitle?.englishSelectedScore)\n  const cacheEvent = lastDelivery || lastTranslationComplete\n  const cacheStatus = cacheEvent?.cache || \'Not seen yet\'\n  const cacheTime = cacheEvent?.totalMs\n  const coldTime = lastTranslationComplete?.totalMs\n  const pipelineTime = lastTranslationComplete?.pipelineMs\n  const wallTime = lastTranslationComplete?.translationWallMs\n\n  const topCandidates = ranked.length\n    ? ranked.map(item => {\n        if (item.raw) return `<div class="candidate">${escapeHtml(item.raw)}</div>`\n        const selected = String(item.id) === String(selectedId)\n        return `<div class="candidate${selected ? \' selected\' : \'\'}"><span>#${item.rank}</span><strong>${escapeHtml(item.id)}</strong><span>score ${escapeHtml(item.score)}</span>${selected ? \'<em>SELECTED</em>\' : \'\'}</div>`\n      }).join(\'\')\n    : \'<div class="muted">No ranked English candidates recorded.</div>\'\n\n  const metadataItems = [\n    [\'Filename\', lastSubtitle?.sourceFilenameProvided, sourceName],\n    [\'Video hash\', lastSubtitle?.sourceVideoHashProvided, lastSubtitle?.sourceVideoHashProvided ? \'Provided\' : \'Not provided\'],\n    [\'Video size\', lastSubtitle?.sourceVideoSizeProvided, lastSubtitle?.sourceVideoSizeProvided ? \'Provided\' : \'Not provided\']\n  ].map(([label, available, detail]) =>\n    `<div class="meta-row"><span>${escapeHtml(label)}</span><strong class="${available ? \'yes\' : \'no\'}">${available ? \'YES\' : \'NO\'}</strong><small>${escapeHtml(detail)}</small></div>`\n  ).join(\'\')\n\n  let guidance = \'Run a title and refresh this page after the subtitle list appears.\'\n  if (lastSubtitle) {\n    if (sync.tone === \'bad\') {\n      guidance = `English source sync is uncertain. Selected source ${selectedId} should be compared with a known synced OpenSubtitles track before changing Gemini settings.`\n    } else if (lastFailure) {\n      guidance = `A recent failure was recorded at ${escapeHtml(lastFailure.failureStage || lastFailure.event)}. Check the failure card and raw events.`\n    } else if (lastDelivery?.cache === \'HIT\') {\n      guidance = \'Subtitle delivery is healthy and came from cache. Any timing problem is more likely source selection than translation speed.\'\n    } else if (status.tone === \'good\') {\n      guidance = \'Delivery looks healthy. If subtitles are out of sync, focus on the English source ID and sync confidence section.\'\n    }\n  }\n\n  const rawEvents = sorted.map(item => {\n    const detail = Object.entries(item)\n      .filter(([key]) => ![\'ts\', \'event\'].includes(key))\n      .map(([key, value]) => `<span><b>${escapeHtml(key)}</b>=${escapeHtml(Array.isArray(value) ? value.join(\',\') : value)}</span>`)\n      .join(\'\')\n    return `<article class="event-card"><div class="event-head"><time>${escapeHtml(formatMalaysiaTime(item.ts))}</time><code>${escapeHtml(item.event)}</code></div><div class="event-detail">${detail || \'<span>No details</span>\'}</div></article>`\n  }).join(\'\') || \'<p class="muted">No request events recorded in the last 24 hours.</p>\'\n\n  return `<!doctype html>\n<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SmartSubsV2 Diagnose</title>\n<style>\n:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101116;color:#f4f4f5;font-family:system-ui,-apple-system,sans-serif}.wrap{max-width:920px;margin:auto;padding:18px 12px 40px}.card{background:#181a21;border:1px solid #30333d;border-radius:16px;padding:16px;margin-bottom:12px}h1{font-size:24px;margin:0 0 8px}h2{font-size:17px;margin:0 0 12px}.muted{color:#aeb1bb;font-size:13px}.status{display:flex;gap:10px;align-items:flex-start}.pill{display:inline-flex;align-items:center;border-radius:999px;padding:5px 10px;font-weight:800;font-size:12px;letter-spacing:.02em}.good{background:#123b29;color:#a7f3d0}.warn{background:#493812;color:#fde68a}.bad{background:#4a1d24;color:#fecaca}.neutral{background:#30333d;color:#e5e7eb}.status-copy{flex:1}.status-title{font-size:20px;font-weight:800;margin-bottom:4px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric{background:#111319;border:1px solid #2b2e37;border-radius:12px;padding:12px}.metric .label{color:#aeb1bb;font-size:12px}.metric .value{font-size:18px;font-weight:800;margin-top:3px;word-break:break-word}.metric .sub{color:#aeb1bb;font-size:12px;margin-top:4px;word-break:break-word}.candidate{display:grid;grid-template-columns:34px 1fr auto auto;gap:8px;align-items:center;padding:9px 10px;border-bottom:1px solid #30333d;font-size:13px}.candidate:last-child{border-bottom:0}.candidate.selected{background:#16271e}.candidate em{font-style:normal;font-size:10px;font-weight:800;color:#a7f3d0}.meta-row{display:grid;grid-template-columns:90px 42px 1fr;gap:8px;padding:8px 0;border-bottom:1px solid #30333d;align-items:start}.meta-row:last-child{border-bottom:0}.meta-row .yes{color:#a7f3d0}.meta-row .no{color:#fca5a5}.meta-row small{color:#c7c9d1;word-break:break-word}.guide{font-size:15px;line-height:1.5}.event-card{border-top:1px solid #30333d;padding:12px 0}.event-card:first-child{border-top:0}.event-head{display:flex;gap:10px;justify-content:space-between;align-items:center;margin-bottom:7px}.event-head time{font-size:12px;color:#aeb1bb}.event-head code{font-size:12px;color:#c9ffdc}.event-detail{display:flex;flex-wrap:wrap;gap:6px}.event-detail span{background:#111319;border-radius:7px;padding:4px 6px;font-size:11px;word-break:break-word}.event-detail b{color:#aeb1bb;font-weight:600}details summary{cursor:pointer;font-weight:800;padding:4px 0}code{color:#c9ffdc}@media(max-width:640px){.grid{grid-template-columns:1fr}.candidate{grid-template-columns:28px 1fr auto}.candidate em{grid-column:2}.meta-row{grid-template-columns:82px 38px 1fr}.event-head{align-items:flex-start;flex-direction:column;gap:4px}}\n</style></head>\n<body><main class="wrap">\n<section class="card"><h1>SmartSubsV2 Diagnose</h1><div class="status"><span class="pill ${status.tone}">${escapeHtml(status.tone === \'good\' ? \'OK\' : status.tone === \'bad\' ? \'PROBLEM\' : status.tone === \'warn\' ? \'CHECK\' : \'INFO\')}</span><div class="status-copy"><div class="status-title">${escapeHtml(status.title)}</div><div class="muted">${escapeHtml(status.explanation)}</div></div></div><p class="muted">Malaysia time (MYT, Asia/Kuala_Lumpur) | Build ${BUILD_ID} | ${sorted.length} events retained for up to 24 hours.</p></section>\n\n<section class="card"><h2>Quick diagnosis</h2><div class="grid">\n<div class="metric"><div class="label">Latest media</div><div class="value">${escapeHtml(lastSubtitle ? `${lastSubtitle.type || \'\'} ${lastSubtitle.id || \'\'}`.trim() : \'No request\')}</div><div class="sub">${escapeHtml(lastSubtitle ? formatMalaysiaTime(lastSubtitle.ts) : \'Waiting for player\')}</div></div>\n<div class="metric"><div class="label">Subtitle result</div><div class="value">${escapeHtml(lastSubtitle?.result || \'Not available\')}</div><div class="sub">${escapeHtml(lastSubtitle ? `${lastSubtitle.subtitleCount || 0} returned | ${lastSubtitle.languages || \'language unknown\'}` : \'\')}</div></div>\n<div class="metric"><div class="label">Selected English source</div><div class="value">${escapeHtml(selectedId)}</div><div class="sub">${Number.isFinite(topScore) ? `score ${escapeHtml(topScore)}` : \'score unavailable\'} | ${candidateCount} candidates</div></div>\n<div class="metric"><div class="label">Sync confidence</div><div class="value"><span class="pill ${sync.tone}">${escapeHtml(sync.level)}</span></div><div class="sub">${escapeHtml(sync.reason)}</div></div>\n<div class="metric"><div class="label">Latest delivery cache</div><div class="value">${escapeHtml(cacheStatus)}</div><div class="sub">${cacheTime !== undefined ? formatDuration(cacheTime) : \'No delivery timing yet\'}</div></div>\n<div class="metric"><div class="label">Cold translation</div><div class="value">${coldTime !== undefined ? formatDuration(coldTime) : \'Not seen yet\'}</div><div class="sub">${pipelineTime !== undefined ? `pipeline ${formatDuration(pipelineTime)}` : \'\'}${wallTime !== undefined ? ` | Gemini wall ${formatDuration(wallTime)}` : \'\'}</div></div>\n</div></section>\n\n<section class="card"><h2>What this means</h2><div class="guide">${escapeHtml(guidance)}</div></section>\n\n<section class="card"><h2>Player sync metadata</h2>${metadataItems}</section>\n\n<section class="card"><h2>English candidates</h2><p class="muted">SmartSubs selected <strong>${escapeHtml(selectedId)}</strong>. A very small score gap without hash or size means selection confidence is weak.</p>${topCandidates}</section>\n\n${lastFailure ? `<section class="card"><h2>Latest failure</h2><div class="metric"><div class="label">${escapeHtml(lastFailure.event)}</div><div class="value">${escapeHtml(lastFailure.failureStage || lastFailure.status || \'Unknown stage\')}</div><div class="sub">${escapeHtml(lastFailure.error || lastFailure.reason || \'\')}</div></div></section>` : \'\'}\n\n<section class="card"><details><summary>Raw recent events</summary><p class="muted">Shown in Malaysia time. Use this only when the summary above is not enough.</p>${rawEvents}</details></section>\n</main></body></html>`\n}'
+
+          text = text[:start] + replacement + text[end:]
+          path.write_text(text)
+          PY
+
+      - name: Add friendly diagnose regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > test/v2-part1a2-friendly-diagnose.test.js <<'TEST'
+          'use strict'
+
+          const test = require('node:test')
+          const assert = require('node:assert/strict')
+
+          test('V2 friendly diagnose shows Malaysia time and sync-risk summary', async () => {
+            const { renderConfiguredDiagnosePage } = await import('../src/cloudflare-worker.mjs')
+
+            const ts = Date.UTC(2026, 7, 21, 4, 42, 47)
+            const html = renderConfiguredDiagnosePage('private-config', [
+              {
+                ts,
+                event: 'subtitle-result',
+                type: 'series',
+                id: 'tt11198330:1:1',
+                result: 'auto-malay-ready',
+                subtitleCount: 1,
+                languages: 'msa',
+                sourceFilenameProvided: true,
+                sourceVideoHashProvided: false,
+                sourceVideoSizeProvided: false,
+                sourceFilename: 'House of the Dragon - Season 1 S01E01-kisskh',
+                englishCandidateCount: 6,
+                englishSelectedId: '9214195',
+                englishSelectedScore: 10020,
+                englishTop: [
+                  '1:9214195:10020',
+                  '2:9215159:10019',
+                  '3:9215154:10018'
+                ],
+                autoReady: true
+              },
+              {
+                ts: ts + 1000,
+                event: 'translation-delivered',
+                cache: 'HIT',
+                totalMs: 411,
+                waitMs: 0,
+                polls: 0,
+                joinStatus: 'cache-hit'
+              }
+            ])
+
+            assert.match(html, /SmartSubsV2 Diagnose/)
+            assert.match(html, /Malaysia time \(MYT, Asia\/Kuala_Lumpur\)/)
+            assert.match(html, /21\/08\/2026/)
+            assert.match(html, /12:42:47/)
+            assert.match(html, /Selected English source/)
+            assert.match(html, /9214195/)
+            assert.match(html, /HIGH RISK/)
+            assert.match(html, /only 1 point/)
+            assert.match(html, /Latest delivery cache/)
+            assert.match(html, />HIT</)
+            assert.match(html, /411 ms/)
+            assert.match(html, /Raw recent events/)
+          })
+
+          test('V2 friendly diagnose rates video hash as strong sync evidence', async () => {
+            const { renderConfiguredDiagnosePage } = await import('../src/cloudflare-worker.mjs')
+
+            const html = renderConfiguredDiagnosePage('private-config', [{
+              ts: Date.UTC(2026, 7, 21, 4, 42, 47),
+              event: 'subtitle-result',
+              type: 'movie',
+              id: 'tt123',
+              result: 'auto-malay-ready',
+              subtitleCount: 1,
+              sourceFilenameProvided: true,
+              sourceVideoHashProvided: true,
+              sourceVideoSizeProvided: true,
+              englishCandidateCount: 4,
+              englishSelectedId: 'hash-match',
+              englishSelectedScore: 40000,
+              englishTop: ['1:hash-match:40000', '2:other:10000']
+            }])
+
+            assert.match(html, /STRONG/)
+            assert.match(html, /video hash/)
+          })
+          TEST
+
+      - name: Add Part 1A.2 notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs
+          cat > docs/V2_PART1A2_FRIENDLY_DIAGNOSE.md <<'DOC'
+          # SmartSubsV2 Part 1A.2: Friendly Diagnose
+
+          This patch changes the diagnose presentation only.
+
+          The top of the page now shows:
+
+          - a plain-English status
+          - the latest media request
+          - selected English subtitle ID and score
+          - sync confidence
+          - player metadata availability
+          - top English candidates
+          - cache status and delivery time
+          - cold translation timing when available
+          - a short recommendation explaining what to investigate
+
+          All timestamps are displayed in Malaysia time using the `Asia/Kuala_Lumpur` time zone and are labelled MYT.
+
+          The original diagnostic events remain available under a collapsed `Raw recent events` section.
+
+          No subtitle selection, OpenSubtitles, Gemini, Queue, cache, or translation behaviour is changed.
+          DOC
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Focused diagnose tests
+        run: node --test test/v2-part1a2-friendly-diagnose.test.js
+
+      - name: Full regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run check
+          npm test
+          git diff --check
+
+      - name: Verify patch scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fq "Malaysia time (MYT, Asia/Kuala_Lumpur)" src/cloudflare-worker.mjs
+          grep -Fq "Quick diagnosis" src/cloudflare-worker.mjs
+          grep -Fq "Sync confidence" src/cloudflare-worker.mjs
+          grep -Fq "Raw recent events" src/cloudflare-worker.mjs
+
+          unexpected="$(
+            git status --porcelain |
+            awk '{print $2}' |
+            grep -Ev '^(src/cloudflare-worker\.mjs|test/v2-part1a2-friendly-diagnose\.test\.js|docs/V2_PART1A2_FRIENDLY_DIAGNOSE\.md)$' || true
+          )"
+
+          if [[ -n "$unexpected" ]]; then
+            echo "Unexpected files changed:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+      - name: Commit verified friendly diagnose
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            src/cloudflare-worker.mjs \
+            test/v2-part1a2-friendly-diagnose.test.js \
+            docs/V2_PART1A2_FRIENDLY_DIAGNOSE.md
+
+          if git diff --cached --quiet; then
+            echo "Friendly diagnose is already applied."
+            exit 0
+          fi
+
+          git commit -m "Make SmartSubsV2 diagnose easier to read"
+          git push origin HEAD:main
