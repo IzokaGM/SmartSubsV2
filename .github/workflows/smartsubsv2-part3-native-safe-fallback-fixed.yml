@@ -1,0 +1,793 @@
+name: SmartSubsV2 Part 3 - Native Malay Safe Fallback
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smartsubsv2-part3-native-safe-fallback
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout SmartSubsV2
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify current Part 2 baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f src/selector.js
+          test -f src/subtitles.js
+          test -f src/diagnostics.js
+          test -f src/cloudflare-worker.mjs
+          test -f package-lock.json
+
+          grep -Fq "function rankMalaySubtitles" src/selector.js
+          grep -Fq "const rankedMalay = rankMalaySubtitles" src/subtitles.js
+          grep -Fq "'malaySelectedId'" src/diagnostics.js
+          grep -Fq "const wallTime = lastTranslationComplete?.translationWallMs" src/cloudflare-worker.mjs
+          grep -Fq "Malaysia time (MYT, Asia/Kuala_Lumpur)" src/cloudflare-worker.mjs
+          grep -Fq "Verdict reference" src/cloudflare-worker.mjs
+          grep -Fq "Raw recent events" src/cloudflare-worker.mjs
+
+      - name: Apply quota-safe native Malay fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          # selector.js
+          path = Path("src/selector.js")
+          text = path.read_text()
+
+          confidence_anchor = "function rankEnglishSubtitles(subtitles, context = {}) {"
+          confidence_code = """function subtitleMatchConfidence(subtitle, index = 0, context = {}, score = null) {
+            const actualScore = Number.isFinite(Number(score))
+              ? Number(score)
+              : scoreEnglishSubtitle(subtitle, index, context)
+            const baseScore = 10000 - index
+            const scoreUplift = actualScore - baseScore
+
+            if (context.videoHash && exactMetadataMatch(subtitle, context.videoHash)) {
+              return { level: 'STRONG', reason: 'exact-video-hash', scoreUplift }
+            }
+
+            if (context.videoSize && exactMetadataMatch(subtitle, context.videoSize)) {
+              return { level: 'STRONG', reason: 'exact-video-size', scoreUplift }
+            }
+
+            if (scoreUplift >= 700) {
+              return { level: 'STRONG', reason: 'strong-release-match', scoreUplift }
+            }
+
+            if (scoreUplift >= 250) {
+              return { level: 'LIMITED', reason: 'partial-release-match', scoreUplift }
+            }
+
+            return { level: 'WEAK', reason: 'insufficient-sync-evidence', scoreUplift }
+          }
+
+          """
+          if "function subtitleMatchConfidence(" not in text:
+              if confidence_anchor not in text:
+                  raise SystemExit("selector confidence anchor failed")
+              text = text.replace(confidence_anchor, confidence_code + confidence_anchor, 1)
+
+          old_english = """function rankEnglishSubtitles(subtitles, context = {}) {
+            return getEnglishSubtitles(subtitles)
+              .map((subtitle, index) => ({
+                subtitle,
+                score: scoreEnglishSubtitle(subtitle, index, context)
+              }))
+              .sort((a, b) => b.score - a.score)
+          }"""
+          new_english = """function rankEnglishSubtitles(subtitles, context = {}) {
+            return getEnglishSubtitles(subtitles)
+              .map((subtitle, index) => {
+                const score = scoreEnglishSubtitle(subtitle, index, context)
+                return {
+                  subtitle,
+                  score,
+                  confidence: subtitleMatchConfidence(subtitle, index, context, score)
+                }
+              })
+              .sort((a, b) => b.score - a.score)
+          }"""
+          if "confidence: subtitleMatchConfidence(subtitle, index, context, score)" not in text:
+              if old_english not in text:
+                  raise SystemExit("rankEnglishSubtitles guard failed")
+              text = text.replace(old_english, new_english, 1)
+
+          old_malay = """function rankMalaySubtitles(subtitles, context = {}) {
+            return getMalaySubtitles(subtitles)
+              .map((subtitle, index) => ({
+                subtitle,
+                score: scoreMalaySubtitle(subtitle, index, context)
+              }))
+              .sort((a, b) => b.score - a.score)
+          }"""
+          new_malay = """function rankMalaySubtitles(subtitles, context = {}) {
+            return getMalaySubtitles(subtitles)
+              .map((subtitle, index) => {
+                const score = scoreMalaySubtitle(subtitle, index, context)
+                return {
+                  subtitle,
+                  score,
+                  confidence: subtitleMatchConfidence(subtitle, index, context, score)
+                }
+              })
+              .sort((a, b) => b.score - a.score)
+          }"""
+          if "function rankMalaySubtitles" in text and "confidence: subtitleMatchConfidence(subtitle, index, context, score)" in text:
+              # English was patched. Malay still needs its own confidence block.
+              malay_section = text[text.find("function rankMalaySubtitles"):text.find("function selectBestMalay")]
+              if "confidence:" not in malay_section:
+                  if old_malay not in text:
+                      raise SystemExit("rankMalaySubtitles guard failed")
+                  text = text.replace(old_malay, new_malay, 1)
+
+          if "  subtitleMatchConfidence," not in text:
+              export_anchor = "  scoreEnglishSubtitle,\n  rankEnglishSubtitles,"
+              if export_anchor not in text:
+                  raise SystemExit("selector export guard failed")
+              text = text.replace(
+                  export_anchor,
+                  "  scoreEnglishSubtitle,\n  subtitleMatchConfidence,\n  rankEnglishSubtitles,",
+                  1
+              )
+
+          path.write_text(text)
+
+          # subtitles.js
+          path = Path("src/subtitles.js")
+          text = path.read_text()
+
+          old_english_diag = """    englishSelectedScore: selectedEntry ? selectedEntry.score : null,
+              englishSelectionStable: selectedEnglish === rankedWinner,"""
+          new_english_diag = """    englishSelectedScore: selectedEntry ? selectedEntry.score : null,
+              englishConfidence: selectedEntry?.confidence?.level || '',
+              englishConfidenceReason: selectedEntry?.confidence?.reason || '',
+              englishScoreUplift: selectedEntry?.confidence?.scoreUplift ?? null,
+              englishSelectionStable: selectedEnglish === rankedWinner,"""
+          if "englishConfidence:" not in text:
+              if old_english_diag not in text:
+                  raise SystemExit("English diagnostics guard failed")
+              text = text.replace(old_english_diag, new_english_diag, 1)
+
+          old_malay_diag = """      malaySelectedScore: rankedMalay[0] ? rankedMalay[0].score : null,
+                malayTop:"""
+          new_malay_diag = """      malaySelectedScore: rankedMalay[0] ? rankedMalay[0].score : null,
+                nativeConfidence: rankedMalay[0]?.confidence?.level || 'NONE',
+                nativeConfidenceReason: rankedMalay[0]?.confidence?.reason || 'no-native-malay',
+                nativeScoreUplift: rankedMalay[0]?.confidence?.scoreUplift ?? null,
+                malayTop:"""
+          if "nativeConfidence:" not in text:
+              if old_malay_diag not in text:
+                  raise SystemExit("Malay diagnostics guard failed")
+              text = text.replace(old_malay_diag, new_malay_diag, 1)
+
+          native_start = text.find("    if (malay.length) {")
+          result_anchor = "    const resultName = auto ? 'auto-malay-ready' : english ? 'byok-not-configured' : 'no-english'"
+          result_pos = text.find(result_anchor)
+
+          if native_start < 0 or result_pos < 0 or result_pos <= native_start:
+              raise SystemExit("Native Malay branch markers failed")
+
+          native_replacement = """    const apiKey = options.apiKey || ''
+              const auto = english && apiKey ? buildAutoSubtitle(english, options) : null
+
+              if (malay.length) {
+                const nativeSubtitles = malay.slice(0, 5).map(toNativeMalay)
+                const nativeConfidence = malaySelectionDiagnostic.nativeConfidence
+                const nativeStrong = nativeConfidence === 'STRONG'
+                const autoFallbackOffered = Boolean(auto) && !nativeStrong
+                const nativeDecision = nativeStrong
+                  ? 'native-only-strong'
+                  : autoFallbackOffered
+                    ? 'dual-fallback'
+                    : 'native-only-auto-unavailable'
+                const autoPrefetch = false
+                const autoPrefetchReason = nativeStrong
+                  ? 'native-strong-no-auto-needed'
+                  : autoFallbackOffered
+                    ? 'weak-native-wait-for-user-selection'
+                    : 'auto-unavailable'
+                const subtitles = autoFallbackOffered
+                  ? [...nativeSubtitles, auto]
+                  : nativeSubtitles
+                const resultName = autoFallbackOffered
+                  ? 'native-malay-with-auto-fallback'
+                  : 'native-malay'
+
+                logPerf({
+                  requestId,
+                  milestone: 'V2-P3',
+                  type: args.type,
+                  id: args.id,
+                  upstreamMs,
+                  upstreamCount: upstream.length,
+                  malayCount: malay.length,
+                  ...malaySelectionDiagnostic,
+                  englishFound: Boolean(english),
+                  ...selectionDiagnostic,
+                  nativeDecision,
+                  autoFallbackOffered,
+                  autoPrefetch,
+                  autoPrefetchReason,
+                  geminiPrefetchAvoided: true,
+                  result: resultName,
+                  totalMs: roundMs(nowMs() - startedAt)
+                })
+
+                await emitDiagnostic(options, {
+                  event: 'subtitle-result',
+                  type: args.type,
+                  id: args.id,
+                  result: resultName,
+                  upstreamCount: upstream.length,
+                  malayCount: malay.length,
+                  ...malaySelectionDiagnostic,
+                  englishFound: Boolean(english),
+                  ...selectionDiagnostic,
+                  byokConfigured: Boolean(apiKey),
+                  autoReady: Boolean(autoFallbackOffered),
+                  nativeDecision,
+                  autoFallbackOffered,
+                  autoPrefetch,
+                  autoPrefetchReason,
+                  geminiPrefetchAvoided: true,
+                  subtitleCount: subtitles.length,
+                  languages: subtitles.map(item => item.lang)
+                })
+
+                return {
+                  subtitles,
+                  autoPrefetch,
+                  autoPrefetchReason,
+                  cacheMaxAge: 120,
+                  staleRevalidate: 60,
+                  staleError: 600
+                }
+              }
+
+          """
+
+          # Replace everything from the native branch through the old apiKey/auto declarations.
+          before_result = text[native_start:result_pos]
+          old_api = "    const apiKey = options.apiKey || ''"
+          old_auto = "    const auto = english && apiKey ? buildAutoSubtitle(english, options) : null"
+          if old_api not in before_result or old_auto not in before_result:
+              raise SystemExit("Native branch apiKey/auto guard failed")
+
+          text = text[:native_start] + native_replacement + text[result_pos:]
+
+          # No-native path keeps aggressive pretranslation.
+          log_search_start = text.find(result_anchor)
+          old_log_tail = """      publicBaseConfigured: Boolean(options.publicBaseUrl ?? config.publicBaseUrl),
+                result: resultName,"""
+          new_log_tail = """      publicBaseConfigured: Boolean(options.publicBaseUrl ?? config.publicBaseUrl),
+                nativeDecision: 'no-native-malay',
+                autoFallbackOffered: false,
+                autoPrefetch: Boolean(auto),
+                autoPrefetchReason: auto ? 'no-native-malay-aggressive-prefetch' : 'auto-unavailable',
+                geminiPrefetchAvoided: false,
+                result: resultName,"""
+          if "no-native-malay-aggressive-prefetch" not in text:
+              tail_pos = text.find(old_log_tail, log_search_start)
+              if tail_pos < 0:
+                  raise SystemExit("No-native log guard failed")
+              text = text[:tail_pos] + text[tail_pos:].replace(old_log_tail, new_log_tail, 1)
+
+          old_diag_tail = """      byokConfigured: Boolean(apiKey),
+                autoReady: Boolean(auto),
+                subtitleCount: auto ? 1 : 0,"""
+          new_diag_tail = """      byokConfigured: Boolean(apiKey),
+                autoReady: Boolean(auto),
+                nativeDecision: 'no-native-malay',
+                autoFallbackOffered: false,
+                autoPrefetch: Boolean(auto),
+                autoPrefetchReason: auto ? 'no-native-malay-aggressive-prefetch' : 'auto-unavailable',
+                geminiPrefetchAvoided: false,
+                subtitleCount: auto ? 1 : 0,"""
+          if new_diag_tail not in text:
+              if old_diag_tail not in text:
+                  raise SystemExit("No-native diagnostic guard failed")
+              text = text.replace(old_diag_tail, new_diag_tail, 1)
+
+          old_return = """      subtitles: auto ? [auto] : [],
+                cacheMaxAge: auto ? 120 : 60,"""
+          new_return = """      subtitles: auto ? [auto] : [],
+                autoPrefetch: Boolean(auto),
+                autoPrefetchReason: auto ? 'no-native-malay-aggressive-prefetch' : 'auto-unavailable',
+                cacheMaxAge: auto ? 120 : 60,"""
+          if new_return not in text:
+              if old_return not in text:
+                  raise SystemExit("No-native return guard failed")
+              text = text.replace(old_return, new_return, 1)
+
+          path.write_text(text)
+
+          # diagnostics.js
+          path = Path("src/diagnostics.js")
+          text = path.read_text()
+
+          old_allowed = """    'malayCandidateCount', 'malaySelectedId', 'malaySelectedScore', 'malayTop',
+              'englishFound', 'byokConfigured', 'autoReady', 'languages', 'totalMs',"""
+          new_allowed = """    'malayCandidateCount', 'malaySelectedId', 'malaySelectedScore', 'malayTop',
+              'nativeConfidence', 'nativeConfidenceReason', 'nativeScoreUplift', 'nativeDecision',
+              'autoFallbackOffered', 'autoPrefetch', 'autoPrefetchReason', 'geminiPrefetchAvoided',
+              'englishFound', 'byokConfigured', 'autoReady', 'languages', 'totalMs',
+              'englishConfidence', 'englishConfidenceReason', 'englishScoreUplift',"""
+          if "'nativeDecision'" not in text:
+              if old_allowed not in text:
+                  raise SystemExit("Diagnostics allowed-list guard failed")
+              text = text.replace(old_allowed, new_allowed, 1)
+
+          verdict_anchor = "  if (lastSubtitle.autoReady) return 'SUBTITLE_RETURNED_WAITING_FOR_PLAYER_SELECTION'"
+          if "NATIVE_MALAY_WITH_AUTO_FALLBACK" not in text:
+              if verdict_anchor not in text:
+                  raise SystemExit("Diagnostics verdict guard failed")
+              text = text.replace(
+                  verdict_anchor,
+                  "  if (lastSubtitle.result === 'native-malay-with-auto-fallback') return 'NATIVE_MALAY_WITH_AUTO_FALLBACK'\n" + verdict_anchor,
+                  1
+              )
+
+          path.write_text(text)
+
+          # cloudflare-worker.mjs
+          path = Path("src/cloudflare-worker.mjs")
+          text = path.read_text()
+
+          map_anchor = "    NATIVE_MALAY_RETURNED: ['Native Malay returned', 'good', 'SmartSubsV2 returned an existing Malay subtitle without Gemini translation.'],"
+          if "NATIVE_MALAY_WITH_AUTO_FALLBACK:" not in text:
+              if map_anchor not in text:
+                  raise SystemExit("Friendly verdict map guard failed")
+              text = text.replace(
+                  map_anchor,
+                  map_anchor + "\n    NATIVE_MALAY_WITH_AUTO_FALLBACK: ['Native Malay + Auto fallback', 'warn', 'Native Malay sync evidence is weak. Malay Auto is available, but Gemini is not used unless you select it.'],",
+                  1
+              )
+
+          # Robust single-line state insertion.
+          wall_anchor = "  const wallTime = lastTranslationComplete?.translationWallMs"
+          if "  const nativeDecision = lastSubtitle?.nativeDecision" not in text:
+              if wall_anchor not in text:
+                  raise SystemExit("Friendly diagnose wallTime anchor failed")
+              text = text.replace(
+                  wall_anchor,
+                  wall_anchor + """
+            const nativeConfidence = lastSubtitle?.nativeConfidence || (Number(lastSubtitle?.malayCount || 0) > 0 ? 'UNKNOWN' : 'NONE')
+            const nativeDecision = lastSubtitle?.nativeDecision || 'Not applicable'
+            const nativeId = lastSubtitle?.malaySelectedId || 'Not available'
+            const nativeScore = Number(lastSubtitle?.malaySelectedScore)""",
+                  1
+              )
+
+          guidance_anchor = """  if (lastSubtitle) {
+              if (sync.tone === 'bad') {"""
+          if "Try Native Malay first" not in text:
+              if guidance_anchor not in text:
+                  raise SystemExit("Friendly diagnose guidance anchor failed")
+              text = text.replace(
+                  guidance_anchor,
+                  """  if (lastSubtitle) {
+              if (lastSubtitle.nativeDecision === 'dual-fallback') {
+                guidance = 'Native Malay sync evidence is weak. Try Native Malay first. Malay Auto is available as a fallback, and Gemini translation starts only if you select Malay Auto.'
+              } else if (sync.tone === 'bad') {""",
+                  1
+              )
+
+          subtitle_card = """<div class="metric"><div class="label">Subtitle result</div><div class="value">${escapeHtml(lastSubtitle?.result || 'Not available')}</div><div class="sub">${escapeHtml(lastSubtitle ? `${lastSubtitle.subtitleCount || 0} returned | ${lastSubtitle.languages || 'language unknown'}` : '')}</div></div>"""
+          if "Native Malay decision</div>" not in text:
+              if subtitle_card not in text:
+                  raise SystemExit("Friendly diagnose subtitle card guard failed")
+              native_card = subtitle_card + """
+          <div class="metric"><div class="label">Native Malay decision</div><div class="value">${escapeHtml(nativeDecision)}</div><div class="sub">source ${escapeHtml(nativeId)} | confidence ${escapeHtml(nativeConfidence)}${Number.isFinite(nativeScore) ? ` | score ${escapeHtml(nativeScore)}` : ''}</div></div>"""
+              text = text.replace(subtitle_card, native_card, 1)
+
+          reference_anchor = "<span><code>NO_ENGLISH_SOURCE_FOUND</code></span>"
+          if "NATIVE_MALAY_WITH_AUTO_FALLBACK</code>" not in text:
+              if reference_anchor not in text:
+                  raise SystemExit("Verdict reference guard failed")
+              text = text.replace(
+                  reference_anchor,
+                  reference_anchor + "<span><code>NATIVE_MALAY_WITH_AUTO_FALLBACK</code></span>",
+                  1
+              )
+
+          configured_anchor = "async function configuredRequest(request, env, token, suffix, executionCtx = null) {"
+          if "function shouldPrefetchAutoResult(" not in text:
+              if configured_anchor not in text:
+                  raise SystemExit("configuredRequest anchor failed")
+              text = text.replace(
+                  configured_anchor,
+                  """function shouldPrefetchAutoResult(result, autoUrl) {
+            return Boolean(autoUrl) && result?.autoPrefetch !== false
+          }
+
+          """ + configured_anchor,
+                  1
+              )
+
+          auto_section_anchor = """      if (autoUrl) {
+                  const translationToken = parseAutoTranslationToken(autoUrl)"""
+          if "event: 'auto-prefetch-skipped'" not in text:
+              if auto_section_anchor not in text:
+                  raise SystemExit("Auto prefetch block guard failed")
+              text = text.replace(
+                  auto_section_anchor,
+                  """      if (autoUrl && result?.autoPrefetch === false) {
+                  await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+                    event: 'auto-prefetch-skipped',
+                    status: 'quota-protected',
+                    reason: result.autoPrefetchReason || 'user-selection-required'
+                  }).catch(() => {})
+                }
+
+                if (shouldPrefetchAutoResult(result, autoUrl)) {
+                  const translationToken = parseAutoTranslationToken(autoUrl)""",
+                  1
+              )
+
+          export_anchor = "rateLimitAllowed, rateLimitedResponse, publicReady }"
+          if "shouldPrefetchAutoResult }" not in text:
+              if export_anchor not in text:
+                  raise SystemExit("Worker export guard failed")
+              text = text.replace(
+                  export_anchor,
+                  "rateLimitAllowed, rateLimitedResponse, publicReady, shouldPrefetchAutoResult }",
+                  1
+              )
+
+          path.write_text(text)
+          PY
+
+      - name: Add Part 3 regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > test/v2-part3-native-safe-fallback.test.js <<'TEST'
+          'use strict'
+
+          const test = require('node:test')
+          const assert = require('node:assert/strict')
+
+          const {
+            subtitleMatchConfidence,
+            rankMalaySubtitles
+          } = require('../src/selector')
+          const { handleSubtitles } = require('../src/subtitles')
+          const { sanitiseEvent, deriveVerdict } = require('../src/diagnostics')
+
+          function responseFor(subtitles) {
+            return async () => ({
+              ok: true,
+              status: 200,
+              json: async () => ({ subtitles })
+            })
+          }
+
+          test('Part 3 treats a 10020 base-style native Malay score as weak evidence', () => {
+            const subtitle = {
+              id: 'native-only',
+              lang: 'ms',
+              url: 'https://example.test/native.srt'
+            }
+
+            const info = subtitleMatchConfidence(
+              subtitle,
+              0,
+              { filename: 'Ted Lasso Season 1 (2020) S01E01-onetouchtv' },
+              10020
+            )
+
+            assert.equal(info.level, 'WEAK')
+            assert.equal(info.reason, 'insufficient-sync-evidence')
+            assert.equal(info.scoreUplift, 20)
+          })
+
+          test('Part 3 recognises strong native release evidence', () => {
+            const ranked = rankMalaySubtitles([{
+              id: 'native-match',
+              lang: 'ms',
+              url: 'https://example.test/Show.S01E01.1080p.WEB-DL.x265-GROUP.srt'
+            }], {
+              filename: 'Show.S01E01.1080p.WEB-DL.x265-GROUP.mkv'
+            })
+
+            assert.equal(ranked[0].confidence.level, 'STRONG')
+            assert.ok(ranked[0].confidence.scoreUplift >= 700)
+          })
+
+          test('Part 3 weak native Malay offers Auto but disables background Gemini prefetch', async () => {
+            const upstream = [
+              {
+                id: 'native-weak',
+                lang: 'ms',
+                url: 'https://example.test/native.srt'
+              },
+              {
+                id: 'english-weak',
+                lang: 'eng',
+                url: 'https://example.test/english.srt'
+              }
+            ]
+
+            const events = []
+            const result = await handleSubtitles({
+              type: 'series',
+              id: 'tt10986410:1:1',
+              extra: { filename: 'Ted Lasso Season 1 (2020) S01E01-onetouchtv' }
+            }, {
+              apiKey: 'test-key',
+              publicBaseUrl: 'https://smartsubsv2.example/c/test',
+              tokenSecret: 'test-secret',
+              fetchImpl: responseFor(upstream),
+              onDiagnostic: async event => events.push(event)
+            })
+
+            assert.equal(result.subtitles.length, 2)
+            assert.equal(result.subtitles[0].id, 'native-weak')
+            assert.match(result.subtitles[1].id, /^smartsubs-auto-/)
+            assert.equal(result.autoPrefetch, false)
+            assert.equal(result.autoPrefetchReason, 'weak-native-wait-for-user-selection')
+
+            const event = events.find(item => item.event === 'subtitle-result')
+            assert.ok(event)
+            assert.equal(event.result, 'native-malay-with-auto-fallback')
+            assert.equal(event.nativeConfidence, 'WEAK')
+            assert.equal(event.nativeDecision, 'dual-fallback')
+            assert.equal(event.autoFallbackOffered, true)
+            assert.equal(event.autoPrefetch, false)
+            assert.equal(event.geminiPrefetchAvoided, true)
+          })
+
+          test('Part 3 strong native Malay remains native-only', async () => {
+            const upstream = [
+              {
+                id: 'native-strong',
+                lang: 'ms',
+                url: 'https://example.test/Show.S01E01.1080p.WEB-DL.x265-GROUP.srt'
+              },
+              {
+                id: 'english',
+                lang: 'eng',
+                url: 'https://example.test/Show.S01E01.1080p.WEB-DL.x265-GROUP.en.srt'
+              }
+            ]
+
+            const events = []
+            const result = await handleSubtitles({
+              type: 'series',
+              id: 'tt123:1:1',
+              extra: { filename: 'Show.S01E01.1080p.WEB-DL.x265-GROUP.mkv' }
+            }, {
+              apiKey: 'test-key',
+              publicBaseUrl: 'https://smartsubsv2.example/c/test',
+              tokenSecret: 'test-secret',
+              fetchImpl: responseFor(upstream),
+              onDiagnostic: async event => events.push(event)
+            })
+
+            assert.equal(result.subtitles.length, 1)
+            assert.equal(result.subtitles[0].id, 'native-strong')
+            assert.equal(result.autoPrefetch, false)
+
+            const event = events.find(item => item.event === 'subtitle-result')
+            assert.equal(event.result, 'native-malay')
+            assert.equal(event.nativeConfidence, 'STRONG')
+            assert.equal(event.nativeDecision, 'native-only-strong')
+            assert.equal(event.autoFallbackOffered, false)
+            assert.equal(event.geminiPrefetchAvoided, true)
+          })
+
+          test('Part 3 no-native path keeps existing aggressive Auto pretranslation', async () => {
+            const events = []
+            const result = await handleSubtitles({
+              type: 'movie',
+              id: 'tt1375666',
+              extra: {}
+            }, {
+              apiKey: 'test-key',
+              publicBaseUrl: 'https://smartsubsv2.example/c/test',
+              tokenSecret: 'test-secret',
+              fetchImpl: responseFor([{
+                id: 'english-only',
+                lang: 'eng',
+                url: 'https://example.test/english.srt'
+              }]),
+              onDiagnostic: async event => events.push(event)
+            })
+
+            assert.equal(result.subtitles.length, 1)
+            assert.equal(result.autoPrefetch, true)
+            assert.equal(result.autoPrefetchReason, 'no-native-malay-aggressive-prefetch')
+
+            const event = events.find(item => item.event === 'subtitle-result')
+            assert.equal(event.nativeDecision, 'no-native-malay')
+            assert.equal(event.autoPrefetch, true)
+            assert.equal(event.geminiPrefetchAvoided, false)
+          })
+
+          test('Part 3 Diagnose preserves native decision and quota fields', () => {
+            const clean = sanitiseEvent({
+              event: 'subtitle-result',
+              nativeConfidence: 'WEAK',
+              nativeConfidenceReason: 'insufficient-sync-evidence',
+              nativeScoreUplift: 20,
+              nativeDecision: 'dual-fallback',
+              autoFallbackOffered: true,
+              autoPrefetch: false,
+              autoPrefetchReason: 'weak-native-wait-for-user-selection',
+              geminiPrefetchAvoided: true,
+              englishConfidence: 'WEAK',
+              englishConfidenceReason: 'insufficient-sync-evidence',
+              englishScoreUplift: 20
+            })
+
+            assert.equal(clean.nativeConfidence, 'WEAK')
+            assert.equal(clean.nativeDecision, 'dual-fallback')
+            assert.equal(clean.autoFallbackOffered, true)
+            assert.equal(clean.autoPrefetch, false)
+            assert.equal(clean.geminiPrefetchAvoided, true)
+            assert.equal(clean.englishConfidence, 'WEAK')
+          })
+
+          test('Part 3 dual fallback gets a dedicated Diagnose verdict', () => {
+            assert.equal(
+              deriveVerdict([{
+                ts: Date.now(),
+                event: 'subtitle-result',
+                result: 'native-malay-with-auto-fallback',
+                subtitleCount: 2,
+                autoReady: true
+              }]),
+              'NATIVE_MALAY_WITH_AUTO_FALLBACK'
+            )
+          })
+
+          test('Part 3 Worker prefetch policy protects Gemini until Auto is selected', async () => {
+            const { shouldPrefetchAutoResult } = await import('../src/cloudflare-worker.mjs')
+
+            assert.equal(
+              shouldPrefetchAutoResult(
+                { autoPrefetch: false },
+                'https://smartsubsv2.example/c/test/translated/token.vtt'
+              ),
+              false
+            )
+
+            assert.equal(
+              shouldPrefetchAutoResult(
+                { autoPrefetch: true },
+                'https://smartsubsv2.example/c/test/translated/token.vtt'
+              ),
+              true
+            )
+          })
+          TEST
+
+      - name: Add Part 3 notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs
+          cat > docs/V2_PART3_NATIVE_SAFE_FALLBACK.md <<'DOC'
+          # SmartSubsV2 Part 3: Native Malay Safe Fallback
+
+          Part 3 protects sync quality and Gemini quota.
+
+          ## Policy
+
+          If native Malay has strong sync evidence, SmartSubsV2 returns native Malay only and does not pretranslate with Gemini.
+
+          If native Malay has weak or limited sync evidence, SmartSubsV2 returns native Malay first plus a Malay Auto fallback. The Malay Auto track is not background-prefetched. Gemini starts only when the translated VTT is actually requested, which normally happens after the user selects Malay Auto.
+
+          If no native Malay exists, the existing aggressive Queue pretranslation remains enabled so Malay Auto can be ready quickly.
+
+          ## Confidence evidence
+
+          Strong evidence includes an exact video hash, exact video size, or a large release-match score uplift.
+
+          A result around score 10020 at rank 1 has only a 20 point uplift and is therefore weak evidence, even if it is the best available candidate.
+
+          ## Diagnose
+
+          All existing diagnostics remain. Part 3 additionally records:
+
+          - nativeConfidence
+          - nativeConfidenceReason
+          - nativeScoreUplift
+          - nativeDecision
+          - autoFallbackOffered
+          - autoPrefetch
+          - autoPrefetchReason
+          - geminiPrefetchAvoided
+          - englishConfidence
+          - englishConfidenceReason
+          - englishScoreUplift
+
+          The friendly Diagnose page also displays the Native Malay decision. Malaysia time, raw recent events, legacy verdict references, Queue, cache, Gemini timing, source timing, retry and failure fields remain available.
+          DOC
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Focused Part 3 tests
+        run: node --test test/v2-part3-native-safe-fallback.test.js
+
+      - name: Full regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run check
+          npm test
+          git diff --check
+
+      - name: Verify quota policy and patch scope
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          grep -Fq "function subtitleMatchConfidence" src/selector.js
+          grep -Fq "native-malay-with-auto-fallback" src/subtitles.js
+          grep -Fq "weak-native-wait-for-user-selection" src/subtitles.js
+          grep -Fq "'nativeDecision'" src/diagnostics.js
+          grep -Fq "function shouldPrefetchAutoResult" src/cloudflare-worker.mjs
+          grep -Fq "auto-prefetch-skipped" src/cloudflare-worker.mjs
+          grep -Fq "Native Malay decision" src/cloudflare-worker.mjs
+          grep -Fq "Verdict reference" src/cloudflare-worker.mjs
+          grep -Fq "Raw recent events" src/cloudflare-worker.mjs
+
+          unexpected="$(
+            git status --porcelain |
+            awk '{print $2}' |
+            grep -Ev '^(src/selector\.js|src/subtitles\.js|src/diagnostics\.js|src/cloudflare-worker\.mjs|test/v2-part3-native-safe-fallback\.test\.js|docs/V2_PART3_NATIVE_SAFE_FALLBACK\.md)$' || true
+          )"
+
+          if [[ -n "$unexpected" ]]; then
+            echo "Unexpected files changed:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+      - name: Commit verified Part 3
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            src/selector.js \
+            src/subtitles.js \
+            src/diagnostics.js \
+            src/cloudflare-worker.mjs \
+            test/v2-part3-native-safe-fallback.test.js \
+            docs/V2_PART3_NATIVE_SAFE_FALLBACK.md
+
+          if git diff --cached --quiet; then
+            echo "Part 3 is already applied."
+            exit 0
+          fi
+
+          git commit -m "Add quota-safe native Malay fallback"
+          git push origin HEAD:main
