@@ -1160,6 +1160,7 @@ async function handleRequest(request, env, executionCtx = null) {
         secretReady: true,
         model: geminiModel(env),
         manifestUrl: urls.manifestUrl,
+        diagnoseUrl: `${urls.configuredBaseUrl}/diagnose`,
         installUrl: urls.installUrl,
       }), { noStore: true, csp: true })
     } catch (error) {
