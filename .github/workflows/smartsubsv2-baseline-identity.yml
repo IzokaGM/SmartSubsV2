@@ -1,0 +1,156 @@
+name: SmartSubsV2 Baseline Identity Fix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smartsubsv2-baseline-identity
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout SmartSubsV2
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify duplicate V1 identity exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f src/manifest.js
+          test -f src/configured-manifest.js
+          test -f package-lock.json
+
+          if grep -Fq "id: 'community.smartsubsv2'" src/manifest.js; then
+            echo "V2 identity is already applied."
+          else
+            grep -Fq "id: 'community.smartsubs'" src/manifest.js
+          fi
+
+      - name: Apply unique SmartSubsV2 manifest identity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("src/manifest.js")
+          text = path.read_text()
+
+          if "id: 'community.smartsubsv2'" not in text:
+              old = "id: 'community.smartsubs'"
+              if old not in text:
+                  raise SystemExit("Manifest ID guard failed")
+              text = text.replace(old, "id: 'community.smartsubsv2'", 1)
+
+          if "name: 'SmartSubsV2'" not in text:
+              old = "name: 'SmartSubs'"
+              if old not in text:
+                  raise SystemExit("Manifest name guard failed")
+              text = text.replace(old, "name: 'SmartSubsV2'", 1)
+
+          path.write_text(text)
+          PY
+
+      - name: Add V2 identity regression test
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > test/v2-baseline-identity.test.js <<'TEST'
+          'use strict'
+
+          const test = require('node:test')
+          const assert = require('node:assert/strict')
+          const manifest = require('../src/manifest')
+          const { createConfiguredManifest } = require('../src/configured-manifest')
+
+          test('SmartSubsV2 has a unique addon identity from stable SmartSubs', () => {
+            assert.equal(manifest.id, 'community.smartsubsv2')
+            assert.equal(manifest.name, 'SmartSubsV2')
+            assert.notEqual(manifest.id, 'community.smartsubs')
+          })
+
+          test('configured SmartSubsV2 manifest preserves V2 identity and subtitle resource', () => {
+            const configured = createConfiguredManifest()
+
+            assert.equal(configured.id, 'community.smartsubsv2')
+            assert.equal(configured.name, 'SmartSubsV2')
+            assert.equal(configured.behaviorHints.configurationRequired, false)
+
+            const subtitles = configured.resources.find(
+              resource => resource && resource.name === 'subtitles'
+            )
+
+            assert.ok(subtitles)
+            assert.deepEqual(subtitles.types, ['movie', 'series'])
+            assert.deepEqual(subtitles.idPrefixes, ['tt'])
+          })
+          TEST
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Focused identity test
+        run: node --test test/v2-baseline-identity.test.js
+
+      - name: Full regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run check
+          npm test
+          git diff --check
+
+      - name: Verify patch scope
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          grep -Fq "id: 'community.smartsubsv2'" src/manifest.js
+          grep -Fq "name: 'SmartSubsV2'" src/manifest.js
+
+          unexpected="$(
+            git status --porcelain |
+            awk '{print $2}' |
+            grep -Ev '^(src/manifest\.js|test/v2-baseline-identity\.test\.js)$' || true
+          )"
+
+          if [[ -n "$unexpected" ]]; then
+            echo "Unexpected files changed:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+      - name: Commit verified V2 identity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add src/manifest.js test/v2-baseline-identity.test.js
+
+          if git diff --cached --quiet; then
+            echo "V2 identity already applied."
+            exit 0
+          fi
+
+          git commit -m "Give SmartSubsV2 a unique addon identity"
+          git push origin HEAD:main
