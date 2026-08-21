@@ -607,15 +607,16 @@ function queueFinalEnabled(env, attempts = 1) {
 
 
 function normaliseRequestedQueueProfile(value) {
-  return String(value || '') === 'user-selected-fast'
-    ? 'user-selected-fast'
+  const requested = String(value || '')
+  return requested === 'user-selected-stable' || requested === 'user-selected-fast'
+    ? 'user-selected-stable'
     : ''
 }
 
 function queueTranslationProfile(env, attempts = 1, requestedProfile = '') {
   const attempt = Math.max(1, Number(attempts || 1))
   const requested = normaliseRequestedQueueProfile(requestedProfile)
-  if (attempt === 1 && requested === 'user-selected-fast') return 'user-selected-fast'
+  if (attempt === 1 && requested === 'user-selected-stable') return 'user-selected-stable'
   if (queueFinalEnabled(env, attempts)) return 'quota-safe-final'
   if (queueParallelEnabled(env, attempts)) return 'parallel-3'
   return attempt > 1 ? 'fallback-stable' : 'm16-compatible'
@@ -635,11 +636,11 @@ function queueTranslationOptions(env, attempts = 1, requestedProfile = '') {
   const retryAttempt = Math.max(1, Number(attempts || 1))
   const requested = normaliseRequestedQueueProfile(requestedProfile)
 
-  if (retryAttempt === 1 && requested === 'user-selected-fast') {
+  if (retryAttempt === 1 && requested === 'user-selected-stable') {
     return {
       maxItems: Math.max(140, Math.min(200, Number(env.QUEUE_USER_SELECTED_CHUNK_ITEMS || 160))),
       maxChars: Math.max(16000, Math.min(24000, Number(env.QUEUE_USER_SELECTED_CHUNK_CHARS || 20000))),
-      concurrency: Math.max(1, Math.min(4, Number(env.QUEUE_USER_SELECTED_CONCURRENCY || 4)))
+      concurrency: Math.max(1, Math.min(3, Number(env.QUEUE_USER_SELECTED_CONCURRENCY || 3)))
     }
   }
   if (queueFinalEnabled(env, attempts)) {
@@ -1212,7 +1213,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
           configToken: token,
           configId,
           cacheKey,
-          queueProfile: 'user-selected-fast'
+          queueProfile: 'user-selected-stable'
         })
 
         if (queued) {
