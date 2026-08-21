@@ -1,0 +1,229 @@
+name: SmartSubsV2 Cloudflare Config
+
+on:
+  workflow_dispatch:
+    inputs:
+      kv_namespace_id:
+        description: "Cloudflare KV namespace ID for smartsubsv2-cache"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smartsubsv2-cloudflare-config
+  cancel-in-progress: false
+
+jobs:
+  configure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout SmartSubsV2
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify current baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f wrangler.jsonc
+          test -f test/m15.test.js
+          test -f test/m20.test.js
+          test -f package.json
+          test -f package-lock.json
+
+          kv="${{ inputs.kv_namespace_id }}"
+          if [[ ! "$kv" =~ ^[0-9a-fA-F]{32}$ ]]; then
+            echo "KV namespace ID must be a 32-character hexadecimal Cloudflare namespace ID."
+            exit 1
+          fi
+
+      - name: Apply isolated V2 Cloudflare config
+        shell: bash
+        env:
+          V2_KV_ID: ${{ inputs.kv_namespace_id }}
+        run: |
+          set -euo pipefail
+
+          node <<'NODE'
+          const fs = require('node:fs')
+          const path = 'wrangler.jsonc'
+          const config = JSON.parse(fs.readFileSync(path, 'utf8'))
+
+          config.name = 'smartsubsv2'
+
+          const kv = config.kv_namespaces?.find(
+            item => item.binding === 'SMARTSUBS_CACHE'
+          )
+          if (!kv) throw new Error('SMARTSUBS_CACHE binding not found')
+          kv.id = process.env.V2_KV_ID
+
+          for (const producer of config.queues?.producers || []) {
+            if (producer.binding === 'SMARTSUBS_TRANSLATION_QUEUE') {
+              producer.queue = 'smartsubsv2-translation'
+            }
+          }
+
+          for (const consumer of config.queues?.consumers || []) {
+            consumer.queue = 'smartsubsv2-translation'
+          }
+
+          const subtitleLimiter = config.ratelimits?.find(
+            item => item.name === 'SMARTSUBS_SUBTITLE_LIMITER'
+          )
+          const generateLimiter = config.ratelimits?.find(
+            item => item.name === 'SMARTSUBS_GENERATE_LIMITER'
+          )
+
+          if (!subtitleLimiter || !generateLimiter) {
+            throw new Error('SmartSubs rate limiter bindings not found')
+          }
+
+          subtitleLimiter.namespace_id = '9282101'
+          generateLimiter.namespace_id = '9282102'
+
+          fs.writeFileSync(path, JSON.stringify(config, null, 2) + '\n')
+          NODE
+
+      - name: Update V2-only regression expectations
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          # M15 has TWO queue expectations:
+          # producer object + separate consumer assert.
+          m15_path = Path("test/m15.test.js")
+          m15 = m15_path.read_text()
+
+          old_queue = "'smartsubs-translation'"
+          new_queue = "'smartsubsv2-translation'"
+
+          old_count = m15.count(old_queue)
+          new_count = m15.count(new_queue)
+
+          if old_count:
+              m15 = m15.replace(old_queue, new_queue)
+          elif new_count < 2:
+              raise SystemExit(
+                  f"M15 guard failed: expected at least two V2 queue assertions, found {new_count}"
+              )
+
+          m15_path.write_text(m15)
+
+          # M20 hard-codes the stable V1 rate-limit namespace IDs.
+          m20_path = Path("test/m20.test.js")
+          m20 = m20_path.read_text()
+
+          pairs = [
+              ("namespace_id: '9282001'", "namespace_id: '9282101'"),
+              ("namespace_id: '9282002'", "namespace_id: '9282102'"),
+          ]
+
+          for old, new in pairs:
+              if old in m20:
+                  m20 = m20.replace(old, new)
+              elif new not in m20:
+                  raise SystemExit(f"M20 guard failed: missing {old} and {new}")
+
+          m20_path.write_text(m20)
+          PY
+
+      - name: Verify config and expectations align
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$(jq -r '.name' wrangler.jsonc)" = "smartsubsv2"
+
+          producer_queue="$(jq -r '.queues.producers[] | select(.binding=="SMARTSUBS_TRANSLATION_QUEUE") | .queue' wrangler.jsonc)"
+          consumer_queue="$(jq -r '.queues.consumers[0].queue' wrangler.jsonc)"
+
+          test "$producer_queue" = "smartsubsv2-translation"
+          test "$consumer_queue" = "smartsubsv2-translation"
+
+          kv="$(jq -r '.kv_namespaces[] | select(.binding=="SMARTSUBS_CACHE") | .id' wrangler.jsonc)"
+          test "$kv" = "${{ inputs.kv_namespace_id }}"
+
+          if [[ "$kv" == "4d1aa89065f44614bd7f5b7398f8b5b0" ]]; then
+            echo "ERROR: V2 is still using stable SmartSubs KV."
+            exit 1
+          fi
+
+          test "$(jq -r '.ratelimits[] | select(.name=="SMARTSUBS_SUBTITLE_LIMITER") | .namespace_id' wrangler.jsonc)" = "9282101"
+          test "$(jq -r '.ratelimits[] | select(.name=="SMARTSUBS_GENERATE_LIMITER") | .namespace_id' wrangler.jsonc)" = "9282102"
+
+          test "$(grep -Fo "'smartsubsv2-translation'" test/m15.test.js | wc -l)" -ge 2
+          ! grep -Fq "'smartsubs-translation'" test/m15.test.js
+
+          grep -Fq "namespace_id: '9282101'" test/m20.test.js
+          grep -Fq "namespace_id: '9282102'" test/m20.test.js
+
+          echo "V2 Wrangler and regression expectations match."
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Run focused config tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test test/m15.test.js test/m20.test.js
+
+      - name: Run full regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run check
+          npm test
+          git diff --check
+
+      - name: Diff safety check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Changed files:"
+          git status --short
+
+          unexpected="$(
+            git status --porcelain |
+            awk '{print $2}' |
+            grep -Ev '^(wrangler\.jsonc|test/m15\.test\.js|test/m20\.test\.js)$' || true
+          )"
+
+          if [[ -n "$unexpected" ]]; then
+            echo "Unexpected files changed:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+      - name: Commit verified V2 Cloudflare config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add wrangler.jsonc test/m15.test.js test/m20.test.js
+
+          if git diff --cached --quiet; then
+            echo "V2 Cloudflare configuration is already applied."
+            exit 0
+          fi
+
+          git commit -m "Configure isolated SmartSubsV2 Cloudflare runtime"
+          git push origin HEAD:main
