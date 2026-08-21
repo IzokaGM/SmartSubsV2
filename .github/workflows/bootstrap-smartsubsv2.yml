@@ -1,1 +1,213 @@
+name: Bootstrap SmartSubsV2
 
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smartsubsv2-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout new SmartSubsV2 repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Guard against accidental overwrite
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -d src || -f package.json || -f wrangler.jsonc ]]; then
+            echo "SmartSubsV2 already appears to contain project source."
+            echo "Bootstrap is intentionally one-time only."
+            exit 1
+          fi
+
+      - name: Copy recovered SmartSubs baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+
+          git clone --depth 1 --branch main \
+            https://github.com/IzokaGM/SmartSubs.git "$tmp/source"
+
+          for path in src test docs .gitignore README.md START_HERE.md package.json wrangler.jsonc; do
+            if [[ -e "$tmp/source/$path" ]]; then
+              cp -a "$tmp/source/$path" ./
+            fi
+          done
+
+      - name: Give the development copy a separate V2 identity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Keep internal SMARTSUBS_* bindings and x-smartsubs-* protocol names
+          # unchanged for compatibility. Only user-facing identity and isolated
+          # Cloudflare resource names are changed here.
+          find src test docs -type f -print0 | xargs -0 sed -i 's/SmartSubs/SmartSubsV2/g'
+          sed -i 's/SmartSubs/SmartSubsV2/g' README.md START_HERE.md
+
+          sed -i "s/community\.smartsubs/community.smartsubsv2/g" src/manifest.js test/*.test.js
+          sed -i "s/'final-stable-m20r3'/'v2-baseline-m20r3'/g" src/cloudflare-worker.mjs test/*.test.js
+          sed -i 's/"name": "smartsubs"/"name": "smartsubsv2"/' package.json
+          sed -i 's/SmartSubs Malay subtitle Stremio addon/SmartSubsV2 experimental Malay subtitle Stremio addon/' package.json
+
+          python <<'PY'
+          from pathlib import Path
+          p = Path('wrangler.jsonc')
+          s = p.read_text()
+          s = s.replace('"name": "smartsubs"', '"name": "smartsubsv2"', 1)
+          s = s.replace('"queue": "smartsubs-translation"', '"queue": "smartsubsv2-translation"')
+          s = s.replace('"id": "4d1aa89065f44614bd7f5b7398f8b5b0"', '"id": "REPLACE_WITH_V2_KV_NAMESPACE_ID"')
+          s = s.replace('"namespace_id": "9282001"', '"namespace_id": "REPLACE_WITH_V2_SUBTITLE_RATE_LIMIT_NAMESPACE_ID"')
+          s = s.replace('"namespace_id": "9282002"', '"namespace_id": "REPLACE_WITH_V2_GENERATE_RATE_LIMIT_NAMESPACE_ID"')
+          p.write_text(s)
+          PY
+
+      - name: Add V2 development roadmap and diagnostics target
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > docs/V2_ROADMAP.md <<'DOC'
+          # SmartSubsV2 development roadmap
+
+          SmartSubsV2 is the experimental development line. The stable SmartSubs repository remains untouched.
+
+          ## Fixed product goal
+
+          Improve two things above everything else:
+
+          1. Faster Malay subtitle availability.
+          2. Better, more naturally translated and better matched Malay subtitles.
+
+          ## Part-by-part plan
+
+          0. Baseline isolation and clean CI.
+          1. Rank existing Malay subtitles instead of blindly accepting any Malay result.
+          2. Strengthen English release matching and compare Malay confidence against English confidence.
+          3. Add context-overlap translation while preserving parallel Gemini translation.
+          4. Improve queue join and translation deduplication without using GitHub Actions as runtime compute.
+          5. Improve exact-source caching and earliest possible pretranslation.
+          6. Expand diagnostics and performance monitoring.
+          7. Stability, regression, and real playback validation.
+
+          ## Required final diagnostics
+
+          The final `/c/<config-token>/diagnose` view must make it possible to determine, without exposing secrets:
+
+          - request type, title identity and episode identity where available
+          - native Malay candidates considered
+          - English candidates considered
+          - selected source and selection reason
+          - release-match signals and confidence score
+          - native Malay versus Malay Auto decision
+          - cache HIT, MISS or JOIN
+          - queue requested, queued, running, ready, failed or fallback state
+          - source subtitle fetch time
+          - source bytes and cue count
+          - chunk count, chunk sizing and concurrency
+          - Gemini call count and HTTP status classes
+          - per-call and total translation timing
+          - retries, rate limits, semantic recovery and fallback cue count
+          - total subtitle pipeline time
+          - final concise verdict identifying the slowest or failing stage
+
+          Diagnostics must redact API keys, configuration tokens, raw query secrets and sensitive URL parameters.
+          DOC
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --no-audit --no-fund
+
+      - name: Syntax check
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run check
+
+      - name: Run recovered regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm test
+
+      - name: Install permanent CI only workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .github/workflows
+          cat > .github/workflows/smartsubsv2-ci.yml <<'CI'
+          name: SmartSubsV2 CI
+
+          on:
+            workflow_dispatch:
+            push:
+              branches:
+                - main
+            pull_request:
+
+          permissions:
+            contents: read
+
+          concurrency:
+            group: smartsubsv2-ci
+            cancel-in-progress: true
+
+          jobs:
+            validate:
+              runs-on: ubuntu-latest
+              timeout-minutes: 10
+              steps:
+                - name: Checkout
+                  uses: actions/checkout@v4
+
+                - name: Setup Node
+                  uses: actions/setup-node@v4
+                  with:
+                    node-version: '24'
+                    cache: npm
+
+                - name: Install dependencies
+                  run: npm ci --no-audit --no-fund
+
+                - name: Syntax check
+                  run: npm run check
+
+                - name: Test
+                  run: npm test
+          CI
+
+      - name: Remove bootstrap workflow from repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/bootstrap-smartsubsv2.yml
+
+      - name: Commit SmartSubsV2 baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Bootstrap SmartSubsV2 baseline"
+          git push origin HEAD:main
