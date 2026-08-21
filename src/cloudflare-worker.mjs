@@ -328,6 +328,7 @@ function verdictPresentation(verdict) {
   const map = {
     NO_SUBTITLE_REQUEST_SEEN: ['Waiting for subtitle request', 'neutral', 'The player has not requested this configured SmartSubsV2 addon yet.'],
     NATIVE_MALAY_RETURNED: ['Native Malay returned', 'good', 'SmartSubsV2 returned an existing Malay subtitle without Gemini translation.'],
+    NATIVE_MALAY_WITH_AUTO_FALLBACK: ['Native Malay + Auto fallback', 'warn', 'Native Malay sync evidence is weak. Malay Auto is available, but Gemini is not used unless you select it.'],
     SUBTITLE_REQUEST_FAILED: ['Subtitle request failed', 'bad', 'SmartSubsV2 received the request but the subtitle request failed.'],
     NO_ENGLISH_SOURCE_FOUND: ['No English source found', 'bad', 'OpenSubtitles returned no recognised English source for Malay Auto.'],
     BYOK_NOT_CONFIGURED: ['Gemini key not configured', 'bad', 'Malay Auto cannot run until BYOK configuration is valid.'],
@@ -376,6 +377,10 @@ function renderConfiguredDiagnosePage(configId, events) {
   const coldTime = lastTranslationComplete?.totalMs
   const pipelineTime = lastTranslationComplete?.pipelineMs
   const wallTime = lastTranslationComplete?.translationWallMs
+  const nativeConfidence = lastSubtitle?.nativeConfidence || (Number(lastSubtitle?.malayCount || 0) > 0 ? 'UNKNOWN' : 'NONE')
+  const nativeDecision = lastSubtitle?.nativeDecision || 'Not applicable'
+  const nativeId = lastSubtitle?.malaySelectedId || 'Not available'
+  const nativeScore = Number(lastSubtitle?.malaySelectedScore)
 
   const topCandidates = ranked.length
     ? ranked.map(item => {
@@ -395,7 +400,9 @@ function renderConfiguredDiagnosePage(configId, events) {
 
   let guidance = 'Run a title and refresh this page after the subtitle list appears.'
   if (lastSubtitle) {
-    if (sync.tone === 'bad') {
+    if (lastSubtitle.nativeDecision === 'dual-fallback') {
+      guidance = 'Native Malay sync evidence is weak. Try Native Malay first. Malay Auto is available as a fallback, and Gemini translation starts only if you select Malay Auto.'
+    } else if (sync.tone === 'bad') {
       guidance = `English source sync is uncertain. Selected source ${selectedId} should be compared with a known synced OpenSubtitles track before changing Gemini settings.`
     } else if (lastFailure) {
       guidance = `A recent failure was recorded at ${escapeHtml(lastFailure.failureStage || lastFailure.event)}. Check the failure card and raw events.`
@@ -425,6 +432,7 @@ function renderConfiguredDiagnosePage(configId, events) {
 <section class="card"><h2>Quick diagnosis</h2><div class="grid">
 <div class="metric"><div class="label">Latest media</div><div class="value">${escapeHtml(lastSubtitle ? `${lastSubtitle.type || ''} ${lastSubtitle.id || ''}`.trim() : 'No request')}</div><div class="sub">${escapeHtml(lastSubtitle ? formatMalaysiaTime(lastSubtitle.ts) : 'Waiting for player')}</div></div>
 <div class="metric"><div class="label">Subtitle result</div><div class="value">${escapeHtml(lastSubtitle?.result || 'Not available')}</div><div class="sub">${escapeHtml(lastSubtitle ? `${lastSubtitle.subtitleCount || 0} returned | ${lastSubtitle.languages || 'language unknown'}` : '')}</div></div>
+<div class="metric"><div class="label">Native Malay decision</div><div class="value">${escapeHtml(nativeDecision)}</div><div class="sub">source ${escapeHtml(nativeId)} | confidence ${escapeHtml(nativeConfidence)}${Number.isFinite(nativeScore) ? ` | score ${escapeHtml(nativeScore)}` : ''}</div></div>
 <div class="metric"><div class="label">Selected English source</div><div class="value">${escapeHtml(selectedId)}</div><div class="sub">${Number.isFinite(topScore) ? `score ${escapeHtml(topScore)}` : 'score unavailable'} | ${candidateCount} candidates</div></div>
 <div class="metric"><div class="label">Sync confidence</div><div class="value"><span class="pill ${sync.tone}">${escapeHtml(sync.level)}</span></div><div class="sub">${escapeHtml(sync.reason)}</div></div>
 <div class="metric"><div class="label">Latest delivery cache</div><div class="value">${escapeHtml(cacheStatus)}</div><div class="sub">${cacheTime !== undefined ? formatDuration(cacheTime) : 'No delivery timing yet'}</div></div>
@@ -439,7 +447,7 @@ function renderConfiguredDiagnosePage(configId, events) {
 
 ${lastFailure ? `<section class="card"><h2>Latest failure</h2><div class="metric"><div class="label">${escapeHtml(lastFailure.event)}</div><div class="value">${escapeHtml(lastFailure.failureStage || lastFailure.status || 'Unknown stage')}</div><div class="sub">${escapeHtml(lastFailure.error || lastFailure.reason || '')}</div></div></section>` : ''}
 
-<section class="card"><details><summary>Verdict reference</summary><p class="muted">Legacy diagnostic codes retained for compatibility and deep debugging.</p><div class="event-detail"><span><code>NO_SUBTITLE_REQUEST_SEEN</code></span><span><code>NO_ENGLISH_SOURCE_FOUND</code></span><span><code>SUBTITLE_RETURNED_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>PREFETCH_FAILED_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>QUEUE_PREFETCH_QUEUED</code></span><span><code>QUEUE_PREFETCH_TRANSLATING</code></span><span><code>QUEUE_PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>QUEUE_PREFETCH_FAILED_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>QUEUE_JOIN_WAITING</code></span><span><code>TRANSLATION_DELIVERED</code></span><span><code>TRANSLATION_FAILED</code></span></div></details></section>
+<section class="card"><details><summary>Verdict reference</summary><p class="muted">Legacy diagnostic codes retained for compatibility and deep debugging.</p><div class="event-detail"><span><code>NO_SUBTITLE_REQUEST_SEEN</code></span><span><code>NO_ENGLISH_SOURCE_FOUND</code></span><span><code>NATIVE_MALAY_WITH_AUTO_FALLBACK</code></span><span><code>SUBTITLE_RETURNED_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>PREFETCH_FAILED_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>QUEUE_PREFETCH_QUEUED</code></span><span><code>QUEUE_PREFETCH_TRANSLATING</code></span><span><code>QUEUE_PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>QUEUE_PREFETCH_FAILED_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>QUEUE_JOIN_WAITING</code></span><span><code>TRANSLATION_DELIVERED</code></span><span><code>TRANSLATION_FAILED</code></span></div></details></section>
 
 <section class="card"><details><summary>Raw recent events</summary><p class="muted">Shown in Malaysia time. Use this only when the summary above is not enough.</p>${rawEvents}</details></section>
 </main></body></html>`
@@ -1042,6 +1050,10 @@ async function handleQueue(batch, env, options = {}) {
     }
   }
 }
+function shouldPrefetchAutoResult(result, autoUrl) {
+  return Boolean(autoUrl) && result?.autoPrefetch !== false
+}
+
 async function configuredRequest(request, env, token, suffix, executionCtx = null) {
   const secret = serverSecret(env)
   if (!secret) return send(503, 'text/plain; charset=utf-8', 'SmartSubs server secret is not configured', { noStore: true })
@@ -1258,7 +1270,15 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
         item && item.lang === 'msa' && typeof item.url === 'string' && item.url.includes('/translated/')
       )?.url
 
-      if (autoUrl) {
+      if (autoUrl && result?.autoPrefetch === false) {
+        await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+          event: 'auto-prefetch-skipped',
+          status: 'quota-protected',
+          reason: result.autoPrefetchReason || 'user-selection-required'
+        }).catch(() => {})
+      }
+
+      if (shouldPrefetchAutoResult(result, autoUrl)) {
         const translationToken = parseAutoTranslationToken(autoUrl)
         let autoCacheKey = ''
 
@@ -1417,4 +1437,4 @@ export default {
   }
 }
 
-export { BUILD_ID, handleRequest, parseSubtitleArgs, safeMessage, classifyTranslationError, renderConfiguredDiagnosePage, prefetchTranslation, parseAutoTranslationToken, enqueuePrefetchTranslation, processQueueMessage, handleQueue, queueTranslationOptions, translationCacheKey, readQueueJobState, writeQueueJobState, queueJobActive, waitForQueueCache, queueFailureStage, queueFinalEnabled, rateLimitAllowed, rateLimitedResponse, publicReady }
+export { BUILD_ID, handleRequest, parseSubtitleArgs, safeMessage, classifyTranslationError, renderConfiguredDiagnosePage, prefetchTranslation, parseAutoTranslationToken, enqueuePrefetchTranslation, processQueueMessage, handleQueue, queueTranslationOptions, translationCacheKey, readQueueJobState, writeQueueJobState, queueJobActive, waitForQueueCache, queueFailureStage, queueFinalEnabled, rateLimitAllowed, rateLimitedResponse, publicReady, shouldPrefetchAutoResult }

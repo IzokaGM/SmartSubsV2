@@ -17,7 +17,10 @@ function sanitiseEvent(event = {}) {
     'type', 'id', 'result', 'error', 'cache', 'status',
     'upstreamCount', 'malayCount', 'subtitleCount',
     'malayCandidateCount', 'malaySelectedId', 'malaySelectedScore', 'malayTop',
+    'nativeConfidence', 'nativeConfidenceReason', 'nativeScoreUplift', 'nativeDecision',
+    'autoFallbackOffered', 'autoPrefetch', 'autoPrefetchReason', 'geminiPrefetchAvoided',
     'englishFound', 'byokConfigured', 'autoReady', 'languages', 'totalMs',
+    'englishConfidence', 'englishConfidenceReason', 'englishScoreUplift',
     'sourceFilenameProvided', 'sourceVideoHashProvided', 'sourceVideoSizeProvided',
     'sourceFilename', 'requestExtraKeys', 'englishCandidateCount', 'englishSelectedId',
     'englishSelectedScore', 'englishSelectionStable', 'englishTop',
@@ -110,6 +113,7 @@ function deriveVerdict(events = []) {
   if (lastPrefetchComplete && Number(lastPrefetchComplete.ts) >= Number(lastSubtitle.ts)) return 'PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION'
   if (lastPrefetchFailed && Number(lastPrefetchFailed.ts) >= Number(lastSubtitle.ts)) return 'PREFETCH_FAILED_WAITING_FOR_PLAYER_SELECTION'
   if (lastPrefetchTranslationRequest && Number(lastPrefetchTranslationRequest.ts) >= Number(lastSubtitle.ts)) return 'PREFETCH_TRANSLATING'
+  if (lastSubtitle.result === 'native-malay-with-auto-fallback') return 'NATIVE_MALAY_WITH_AUTO_FALLBACK'
   if (lastSubtitle.autoReady) return 'SUBTITLE_RETURNED_WAITING_FOR_PLAYER_SELECTION'
   return 'SUBTITLE_RETURNED'
 }
