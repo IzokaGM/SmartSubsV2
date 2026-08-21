@@ -1,6 +1,6 @@
 'use strict'
 
-const { getEnglishSubtitles } = require('./languages')
+const { getEnglishSubtitles, getMalaySubtitles } = require('./languages')
 
 const SOURCE_PATTERNS = [
   ['webdl', /\bweb[ ._-]?dl\b/i],
@@ -184,6 +184,23 @@ function rankEnglishSubtitles(subtitles, context = {}) {
     .sort((a, b) => b.score - a.score)
 }
 
+function scoreMalaySubtitle(subtitle, index = 0, context = {}) {
+  return scoreEnglishSubtitle(subtitle, index, context)
+}
+
+function rankMalaySubtitles(subtitles, context = {}) {
+  return getMalaySubtitles(subtitles)
+    .map((subtitle, index) => ({
+      subtitle,
+      score: scoreMalaySubtitle(subtitle, index, context)
+    }))
+    .sort((a, b) => b.score - a.score)
+}
+
+function selectBestMalay(subtitles, context = {}) {
+  return rankMalaySubtitles(subtitles, context)[0]?.subtitle || null
+}
+
 function selectBestEnglish(subtitles, context = {}) {
   return rankEnglishSubtitles(subtitles, context)[0]?.subtitle || null
 }
@@ -194,5 +211,8 @@ module.exports = {
   releaseGroup,
   scoreEnglishSubtitle,
   rankEnglishSubtitles,
-  selectBestEnglish
+  selectBestEnglish,
+  scoreMalaySubtitle,
+  rankMalaySubtitles,
+  selectBestMalay
 }

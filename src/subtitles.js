@@ -5,7 +5,7 @@ const config = require('./config')
 const { nowMs, roundMs, logPerf } = require('./perf')
 const { isSupportedRequest, fetchOpenSubtitles } = require('./opensubtitles')
 const { getMalaySubtitles, toNativeMalay } = require('./languages')
-const { selectBestEnglish, rankEnglishSubtitles } = require('./selector')
+const { selectBestEnglish, rankEnglishSubtitles, rankMalaySubtitles } = require('./selector')
 const { createTranslationToken } = require('./token')
 
 async function emitDiagnostic(options, payload) {
@@ -93,7 +93,19 @@ async function handleSubtitles(args, options = {}) {
     const upstreamStartedAt = nowMs()
     const upstream = await fetchOpenSubtitles(args, options)
     const upstreamMs = roundMs(nowMs() - upstreamStartedAt)
-    const malay = dedupeSubtitles(getMalaySubtitles(upstream))
+    const rankedMalay = rankMalaySubtitles(
+      dedupeSubtitles(getMalaySubtitles(upstream)),
+      args.extra || {}
+    )
+    const malay = rankedMalay.map(item => item.subtitle)
+    const malaySelectionDiagnostic = {
+      malayCandidateCount: rankedMalay.length,
+      malaySelectedId: rankedMalay[0] ? diagnosticSubtitleId(rankedMalay[0].subtitle) : '',
+      malaySelectedScore: rankedMalay[0] ? rankedMalay[0].score : null,
+      malayTop: rankedMalay.slice(0, 5).map((item, index) =>
+        `${index + 1}:${diagnosticSubtitleId(item.subtitle, index)}:${item.score}`
+      )
+    }
     const english = selectBestEnglish(upstream, args.extra || {})
     const selectionDiagnostic = englishSelectionDiagnostics(
       upstream,
@@ -111,6 +123,7 @@ async function handleSubtitles(args, options = {}) {
         upstreamMs,
         upstreamCount: upstream.length,
         malayCount: malay.length,
+        ...malaySelectionDiagnostic,
         englishFound: Boolean(english),
         ...selectionDiagnostic,
         result: 'native-malay',
@@ -123,6 +136,7 @@ async function handleSubtitles(args, options = {}) {
         result: 'native-malay',
         upstreamCount: upstream.length,
         malayCount: malay.length,
+        ...malaySelectionDiagnostic,
         englishFound: Boolean(english),
         ...selectionDiagnostic,
         byokConfigured: Boolean(options.apiKey),
@@ -144,6 +158,7 @@ async function handleSubtitles(args, options = {}) {
       upstreamMs,
       upstreamCount: upstream.length,
       malayCount: 0,
+      ...malaySelectionDiagnostic,
       englishFound: Boolean(english),
         ...selectionDiagnostic,
       autoReady: Boolean(auto),
@@ -159,6 +174,7 @@ async function handleSubtitles(args, options = {}) {
       result: resultName,
       upstreamCount: upstream.length,
       malayCount: 0,
+      ...malaySelectionDiagnostic,
       englishFound: Boolean(english),
         ...selectionDiagnostic,
       byokConfigured: Boolean(apiKey),

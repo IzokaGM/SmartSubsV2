@@ -16,6 +16,7 @@ function sanitiseEvent(event = {}) {
   const allowed = [
     'type', 'id', 'result', 'error', 'cache', 'status',
     'upstreamCount', 'malayCount', 'subtitleCount',
+    'malayCandidateCount', 'malaySelectedId', 'malaySelectedScore', 'malayTop',
     'englishFound', 'byokConfigured', 'autoReady', 'languages', 'totalMs',
     'sourceFilenameProvided', 'sourceVideoHashProvided', 'sourceVideoSizeProvided',
     'sourceFilename', 'requestExtraKeys', 'englishCandidateCount', 'englishSelectedId',
