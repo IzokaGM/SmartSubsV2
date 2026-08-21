@@ -1,0 +1,13 @@
+{
+  "name": "smartsubs",
+  "version": "1.0.0",
+  "private": true,
+  "description": "SmartSubs Malay subtitle Stremio addon",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "node --check src/*.js && node --check src/cloudflare-worker.mjs && node --check src/cf-cache.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "4.123.0"
+  }
+}

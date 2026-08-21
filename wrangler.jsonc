@@ -1,0 +1,73 @@
+{
+  "name": "smartsubs",
+  "main": "src/cloudflare-worker.mjs",
+  "compatibility_date": "2026-08-20",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "vars": {
+    "GEMINI_MODEL": "gemini-3.5-flash-lite",
+    "SMARTSUBS_CACHE_VERSION": "m8-v1",
+    "SMARTSUBS_CACHE_TTL_MS": "15552000000",
+    "TRANSLATION_CHUNK_ITEMS": "180",
+    "TRANSLATION_CHUNK_CHARS": "24000",
+    "TRANSLATION_CONCURRENCY": "2",
+    "QUEUE_TRANSLATION_CHUNK_ITEMS": "240",
+    "QUEUE_TRANSLATION_CHUNK_CHARS": "30000",
+    "QUEUE_TRANSLATION_CONCURRENCY": "2",
+    "QUEUE_JOIN_MAX_MS": "55000",
+    "QUEUE_JOIN_POLL_MS": "1500",
+    "QUEUE_JOB_TTL_SECONDS": "600",
+    "QUEUE_PARALLEL_CHUNK_ITEMS": "160",
+    "QUEUE_PARALLEL_CHUNK_CHARS": "20000",
+    "QUEUE_PARALLEL_CONCURRENCY": "3",
+    "QUEUE_FALLBACK_CHUNK_ITEMS": "180",
+    "QUEUE_FALLBACK_CHUNK_CHARS": "24000",
+    "QUEUE_FALLBACK_CONCURRENCY": "2",
+    "QUEUE_FINAL_CHUNK_ITEMS": "160",
+    "QUEUE_FINAL_CHUNK_CHARS": "20000",
+    "QUEUE_FINAL_CONCURRENCY": "3"
+  },
+  "kv_namespaces": [
+    {
+      "binding": "SMARTSUBS_CACHE",
+      "id": "4d1aa89065f44614bd7f5b7398f8b5b0"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "SMARTSUBS_TRANSLATION_QUEUE",
+        "queue": "smartsubs-translation"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "smartsubs-translation",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_retries": 2,
+        "retry_delay": 10,
+        "max_concurrency": 1
+      }
+    ]
+  },
+  "ratelimits": [
+    {
+      "name": "SMARTSUBS_SUBTITLE_LIMITER",
+      "namespace_id": "9282001",
+      "simple": {
+        "limit": 120,
+        "period": 60
+      }
+    },
+    {
+      "name": "SMARTSUBS_GENERATE_LIMITER",
+      "namespace_id": "9282002",
+      "simple": {
+        "limit": 6,
+        "period": 60
+      }
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+node_modules/
+.cf-build/
+.wrangler/
+.env
+.dev.vars
