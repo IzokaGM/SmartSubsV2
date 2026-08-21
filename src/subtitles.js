@@ -5,7 +5,7 @@ const config = require('./config')
 const { nowMs, roundMs, logPerf } = require('./perf')
 const { isSupportedRequest, fetchOpenSubtitles } = require('./opensubtitles')
 const { getMalaySubtitles, toNativeMalay } = require('./languages')
-const { selectBestEnglish } = require('./selector')
+const { selectBestEnglish, rankEnglishSubtitles } = require('./selector')
 const { createTranslationToken } = require('./token')
 
 async function emitDiagnostic(options, payload) {
@@ -26,6 +26,40 @@ function dedupeSubtitles(subtitles) {
     output.push(subtitle)
   }
   return output
+}
+
+function sourceFilename(extra = {}) {
+  const value = String(extra.filename || extra.fileName || extra.file_name || '').trim()
+  if (!value) return ''
+  return value.split(/[\\/]/).pop() || value
+}
+
+function diagnosticSubtitleId(subtitle, index = 0) {
+  if (!subtitle || typeof subtitle !== 'object') return `index-${index}`
+  const value = subtitle.id ?? subtitle.file_id ?? subtitle.fileId ?? subtitle.subtitle_id ?? subtitle.subtitleId
+  return value == null || value === '' ? `index-${index}` : String(value)
+}
+
+function englishSelectionDiagnostics(upstream, selectedEnglish, extra = {}) {
+  const ranked = rankEnglishSubtitles(upstream, extra)
+  const top = ranked.slice(0, 5)
+  const selectedEntry = ranked.find(item => item.subtitle === selectedEnglish) || null
+  const rankedWinner = ranked[0]?.subtitle || null
+
+  return {
+    sourceFilenameProvided: Boolean(extra && (extra.filename || extra.fileName || extra.file_name)),
+    sourceVideoHashProvided: Boolean(extra && extra.videoHash),
+    sourceVideoSizeProvided: Boolean(extra && extra.videoSize),
+    sourceFilename: sourceFilename(extra),
+    requestExtraKeys: Object.keys(extra || {}).sort().slice(0, 8),
+    englishCandidateCount: ranked.length,
+    englishSelectedId: selectedEnglish ? diagnosticSubtitleId(selectedEnglish) : '',
+    englishSelectedScore: selectedEntry ? selectedEntry.score : null,
+    englishSelectionStable: selectedEnglish === rankedWinner,
+    englishTop: top.map((item, index) =>
+      `${index + 1}:${diagnosticSubtitleId(item.subtitle, index)}:${item.score}`
+    )
+  }
 }
 
 function buildAutoSubtitle(englishSubtitle, options = {}) {
@@ -61,6 +95,11 @@ async function handleSubtitles(args, options = {}) {
     const upstreamMs = roundMs(nowMs() - upstreamStartedAt)
     const malay = dedupeSubtitles(getMalaySubtitles(upstream))
     const english = selectBestEnglish(upstream, args.extra || {})
+    const selectionDiagnostic = englishSelectionDiagnostics(
+      upstream,
+      english,
+      args.extra || {}
+    )
 
     if (malay.length) {
       const subtitles = malay.slice(0, 5).map(toNativeMalay)
@@ -73,9 +112,7 @@ async function handleSubtitles(args, options = {}) {
         upstreamCount: upstream.length,
         malayCount: malay.length,
         englishFound: Boolean(english),
-        sourceFilenameProvided: Boolean(args.extra && (args.extra.filename || args.extra.fileName || args.extra.file_name)),
-        sourceVideoHashProvided: Boolean(args.extra && args.extra.videoHash),
-        sourceVideoSizeProvided: Boolean(args.extra && args.extra.videoSize),
+        ...selectionDiagnostic,
         result: 'native-malay',
         totalMs: roundMs(nowMs() - startedAt)
       })
@@ -87,9 +124,7 @@ async function handleSubtitles(args, options = {}) {
         upstreamCount: upstream.length,
         malayCount: malay.length,
         englishFound: Boolean(english),
-        sourceFilenameProvided: Boolean(args.extra && (args.extra.filename || args.extra.fileName || args.extra.file_name)),
-        sourceVideoHashProvided: Boolean(args.extra && args.extra.videoHash),
-        sourceVideoSizeProvided: Boolean(args.extra && args.extra.videoSize),
+        ...selectionDiagnostic,
         byokConfigured: Boolean(options.apiKey),
         autoReady: false,
         subtitleCount: subtitles.length,
@@ -110,9 +145,7 @@ async function handleSubtitles(args, options = {}) {
       upstreamCount: upstream.length,
       malayCount: 0,
       englishFound: Boolean(english),
-        sourceFilenameProvided: Boolean(args.extra && (args.extra.filename || args.extra.fileName || args.extra.file_name)),
-        sourceVideoHashProvided: Boolean(args.extra && args.extra.videoHash),
-        sourceVideoSizeProvided: Boolean(args.extra && args.extra.videoSize),
+        ...selectionDiagnostic,
       autoReady: Boolean(auto),
       byokConfigured: Boolean(apiKey),
       publicBaseConfigured: Boolean(options.publicBaseUrl ?? config.publicBaseUrl),
@@ -127,9 +160,7 @@ async function handleSubtitles(args, options = {}) {
       upstreamCount: upstream.length,
       malayCount: 0,
       englishFound: Boolean(english),
-        sourceFilenameProvided: Boolean(args.extra && (args.extra.filename || args.extra.fileName || args.extra.file_name)),
-        sourceVideoHashProvided: Boolean(args.extra && args.extra.videoHash),
-        sourceVideoSizeProvided: Boolean(args.extra && args.extra.videoSize),
+        ...selectionDiagnostic,
       byokConfigured: Boolean(apiKey),
       autoReady: Boolean(auto),
       subtitleCount: auto ? 1 : 0,
@@ -162,4 +193,4 @@ async function handleSubtitles(args, options = {}) {
   }
 }
 
-module.exports = { dedupeSubtitles, buildAutoSubtitle, handleSubtitles }
+module.exports = { dedupeSubtitles, buildAutoSubtitle, handleSubtitles, englishSelectionDiagnostics }
