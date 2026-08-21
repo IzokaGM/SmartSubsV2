@@ -1,0 +1,156 @@
+name: SmartSubsV2 Baseline Diagnose Link
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smartsubsv2-baseline-diagnose-link
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout SmartSubsV2
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify current V2 source shape
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f src/configure.js
+          test -f src/cloudflare-worker.mjs
+          test -f src/manifest.js
+          test -f package-lock.json
+          grep -Fq "id: 'community.smartsubsv2'" src/manifest.js
+          grep -Fq "name: 'SmartSubsV2'" src/manifest.js
+          grep -Fq "configuredBaseUrl: configured" src/configure.js
+          grep -Fq "manifestUrl: urls.manifestUrl" src/cloudflare-worker.mjs
+
+      - name: Apply minimal diagnose-link patch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          configure_path = Path("src/configure.js")
+          text = configure_path.read_text()
+
+          old_line = '    ? `<div class="result"><p>SmartSubs is configured.</p><p><a href="${escapeHtml(options.installUrl || \'\')}">Install in Stremio</a></p><code>${escapeHtml(options.manifestUrl)}</code></div>`'
+          new_line = '    ? `<div class="result"><p>SmartSubsV2 is configured.</p><p><a href="${escapeHtml(options.installUrl || \'\')}">Install in Stremio</a></p><p><a href="${escapeHtml(options.diagnoseUrl || \'\')}">Open Diagnose</a></p><code>${escapeHtml(options.manifestUrl)}</code></div>`'
+
+          if "Open Diagnose" not in text:
+              if old_line not in text:
+                  raise SystemExit("configure.js result block guard failed")
+              text = text.replace(old_line, new_line, 1)
+
+          text = text.replace("<title>SmartSubs</title>", "<title>SmartSubsV2</title>")
+          text = text.replace("<h1>SmartSubs</h1>", "<h1>SmartSubsV2</h1>")
+          configure_path.write_text(text)
+
+          worker_path = Path("src/cloudflare-worker.mjs")
+          worker = worker_path.read_text()
+
+          target = "        manifestUrl: urls.manifestUrl,\n"
+          insertion = "        manifestUrl: urls.manifestUrl,\n        diagnoseUrl: `${urls.configuredBaseUrl}/diagnose`,\n"
+
+          if "diagnoseUrl: `${urls.configuredBaseUrl}/diagnose`" not in worker:
+              if target not in worker:
+                  raise SystemExit("cloudflare-worker configure result guard failed")
+              worker = worker.replace(target, insertion, 1)
+
+          worker_path.write_text(worker)
+          PY
+
+      - name: Add focused regression test
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > test/v2-baseline-diagnose-link.test.js <<'TEST'
+          'use strict'
+
+          const test = require('node:test')
+          const assert = require('node:assert/strict')
+          const { renderConfigurePage } = require('../src/configure')
+
+          test('V2 configure result shows install and diagnose actions', () => {
+            const html = renderConfigurePage({
+              secretReady: true,
+              model: 'gemini-3.5-flash-lite',
+              manifestUrl: 'https://smartsubsv2.example/c/private/manifest.json',
+              installUrl: 'stremio://smartsubsv2.example/c/private/manifest.json',
+              diagnoseUrl: 'https://smartsubsv2.example/c/private/diagnose'
+            })
+
+            assert.match(html, /SmartSubsV2 is configured/)
+            assert.match(html, /Install in Stremio/)
+            assert.match(html, /Open Diagnose/)
+            assert.match(html, /https:\/\/smartsubsv2\.example\/c\/private\/diagnose/)
+          })
+          TEST
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Focused diagnose-link test
+        run: node --test test/v2-baseline-diagnose-link.test.js
+
+      - name: Full regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run check
+          npm test
+          git diff --check
+
+      - name: Verify patch scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fq "Open Diagnose" src/configure.js
+          grep -Fq 'diagnoseUrl: `${urls.configuredBaseUrl}/diagnose`' src/cloudflare-worker.mjs
+
+          unexpected="$(
+            git status --porcelain |
+            awk '{print $2}' |
+            grep -Ev '^(src/configure\.js|src/cloudflare-worker\.mjs|test/v2-baseline-diagnose-link\.test\.js)$' || true
+          )"
+
+          if [[ -n "$unexpected" ]]; then
+            echo "Unexpected files changed:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+      - name: Commit verified diagnose link
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add src/configure.js src/cloudflare-worker.mjs test/v2-baseline-diagnose-link.test.js
+
+          if git diff --cached --quiet; then
+            echo "Diagnose link patch already applied."
+            exit 0
+          fi
+
+          git commit -m "Expose SmartSubsV2 diagnose from configure"
+          git push origin HEAD:main
