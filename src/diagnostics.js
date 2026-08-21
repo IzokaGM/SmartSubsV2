@@ -83,6 +83,8 @@ function deriveVerdict(events = []) {
   const lastTranslationRequest = rows.find(
     item => item.event === 'translation-request' && item.status !== 'prefetch'
   )
+  const lastTranslationPending = rows.find(item => item.event === 'translation-pending')
+  const lastPlayerTranslationQueued = rows.find(item => item.event === 'player-translation-queued')
   const lastPrefetchTranslationRequest = rows.find(
     item => item.event === 'translation-request' && item.status === 'prefetch'
   )
@@ -104,6 +106,8 @@ function deriveVerdict(events = []) {
   }
   if (lastTranslationDelivered && Number(lastTranslationDelivered.ts) >= Number(lastSubtitle.ts)) return 'TRANSLATION_DELIVERED'
   if (lastTranslationFailed && Number(lastTranslationFailed.ts) >= Number(lastSubtitle.ts)) return 'TRANSLATION_FAILED'
+  if (lastTranslationPending && Number(lastTranslationPending.ts) >= Number(lastSubtitle.ts)) return 'TRANSLATION_PREPARING_IN_QUEUE'
+  if (lastPlayerTranslationQueued && Number(lastPlayerTranslationQueued.ts) >= Number(lastSubtitle.ts)) return 'TRANSLATION_PREPARING_IN_QUEUE'
   if (lastQueueJoinStart && Number(lastQueueJoinStart.ts) >= Number(lastSubtitle.ts)) return 'QUEUE_JOIN_WAITING'
   if (lastTranslationRequest && Number(lastTranslationRequest.ts) >= Number(lastSubtitle.ts)) return 'TRANSLATION_REQUESTED_WAITING_FOR_RESULT'
   if (lastQueueComplete && Number(lastQueueComplete.ts) >= Number(lastSubtitle.ts)) return 'QUEUE_PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION'

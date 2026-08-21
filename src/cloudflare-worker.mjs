@@ -337,6 +337,7 @@ function verdictPresentation(verdict) {
     TRANSLATION_FAILED: ['Translation failed', 'bad', 'The Malay translation request failed. Check the error event below.'],
     QUEUE_JOIN_WAITING: ['Waiting for queued translation', 'warn', 'The player selected Malay Auto while the background Queue job is still running.'],
     TRANSLATION_REQUESTED_WAITING_FOR_RESULT: ['Translation requested', 'warn', 'The player requested Malay Auto and SmartSubsV2 is waiting for the result.'],
+    TRANSLATION_PREPARING_IN_QUEUE: ['Translation preparing', 'warn', 'Malay Auto is translating safely in Cloudflare Queue. Retry or select Malay Auto again shortly.'],
     QUEUE_PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION: ['Malay Auto ready in cache', 'good', 'Background Queue translation finished before player selection.'],
     QUEUE_PREFETCH_FAILED_WAITING_FOR_PLAYER_SELECTION: ['Background translation failed', 'bad', 'Queue prefetch failed. Selecting Malay Auto may still retry.'],
     QUEUE_PREFETCH_TRANSLATING: ['Background translation running', 'warn', 'Cloudflare Queue is translating Malay Auto now.'],
@@ -447,7 +448,7 @@ function renderConfiguredDiagnosePage(configId, events) {
 
 ${lastFailure ? `<section class="card"><h2>Latest failure</h2><div class="metric"><div class="label">${escapeHtml(lastFailure.event)}</div><div class="value">${escapeHtml(lastFailure.failureStage || lastFailure.status || 'Unknown stage')}</div><div class="sub">${escapeHtml(lastFailure.error || lastFailure.reason || '')}</div></div></section>` : ''}
 
-<section class="card"><details><summary>Verdict reference</summary><p class="muted">Legacy diagnostic codes retained for compatibility and deep debugging.</p><div class="event-detail"><span><code>NO_SUBTITLE_REQUEST_SEEN</code></span><span><code>NO_ENGLISH_SOURCE_FOUND</code></span><span><code>NATIVE_MALAY_WITH_AUTO_FALLBACK</code></span><span><code>SUBTITLE_RETURNED_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>PREFETCH_FAILED_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>QUEUE_PREFETCH_QUEUED</code></span><span><code>QUEUE_PREFETCH_TRANSLATING</code></span><span><code>QUEUE_PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>QUEUE_PREFETCH_FAILED_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>QUEUE_JOIN_WAITING</code></span><span><code>TRANSLATION_DELIVERED</code></span><span><code>TRANSLATION_FAILED</code></span></div></details></section>
+<section class="card"><details><summary>Verdict reference</summary><p class="muted">Legacy diagnostic codes retained for compatibility and deep debugging.</p><div class="event-detail"><span><code>NO_SUBTITLE_REQUEST_SEEN</code></span><span><code>NO_ENGLISH_SOURCE_FOUND</code></span><span><code>NATIVE_MALAY_WITH_AUTO_FALLBACK</code></span><span><code>SUBTITLE_RETURNED_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>PREFETCH_FAILED_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>QUEUE_PREFETCH_QUEUED</code></span><span><code>QUEUE_PREFETCH_TRANSLATING</code></span><span><code>QUEUE_PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>QUEUE_PREFETCH_FAILED_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>QUEUE_JOIN_WAITING</code></span><span><code>TRANSLATION_PREPARING_IN_QUEUE</code></span><span><code>TRANSLATION_DELIVERED</code></span><span><code>TRANSLATION_FAILED</code></span></div></details></section>
 
 <section class="card"><details><summary>Raw recent events</summary><p class="muted">Shown in Malaysia time. Use this only when the summary above is not enough.</p>${rawEvents}</details></section>
 </main></body></html>`
@@ -561,6 +562,26 @@ function queueJoinMaxMs(env) {
 
 function queueJoinPollMs(env) {
   return Math.max(500, Math.min(5000, Number(env.QUEUE_JOIN_POLL_MS || 1500)))
+}
+
+function playerQueueWaitMaxMs(env) {
+  return Math.max(2000, Math.min(10000, Number(env.PLAYER_QUEUE_WAIT_MAX_MS || 5000)))
+}
+
+function translationPreparingResponse() {
+  return send(
+    503,
+    'text/plain; charset=utf-8',
+    'Malay translation is being prepared. Retry shortly.',
+    {
+      noStore: true,
+      headers: {
+        'retry-after': '3',
+        'x-smartsubs-error': 'translation-preparing',
+        'x-smartsubs-build': BUILD_ID
+      }
+    }
+  )
 }
 
 function queueParallelEnabled(env, attempts = 1) {
@@ -1113,7 +1134,6 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
         joinStatus = 'cache-hit'
       } else {
         const job = await readQueueJobState(env, cacheKey)
-
         if (queueJobActive(job)) {
           await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
             event: 'queue-join-start',
@@ -1124,7 +1144,8 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
             env,
             cache,
             cacheKey,
-            initialJob: job
+            initialJob: job,
+            maxWaitMs: playerQueueWaitMaxMs(env)
           })
 
           joinWaitMs = joined.waitMs
@@ -1138,42 +1159,90 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
               status: 'QUEUE_JOIN',
               translationStats: null
             }
-
             await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
               event: 'queue-join-hit',
               status: joined.jobStatus,
               waitMs: joinWaitMs,
               polls: joinPolls
             }).catch(() => {})
-          } else {
+          } else if (joined.outcome !== 'failed') {
             await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
-              event: joined.outcome === 'failed' ? 'queue-join-fallback' : 'queue-join-timeout',
+              event: 'translation-pending',
               status: joined.jobStatus,
               waitMs: joinWaitMs,
               polls: joinPolls,
               reason: joined.outcome
             }).catch(() => {})
+
+            return translationPreparingResponse()
           }
         }
       }
 
       if (!result) {
-        if (!joinStatus) joinStatus = 'direct'
-
         if (!await rateLimitAllowed(env.SMARTSUBS_GENERATE_LIMITER, `generate:${configId}`)) {
           return rateLimitedResponse('translation generation')
         }
 
-        result = await cfGetOrTranslate({
-          cache,
-          upstreamUrl: tokenData.url,
-          sourceId: tokenData.cacheId,
-          model: userConfig.model,
-          apiKey: userConfig.apiKey,
-          cacheVersion: cacheVersion(env)
+        const queued = await enqueuePrefetchTranslation({
+          autoUrl: request.url,
+          env,
+          configToken: token,
+          configId,
+          cacheKey
         })
-      }
 
+        if (queued) {
+          await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+            event: 'player-translation-queued',
+            status: 'queued'
+          }).catch(() => {})
+
+          const joined = await waitForQueueCache({
+            env,
+            cache,
+            cacheKey,
+            maxWaitMs: playerQueueWaitMaxMs(env)
+          })
+
+          joinWaitMs = joined.waitMs
+          joinPolls = joined.polls
+          joinStatus = joined.outcome === 'hit'
+            ? 'player-queue-hit'
+            : `player-queue-${joined.outcome}`
+
+          if (joined.vtt) {
+            result = {
+              vtt: joined.vtt,
+              cacheKey,
+              status: 'QUEUE_JOIN',
+              translationStats: null
+            }
+          } else if (joined.outcome !== 'failed') {
+            await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+              event: 'translation-pending',
+              status: joined.jobStatus || 'queued',
+              waitMs: joinWaitMs,
+              polls: joinPolls,
+              reason: joined.outcome
+            }).catch(() => {})
+
+            return translationPreparingResponse()
+          }
+        }
+
+        if (!result) {
+          joinStatus = joinStatus || 'direct-fallback'
+          result = await cfGetOrTranslate({
+            cache,
+            upstreamUrl: tokenData.url,
+            sourceId: tokenData.cacheId,
+            model: userConfig.model,
+            apiKey: userConfig.apiKey,
+            cacheVersion: cacheVersion(env)
+          })
+        }
+      }
       const totalMs = roundMs(nowMs() - startedAt)
       logPerf({
         milestone: 'M20R2',
@@ -1437,4 +1506,4 @@ export default {
   }
 }
 
-export { BUILD_ID, handleRequest, parseSubtitleArgs, safeMessage, classifyTranslationError, renderConfiguredDiagnosePage, prefetchTranslation, parseAutoTranslationToken, enqueuePrefetchTranslation, processQueueMessage, handleQueue, queueTranslationOptions, translationCacheKey, readQueueJobState, writeQueueJobState, queueJobActive, waitForQueueCache, queueFailureStage, queueFinalEnabled, rateLimitAllowed, rateLimitedResponse, publicReady, shouldPrefetchAutoResult }
+export { BUILD_ID, handleRequest, parseSubtitleArgs, safeMessage, classifyTranslationError, renderConfiguredDiagnosePage, prefetchTranslation, parseAutoTranslationToken, enqueuePrefetchTranslation, processQueueMessage, handleQueue, queueTranslationOptions, translationCacheKey, readQueueJobState, writeQueueJobState, queueJobActive, waitForQueueCache, queueFailureStage, queueFinalEnabled, rateLimitAllowed, rateLimitedResponse, publicReady, shouldPrefetchAutoResult, playerQueueWaitMaxMs, translationPreparingResponse }
