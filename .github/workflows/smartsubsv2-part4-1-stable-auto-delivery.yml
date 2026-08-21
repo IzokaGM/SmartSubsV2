@@ -1,0 +1,265 @@
+name: SmartSubsV2 Part 4.1 - Stable Auto Delivery
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smartsubsv2-part4-1-stable-auto-delivery
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout SmartSubsV2
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify current Part 4 baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f src/translator.js
+          test -f src/cloudflare-worker.mjs
+          test -f wrangler.jsonc
+          test -f test/v2-part4-fast-user-selected-auto.test.js
+          test -f package-lock.json
+          grep -Fq "Math.min(4, explicitConcurrency)" src/translator.js
+          grep -Fq "user-selected-fast" src/cloudflare-worker.mjs
+          grep -Fq "QUEUE_USER_SELECTED_CONCURRENCY || 4" src/cloudflare-worker.mjs
+          grep -Fq "queueProfile: 'user-selected-fast'" src/cloudflare-worker.mjs
+          grep -Fq '"QUEUE_USER_SELECTED_CONCURRENCY": "4"' wrangler.jsonc
+
+      - name: Apply stable delivery rollback
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          import json
+
+          # Revert explicit Gemini chunk concurrency cap to the proven stable value.
+          p = Path('src/translator.js')
+          s = p.read_text()
+          old = '? Math.max(1, Math.min(4, explicitConcurrency))'
+          new = '? Math.max(1, Math.min(3, explicitConcurrency))'
+          if old in s:
+              s = s.replace(old, new, 1)
+          elif new not in s:
+              raise SystemExit('translator concurrency rollback guard failed')
+          p.write_text(s)
+
+          # Make the user-selected Queue profile stable and keep old fast messages compatible.
+          p = Path('src/cloudflare-worker.mjs')
+          s = p.read_text()
+          old = """function normaliseRequestedQueueProfile(value) {
+            return String(value || '') === 'user-selected-fast'
+              ? 'user-selected-fast'
+              : ''
+          }"""
+          new = """function normaliseRequestedQueueProfile(value) {
+            const requested = String(value || '')
+            return requested === 'user-selected-stable' || requested === 'user-selected-fast'
+              ? 'user-selected-stable'
+              : ''
+          }"""
+          if "requested === 'user-selected-stable'" not in s:
+              if old not in s: raise SystemExit('requested profile normaliser guard failed')
+              s = s.replace(old, new, 1)
+
+          s = s.replace("if (attempt === 1 && requested === 'user-selected-fast') return 'user-selected-fast'",
+                        "if (attempt === 1 && requested === 'user-selected-stable') return 'user-selected-stable'", 1)
+          s = s.replace("if (retryAttempt === 1 && requested === 'user-selected-fast') {",
+                        "if (retryAttempt === 1 && requested === 'user-selected-stable') {", 1)
+
+          oldc = "concurrency: Math.max(1, Math.min(4, Number(env.QUEUE_USER_SELECTED_CONCURRENCY || 4)))"
+          newc = "concurrency: Math.max(1, Math.min(3, Number(env.QUEUE_USER_SELECTED_CONCURRENCY || 3)))"
+          if oldc in s:
+              s = s.replace(oldc, newc, 1)
+          elif newc not in s:
+              raise SystemExit('user-selected concurrency guard failed')
+
+          if "queueProfile: 'user-selected-fast'" in s:
+              s = s.replace("queueProfile: 'user-selected-fast'", "queueProfile: 'user-selected-stable'", 1)
+          elif "queueProfile: 'user-selected-stable'" not in s:
+              raise SystemExit('selected route profile guard failed')
+          p.write_text(s)
+
+          # Deployed player wait: 9 seconds. This stays below 10 seconds but covers more of the Queue job.
+          p = Path('wrangler.jsonc')
+          cfg = json.loads(p.read_text())
+          vars_ = cfg.setdefault('vars', {})
+          vars_['PLAYER_QUEUE_WAIT_MAX_MS'] = '9000'
+          vars_['QUEUE_USER_SELECTED_CHUNK_ITEMS'] = '160'
+          vars_['QUEUE_USER_SELECTED_CHUNK_CHARS'] = '20000'
+          vars_['QUEUE_USER_SELECTED_CONCURRENCY'] = '3'
+          p.write_text(json.dumps(cfg, indent=2) + '\n')
+
+          PY
+
+      - name: Update superseded Part 4 regression expectations
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          p = Path('test/v2-part4-fast-user-selected-auto.test.js')
+          s = p.read_text()
+          s = s.replace('Part 4 explicit translation profile can run four chunks concurrently', 'Part 4.1 caps explicit translation concurrency at stable value three')
+          s = s.replace('assert.equal(maxActive, 4)', 'assert.equal(maxActive, 3)')
+          s = s.replace('assert.equal(stats.concurrency, 4)', 'assert.equal(stats.concurrency, 3)')
+          s = s.replace("'user-selected-fast'", "'user-selected-stable'")
+          s = s.replace("QUEUE_USER_SELECTED_CONCURRENCY: '4'", "QUEUE_USER_SELECTED_CONCURRENCY: '3'")
+          s = s.replace('{ maxItems: 160, maxChars: 20000, concurrency: 4 }', '{ maxItems: 160, maxChars: 20000, concurrency: 3 }')
+          s = s.replace('assert.equal(started.concurrency, 4)', 'assert.equal(started.concurrency, 3)')
+          s = s.replace('assert.equal(completed.concurrency, 4)', 'assert.equal(completed.concurrency, 3)')
+          s = s.replace("/queueProfile: 'user-selected-fast'/", "/queueProfile: 'user-selected-stable'/")
+          s = s.replace("assert.equal(config.vars.QUEUE_USER_SELECTED_CONCURRENCY, '4')", "assert.equal(config.vars.QUEUE_USER_SELECTED_CONCURRENCY, '3')")
+          p.write_text(s)
+
+          PY
+
+      - name: Add Part 4.1 tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > test/v2-part4-1-stable-auto-delivery.test.js <<'TEST'
+          \'use strict\'
+
+          const test = require('node:test')
+          const assert = require('node:assert/strict')
+          const fs = require('node:fs')
+
+          test('Part 4.1 deployed player Queue wait is nine seconds', async () => {
+            const { playerQueueWaitMaxMs } = await import('../src/cloudflare-worker.mjs')
+            const config = JSON.parse(fs.readFileSync('wrangler.jsonc', 'utf8'))
+
+            assert.equal(config.vars.PLAYER_QUEUE_WAIT_MAX_MS, '9000')
+            assert.equal(playerQueueWaitMaxMs({ PLAYER_QUEUE_WAIT_MAX_MS: '9000' }), 9000)
+          })
+
+          test('Part 4.1 selected profile is stable concurrency three', async () => {
+            const { queueTranslationOptions, queueTranslationProfile, normaliseRequestedQueueProfile } = await import('../src/cloudflare-worker.mjs')
+            const env = {
+              QUEUE_USER_SELECTED_CHUNK_ITEMS: '160',
+              QUEUE_USER_SELECTED_CHUNK_CHARS: '20000',
+              QUEUE_USER_SELECTED_CONCURRENCY: '3',
+              QUEUE_FALLBACK_CHUNK_ITEMS: '180',
+              QUEUE_FALLBACK_CHUNK_CHARS: '24000',
+              QUEUE_FALLBACK_CONCURRENCY: '2'
+            }
+
+            assert.equal(normaliseRequestedQueueProfile('user-selected-fast'), 'user-selected-stable')
+            assert.equal(queueTranslationProfile(env, 1, 'user-selected-stable'), 'user-selected-stable')
+            assert.deepEqual(queueTranslationOptions(env, 1, 'user-selected-stable'), {
+              maxItems: 160,
+              maxChars: 20000,
+              concurrency: 3
+            })
+            assert.equal(queueTranslationProfile(env, 2, 'user-selected-stable'), 'fallback-stable')
+          })
+
+          test('Part 4.1 selected route uses stable profile and durable Queue wait', () => {
+            const source = fs.readFileSync('src/cloudflare-worker.mjs', 'utf8')
+            const routeStart = source.indexOf('const translationMatch =')
+            const routeEnd = source.indexOf("if (request.method === 'GET')", routeStart)
+            const route = source.slice(routeStart, routeEnd)
+
+            assert.match(route, /queueProfile: 'user-selected-stable'/)
+            assert.match(route, /maxWaitMs: playerQueueWaitMaxMs\(env\)/)
+            assert.match(route, /translationPreparingResponse/)
+            assert.match(route, /player-translation-queued/)
+          })
+
+          TEST
+
+      - name: Add Part 4.1 notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs
+          cat > docs/V2_PART4_1_STABLE_AUTO_DELIVERY.md <<'DOC'
+          # SmartSubsV2 Part 4.1: Stable Auto Delivery
+
+          Part 4 live testing showed that user-selected concurrency 4 was slower and less reliable than the Part 3.1 baseline. Two Gemini calls reached the 30 second abort timeout, causing seven Gemini calls and about 47 seconds total translation time.
+
+          Part 4.1 rolls the selected translation path back to concurrency 3.
+
+          It also increases the deployed player Queue wait from 5 seconds to 9 seconds. This stays below 10 seconds while giving Nuvio automatic retries a much better chance of remaining open when a roughly 28 second Queue translation finishes.
+
+          The selected Queue profile is renamed to `user-selected-stable`. Old `user-selected-fast` Queue messages are accepted and normalised to the stable profile.
+
+          Unchanged: weak native Malay still consumes no Gemini quota until Malay Auto is selected, Queue remains durable, cache remains persistent, no-native background pretranslation remains enabled, and all MYT Diagnose data remains available.
+          DOC
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Focused Part 4.1 tests
+        run: |
+          node --test test/v2-part4-fast-user-selected-auto.test.js
+          node --test test/v2-part4-1-stable-auto-delivery.test.js
+
+      - name: Full regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run check
+          npm test
+          git diff --check
+
+      - name: Verify stable delivery and Diagnose preservation
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fq "Math.min(3, explicitConcurrency)" src/translator.js
+          grep -Fq "user-selected-stable" src/cloudflare-worker.mjs
+          grep -Fq "QUEUE_USER_SELECTED_CONCURRENCY || 3" src/cloudflare-worker.mjs
+          grep -Fq "queueProfile: 'user-selected-stable'" src/cloudflare-worker.mjs
+          grep -Fq '"PLAYER_QUEUE_WAIT_MAX_MS": "9000"' wrangler.jsonc
+          grep -Fq '"QUEUE_USER_SELECTED_CONCURRENCY": "3"' wrangler.jsonc
+          grep -Fq '"QUEUE_FINAL_CONCURRENCY": "3"' wrangler.jsonc
+          grep -Fq "Malaysia time (MYT, Asia/Kuala_Lumpur)" src/cloudflare-worker.mjs
+          grep -Fq "Raw recent events" src/cloudflare-worker.mjs
+          grep -Fq "translation-pending" src/cloudflare-worker.mjs
+          grep -Fq "player-translation-queued" src/cloudflare-worker.mjs
+
+          unexpected="$(
+            git status --porcelain |
+            awk '{print $2}' |
+            grep -Ev '^(src/translator\.js|src/cloudflare-worker\.mjs|wrangler\.jsonc|test/v2-part4-fast-user-selected-auto\.test\.js|test/v2-part4-1-stable-auto-delivery\.test\.js|docs/V2_PART4_1_STABLE_AUTO_DELIVERY\.md)$' || true
+          )"
+          if [[ -n "$unexpected" ]]; then
+            echo "Unexpected files changed:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+      - name: Commit verified Part 4.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/translator.js src/cloudflare-worker.mjs wrangler.jsonc \
+            test/v2-part4-fast-user-selected-auto.test.js \
+            test/v2-part4-1-stable-auto-delivery.test.js \
+            docs/V2_PART4_1_STABLE_AUTO_DELIVERY.md
+          if git diff --cached --quiet; then
+            echo "Part 4.1 is already applied."
+            exit 0
+          fi
+          git commit -m "Stabilize Malay Auto delivery"
+          git push origin HEAD:main
