@@ -1,0 +1,186 @@
+name: Bootstrap SmartSubsV2 Baseline
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smartsubsv2-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout SmartSubsV2
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Guard against accidental overwrite
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -d src || -f package.json || -f wrangler.jsonc ]]; then
+            echo "SmartSubsV2 already contains project source."
+            echo "Bootstrap is one-time only."
+            exit 1
+          fi
+
+      - name: Copy exact stable SmartSubs baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+
+          git clone --depth 1 --branch main \
+            https://github.com/IzokaGM/SmartSubs.git "$tmp/source"
+
+          SOURCE_SHA="$(git -C "$tmp/source" rev-parse HEAD)"
+
+          # Important:
+          # .github is deliberately excluded.
+          # A normal GITHUB_TOKEN cannot push changes to workflow files.
+          rsync -a \
+            --exclude='.git' \
+            --exclude='.github' \
+            "$tmp/source/" ./
+
+          mkdir -p docs
+          cat > docs/V2_BASELINE.md <<DOC
+          # SmartSubsV2 baseline
+
+          SmartSubsV2 starts as an exact functional copy of the stable SmartSubs source.
+
+          Source repository:
+          https://github.com/IzokaGM/SmartSubs
+
+          Source commit:
+          ${SOURCE_SHA}
+
+          Part 0 intentionally keeps runtime behaviour, identifiers, tests,
+          translation logic and Cloudflare configuration unchanged.
+
+          SmartSubsV2 improvements will be introduced one tested part at a time.
+          DOC
+
+          cat > docs/V2_ROADMAP.md <<'DOC'
+          # SmartSubsV2 roadmap
+
+          ## Product target
+
+          1. Faster Malay subtitle availability.
+          2. Better Malay translation quality.
+          3. Better release matching and sync reliability.
+          4. Strong diagnostics for monitoring the whole pipeline.
+
+          ## Development parts
+
+          0. Verified stable baseline.
+          1. Rank native Malay subtitles instead of accepting any Malay result.
+          2. Strengthen English source ranking and Malay versus English confidence.
+          3. Add context-overlap translation while preserving parallel speed.
+          4. Improve queue join and translation deduplication.
+          5. Improve exact-source caching and earliest possible pretranslation.
+          6. Expand diagnostics and performance monitoring.
+          7. Stability and real playback regression validation.
+
+          ## Required final diagnostics
+
+          The final diagnose view should show, with secrets redacted:
+
+          - media/request identity
+          - Malay candidates considered
+          - English candidates considered
+          - selected source and selection reason
+          - release-match signals and confidence
+          - native Malay versus Malay Auto decision
+          - cache HIT, MISS or JOIN
+          - queue state
+          - source fetch time
+          - source bytes and cue count
+          - translation chunk count and concurrency
+          - Gemini call count and HTTP status classes
+          - translation timing
+          - retries and fallback cue count
+          - total subtitle pipeline time
+          - concise diagnosis of the slowest or failing stage
+          DOC
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install exact dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+
+      - name: Syntax check
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run check
+
+      - name: Regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm test
+
+      - name: Verify no workflow files changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! git diff --quiet -- .github/workflows; then
+            echo "ERROR: bootstrap attempted to modify workflow files."
+            git diff -- .github/workflows
+            exit 1
+          fi
+
+          if [[ -n "$(git ls-files --others --exclude-standard .github/workflows)" ]]; then
+            echo "ERROR: bootstrap created an untracked workflow file."
+            git ls-files --others --exclude-standard .github/workflows
+            exit 1
+          fi
+
+          echo "Workflow directory unchanged."
+
+      - name: Commit verified SmartSubsV2 baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Explicitly stage project files only.
+          # Do not stage .github/workflows.
+          git add \
+            .gitignore \
+            README.md \
+            START_HERE.md \
+            docs \
+            package.json \
+            package-lock.json \
+            src \
+            test \
+            wrangler.jsonc
+
+          if git diff --cached --quiet; then
+            echo "No project changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Bootstrap verified SmartSubsV2 baseline"
+          git push origin HEAD:main
