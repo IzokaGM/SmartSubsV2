@@ -232,12 +232,12 @@ test('M20 Wrangler final config is quota-safe and public-ready', () => {
   assert.deepEqual(config.ratelimits, [
     {
       name: 'SMARTSUBS_SUBTITLE_LIMITER',
-      namespace_id: '9282001',
+      namespace_id: '9282101',
       simple: { limit: 120, period: 60 }
     },
     {
       name: 'SMARTSUBS_GENERATE_LIMITER',
-      namespace_id: '9282002',
+      namespace_id: '9282102',
       simple: { limit: 6, period: 60 }
     }
   ])

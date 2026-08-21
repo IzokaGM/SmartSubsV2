@@ -152,9 +152,9 @@ test('M15 Wrangler config serializes translation queue consumer', () => {
   const config = JSON.parse(fs.readFileSync('wrangler.jsonc', 'utf8'))
   assert.deepEqual(config.queues.producers, [{
     binding: 'SMARTSUBS_TRANSLATION_QUEUE',
-    queue: 'smartsubs-translation'
+    queue: 'smartsubsv2-translation'
   }])
-  assert.equal(config.queues.consumers[0].queue, 'smartsubs-translation')
+  assert.equal(config.queues.consumers[0].queue, 'smartsubsv2-translation')
   assert.equal(config.queues.consumers[0].max_batch_size, 1)
   assert.equal(config.queues.consumers[0].max_concurrency, 1)
 })

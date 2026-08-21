@@ -1,5 +1,5 @@
 {
-  "name": "smartsubs",
+  "name": "smartsubsv2",
   "main": "src/cloudflare-worker.mjs",
   "compatibility_date": "2026-08-20",
   "compatibility_flags": [
@@ -31,19 +31,19 @@
   "kv_namespaces": [
     {
       "binding": "SMARTSUBS_CACHE",
-      "id": "4d1aa89065f44614bd7f5b7398f8b5b0"
+      "id": "dee972fb2e584111a7cd9666cbbd371f"
     }
   ],
   "queues": {
     "producers": [
       {
         "binding": "SMARTSUBS_TRANSLATION_QUEUE",
-        "queue": "smartsubs-translation"
+        "queue": "smartsubsv2-translation"
       }
     ],
     "consumers": [
       {
-        "queue": "smartsubs-translation",
+        "queue": "smartsubsv2-translation",
         "max_batch_size": 1,
         "max_batch_timeout": 1,
         "max_retries": 2,
@@ -55,7 +55,7 @@
   "ratelimits": [
     {
       "name": "SMARTSUBS_SUBTITLE_LIMITER",
-      "namespace_id": "9282001",
+      "namespace_id": "9282101",
       "simple": {
         "limit": 120,
         "period": 60
@@ -63,7 +63,7 @@
     },
     {
       "name": "SMARTSUBS_GENERATE_LIMITER",
-      "namespace_id": "9282002",
+      "namespace_id": "9282102",
       "simple": {
         "limit": 6,
         "period": 60
