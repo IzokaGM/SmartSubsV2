@@ -1,0 +1,415 @@
+name: SmartSubsV2 Part 3.1 - Selected Auto Queue Fix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smartsubsv2-part3-1-selected-auto-queue
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout SmartSubsV2
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify Part 3 baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f src/cloudflare-worker.mjs
+          test -f src/diagnostics.js
+          test -f package-lock.json
+
+          grep -Fq "auto-prefetch-skipped" src/cloudflare-worker.mjs
+          grep -Fq "function shouldPrefetchAutoResult" src/cloudflare-worker.mjs
+          grep -Fq "const translationMatch =" src/cloudflare-worker.mjs
+          grep -Fq "result = await cfGetOrTranslate" src/cloudflare-worker.mjs
+          grep -Fq "function waitForQueueCache" src/cloudflare-worker.mjs
+
+      - name: Apply selected Auto Queue fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("src/cloudflare-worker.mjs")
+          text = path.read_text()
+
+          join_anchor = """function queueJoinPollMs(env) {
+            return Math.max(500, Math.min(5000, Number(env.QUEUE_JOIN_POLL_MS || 1500)))
+          }
+          """
+          join_new = """function queueJoinPollMs(env) {
+            return Math.max(500, Math.min(5000, Number(env.QUEUE_JOIN_POLL_MS || 1500)))
+          }
+
+          function playerQueueWaitMaxMs(env) {
+            return Math.max(2000, Math.min(10000, Number(env.PLAYER_QUEUE_WAIT_MAX_MS || 5000)))
+          }
+
+          function translationPreparingResponse() {
+            return send(
+              503,
+              'text/plain; charset=utf-8',
+              'Malay translation is being prepared. Retry shortly.',
+              {
+                noStore: true,
+                headers: {
+                  'retry-after': '3',
+                  'x-smartsubs-error': 'translation-preparing',
+                  'x-smartsubs-build': BUILD_ID
+                }
+              }
+            )
+          }
+          """
+          if "function playerQueueWaitMaxMs(" not in text:
+              if join_anchor not in text:
+                  raise SystemExit("Queue join helper anchor failed")
+              text = text.replace(join_anchor, join_new, 1)
+
+          old_join = """          const joined = await waitForQueueCache({
+                      env,
+                      cache,
+                      cacheKey,
+                      initialJob: job
+                    })"""
+          new_join = """          const joined = await waitForQueueCache({
+                      env,
+                      cache,
+                      cacheKey,
+                      initialJob: job,
+                      maxWaitMs: playerQueueWaitMaxMs(env)
+                    })"""
+          if "maxWaitMs: playerQueueWaitMaxMs(env)" not in text:
+              if old_join not in text:
+                  raise SystemExit("Player Queue join guard failed")
+              text = text.replace(old_join, new_join, 1)
+
+          old_block = """          } else {
+                      await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+                        event: joined.outcome === 'failed' ? 'queue-join-fallback' : 'queue-join-timeout',
+                        status: joined.jobStatus,
+                        waitMs: joinWaitMs,
+                        polls: joinPolls,
+                        reason: joined.outcome
+                      }).catch(() => {})
+                    }
+                  }
+                }
+                if (!result) {
+                  if (!joinStatus) joinStatus = 'direct'
+
+                  if (!await rateLimitAllowed(env.SMARTSUBS_GENERATE_LIMITER, `generate:${configId}`)) {
+                    return rateLimitedResponse('translation generation')
+                  }
+
+                  result = await cfGetOrTranslate({
+                    cache,
+                    upstreamUrl: tokenData.url,
+                    sourceId: tokenData.cacheId,
+                    model: userConfig.model,
+                    apiKey: userConfig.apiKey,
+                    cacheVersion: cacheVersion(env)
+                  })
+                }"""
+
+          new_block = """          } else {
+                      await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+                        event: joined.outcome === 'failed' ? 'queue-join-fallback' : 'translation-pending',
+                        status: joined.jobStatus,
+                        waitMs: joinWaitMs,
+                        polls: joinPolls,
+                        reason: joined.outcome
+                      }).catch(() => {})
+
+                      if (joined.outcome !== 'failed') {
+                        return translationPreparingResponse()
+                      }
+                    }
+                  }
+                }
+
+                if (!result) {
+                  if (!await rateLimitAllowed(env.SMARTSUBS_GENERATE_LIMITER, `generate:${configId}`)) {
+                    return rateLimitedResponse('translation generation')
+                  }
+
+                  const queued = await enqueuePrefetchTranslation({
+                    autoUrl: request.url,
+                    env,
+                    configToken: token,
+                    configId,
+                    cacheKey
+                  })
+
+                  if (queued) {
+                    await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+                      event: 'player-translation-queued',
+                      status: 'queued'
+                    }).catch(() => {})
+
+                    const joined = await waitForQueueCache({
+                      env,
+                      cache,
+                      cacheKey,
+                      maxWaitMs: playerQueueWaitMaxMs(env)
+                    })
+
+                    joinWaitMs = joined.waitMs
+                    joinPolls = joined.polls
+                    joinStatus = joined.outcome === 'hit'
+                      ? 'player-queue-hit'
+                      : `player-queue-${joined.outcome}`
+
+                    if (joined.vtt) {
+                      result = {
+                        vtt: joined.vtt,
+                        cacheKey,
+                        status: 'QUEUE_JOIN',
+                        translationStats: null
+                      }
+                    } else {
+                      await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+                        event: 'translation-pending',
+                        status: joined.jobStatus || 'queued',
+                        waitMs: joinWaitMs,
+                        polls: joinPolls,
+                        reason: joined.outcome
+                      }).catch(() => {})
+
+                      if (joined.outcome !== 'failed') {
+                        return translationPreparingResponse()
+                      }
+                    }
+                  }
+
+                  if (!result) {
+                    joinStatus = joinStatus || 'direct-fallback'
+                    result = await cfGetOrTranslate({
+                      cache,
+                      upstreamUrl: tokenData.url,
+                      sourceId: tokenData.cacheId,
+                      model: userConfig.model,
+                      apiKey: userConfig.apiKey,
+                      cacheVersion: cacheVersion(env)
+                    })
+                  }
+                }"""
+
+          if "event: 'player-translation-queued'" not in text:
+              if old_block not in text:
+                  raise SystemExit("Selected Auto translation block guard failed")
+              text = text.replace(old_block, new_block, 1)
+
+          map_anchor = """    TRANSLATION_REQUESTED_WAITING_FOR_RESULT: ['Translation requested', 'warn', 'The player requested Malay Auto and SmartSubsV2 is waiting for the result.'],"""
+          map_new = """    TRANSLATION_REQUESTED_WAITING_FOR_RESULT: ['Translation requested', 'warn', 'The player requested Malay Auto and SmartSubsV2 is waiting for the result.'],
+              TRANSLATION_PREPARING_IN_QUEUE: ['Translation preparing', 'warn', 'Malay Auto is translating safely in Cloudflare Queue. The player can retry the same subtitle shortly.'],"""
+          if "TRANSLATION_PREPARING_IN_QUEUE:" not in text:
+              if map_anchor not in text:
+                  raise SystemExit("Friendly verdict map anchor failed")
+              text = text.replace(map_anchor, map_new, 1)
+
+          export_anchor = "rateLimitAllowed, rateLimitedResponse, publicReady, shouldPrefetchAutoResult }"
+          export_new = "rateLimitAllowed, rateLimitedResponse, publicReady, shouldPrefetchAutoResult, playerQueueWaitMaxMs, translationPreparingResponse }"
+          if "translationPreparingResponse }" not in text:
+              if export_anchor not in text:
+                  raise SystemExit("Worker export guard failed")
+              text = text.replace(export_anchor, export_new, 1)
+
+          path.write_text(text)
+
+          diag_path = Path("src/diagnostics.js")
+          diag = diag_path.read_text()
+
+          if "TRANSLATION_PREPARING_IN_QUEUE" not in diag:
+              request_line = """  const lastTranslationRequest = rows.find(
+              item => item.event === 'translation-request' && item.status !== 'prefetch'
+            )"""
+              request_new = request_line + """
+            const lastTranslationPending = rows.find(item => item.event === 'translation-pending')
+            const lastPlayerQueue = rows.find(item => item.event === 'player-translation-queued')"""
+              if request_line in diag:
+                  diag = diag.replace(request_line, request_new, 1)
+
+              verdict_line = """  if (lastQueueJoinStart && Number(lastQueueJoinStart.ts) >= Number(lastSubtitle.ts)) return 'QUEUE_JOIN_WAITING'
+            if (lastTranslationRequest && Number(lastTranslationRequest.ts) >= Number(lastSubtitle.ts)) return 'TRANSLATION_REQUESTED_WAITING_FOR_RESULT'"""
+              verdict_new = """  if (lastTranslationPending && Number(lastTranslationPending.ts) >= Number(lastSubtitle.ts)) return 'TRANSLATION_PREPARING_IN_QUEUE'
+            if (lastPlayerQueue && Number(lastPlayerQueue.ts) >= Number(lastSubtitle.ts)) return 'TRANSLATION_PREPARING_IN_QUEUE'
+            if (lastQueueJoinStart && Number(lastQueueJoinStart.ts) >= Number(lastSubtitle.ts)) return 'QUEUE_JOIN_WAITING'
+            if (lastTranslationRequest && Number(lastTranslationRequest.ts) >= Number(lastSubtitle.ts)) return 'TRANSLATION_REQUESTED_WAITING_FOR_RESULT'"""
+              if verdict_line in diag:
+                  diag = diag.replace(verdict_line, verdict_new, 1)
+
+          diag_path.write_text(diag)
+          PY
+
+      - name: Add Part 3.1 regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > test/v2-part3-1-selected-auto-queue.test.js <<'TEST'
+          'use strict'
+
+          const test = require('node:test')
+          const assert = require('node:assert/strict')
+
+          test('Part 3.1 player Queue wait is deliberately short', async () => {
+            const { playerQueueWaitMaxMs } = await import('../src/cloudflare-worker.mjs')
+
+            assert.equal(playerQueueWaitMaxMs({}), 5000)
+            assert.equal(playerQueueWaitMaxMs({ PLAYER_QUEUE_WAIT_MAX_MS: 100 }), 2000)
+            assert.equal(playerQueueWaitMaxMs({ PLAYER_QUEUE_WAIT_MAX_MS: 60000 }), 10000)
+          })
+
+          test('Part 3.1 preparing response is retryable instead of hanging', async () => {
+            const { translationPreparingResponse } = await import('../src/cloudflare-worker.mjs')
+
+            const response = translationPreparingResponse()
+
+            assert.equal(response.status, 503)
+            assert.equal(response.headers.get('retry-after'), '3')
+            assert.equal(response.headers.get('x-smartsubs-error'), 'translation-preparing')
+            assert.match(await response.text(), /being prepared/i)
+          })
+
+          test('Part 3.1 selected Auto route uses Queue before direct fallback', async () => {
+            const fs = require('node:fs')
+            const source = fs.readFileSync('src/cloudflare-worker.mjs', 'utf8')
+
+            const start = source.indexOf("const translationMatch =")
+            const end = source.indexOf("if (request.method === 'GET')", start)
+            const translatedRoute = source.slice(start, end)
+
+            assert.match(translatedRoute, /player-translation-queued/)
+            assert.match(translatedRoute, /enqueuePrefetchTranslation/)
+            assert.match(translatedRoute, /playerQueueWaitMaxMs/)
+            assert.match(translatedRoute, /translationPreparingResponse/)
+            assert.match(translatedRoute, /direct-fallback/)
+
+            const queuePos = translatedRoute.indexOf('enqueuePrefetchTranslation')
+            const directPos = translatedRoute.indexOf('result = await cfGetOrTranslate')
+            assert.ok(queuePos >= 0)
+            assert.ok(directPos > queuePos)
+          })
+
+          test('Part 3.1 active Queue join also uses short player wait', async () => {
+            const fs = require('node:fs')
+            const source = fs.readFileSync('src/cloudflare-worker.mjs', 'utf8')
+
+            assert.match(
+              source,
+              /initialJob: job,\s*maxWaitMs: playerQueueWaitMaxMs\(env\)/
+            )
+          })
+          TEST
+
+      - name: Add Part 3.1 notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs
+          cat > docs/V2_PART3_1_SELECTED_AUTO_QUEUE.md <<'DOC'
+          # SmartSubsV2 Part 3.1: Selected Auto Queue Fix
+
+          Part 3 correctly stopped background Gemini use when weak native Malay exists.
+
+          The live test exposed a player-delivery problem: when the user selected Malay Auto,
+          the translated VTT route attempted the full Gemini translation synchronously inside
+          the player's HTTP request. A slow translation can outlive the player's willingness
+          to wait, leaving only a `translation-request` diagnostic with no delivered subtitle.
+
+          Part 3.1 changes the selected-Auto path:
+
+          1. Cache is checked first.
+          2. If a Queue job already exists, the player waits only a short bounded time.
+          3. If no job exists, selecting Malay Auto starts exactly one deduplicated Queue job.
+          4. The request waits up to 5 seconds for a fast Queue/cache result.
+          5. If translation is still running, SmartSubs returns HTTP 503 with `Retry-After: 3`
+             and `x-smartsubs-error: translation-preparing`.
+          6. The Queue continues independently even after the player request returns.
+          7. A later retry or re-selection receives the cached VTT.
+          8. Direct synchronous Gemini translation remains only as a last-resort fallback if
+             Queue is unavailable or its job has failed.
+
+          This preserves Part 3 quota protection. Gemini still starts only when Malay Auto is
+          actually selected for weak native Malay, and repeated requests deduplicate through
+          the existing Queue job/cache key.
+          DOC
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Focused Part 3.1 tests
+        run: node --test test/v2-part3-1-selected-auto-queue.test.js
+
+      - name: Full regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run check
+          npm test
+          git diff --check
+
+      - name: Verify patch scope
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          grep -Fq "function playerQueueWaitMaxMs" src/cloudflare-worker.mjs
+          grep -Fq "function translationPreparingResponse" src/cloudflare-worker.mjs
+          grep -Fq "player-translation-queued" src/cloudflare-worker.mjs
+          grep -Fq "translation-pending" src/cloudflare-worker.mjs
+          grep -Fq "Retry shortly" src/cloudflare-worker.mjs
+          grep -Fq "Raw recent events" src/cloudflare-worker.mjs
+          grep -Fq "Malaysia time (MYT, Asia/Kuala_Lumpur)" src/cloudflare-worker.mjs
+
+          unexpected="$(
+            git status --porcelain |
+            awk '{print $2}' |
+            grep -Ev '^(src/cloudflare-worker\.mjs|src/diagnostics\.js|test/v2-part3-1-selected-auto-queue\.test\.js|docs/V2_PART3_1_SELECTED_AUTO_QUEUE\.md)$' || true
+          )"
+
+          if [[ -n "$unexpected" ]]; then
+            echo "Unexpected files changed:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+      - name: Commit verified Part 3.1
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            src/cloudflare-worker.mjs \
+            src/diagnostics.js \
+            test/v2-part3-1-selected-auto-queue.test.js \
+            docs/V2_PART3_1_SELECTED_AUTO_QUEUE.md
+
+          if git diff --cached --quiet; then
+            echo "Part 3.1 is already applied."
+            exit 0
+          fi
+
+          git commit -m "Queue selected Malay Auto translation"
+          git push origin HEAD:main
