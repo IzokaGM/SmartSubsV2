@@ -1,0 +1,156 @@
+name: SmartSubsV2 Cloudflare Config
+
+on:
+  workflow_dispatch:
+    inputs:
+      kv_namespace_id:
+        description: "Cloudflare KV namespace ID for smartsubsv2-cache"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smartsubsv2-cloudflare-config
+  cancel-in-progress: false
+
+jobs:
+  configure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout SmartSubsV2
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify current baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f wrangler.jsonc
+          test -f package.json
+          test -f package-lock.json
+          test -f src/cloudflare-worker.mjs
+
+          kv="${{ inputs.kv_namespace_id }}"
+          if [[ ! "$kv" =~ ^[0-9a-fA-F]{32}$ ]]; then
+            echo "KV namespace ID must be a 32-character hexadecimal Cloudflare namespace ID."
+            exit 1
+          fi
+
+      - name: Apply V2-only Cloudflare identity
+        shell: bash
+        env:
+          V2_KV_ID: ${{ inputs.kv_namespace_id }}
+        run: |
+          set -euo pipefail
+
+          node <<'NODE'
+          const fs = require('node:fs')
+          const path = 'wrangler.jsonc'
+          const config = JSON.parse(fs.readFileSync(path, 'utf8'))
+
+          config.name = 'smartsubsv2'
+
+          const kv = Array.isArray(config.kv_namespaces)
+            ? config.kv_namespaces.find(x => x.binding === 'SMARTSUBS_CACHE')
+            : null
+
+          if (!kv) {
+            throw new Error('SMARTSUBS_CACHE binding not found in wrangler.jsonc')
+          }
+
+          kv.id = process.env.V2_KV_ID
+
+          if (!config.queues?.producers?.length || !config.queues?.consumers?.length) {
+            throw new Error('Expected SmartSubs Queue configuration is missing')
+          }
+
+          for (const producer of config.queues.producers) {
+            if (producer.binding === 'SMARTSUBS_TRANSLATION_QUEUE') {
+              producer.queue = 'smartsubsv2-translation'
+            }
+          }
+
+          for (const consumer of config.queues.consumers) {
+            consumer.queue = 'smartsubsv2-translation'
+          }
+
+          const subtitleLimiter = config.ratelimits?.find(
+            x => x.name === 'SMARTSUBS_SUBTITLE_LIMITER'
+          )
+          const generateLimiter = config.ratelimits?.find(
+            x => x.name === 'SMARTSUBS_GENERATE_LIMITER'
+          )
+
+          if (!subtitleLimiter || !generateLimiter) {
+            throw new Error('Expected SmartSubs rate limiter configuration is missing')
+          }
+
+          // Cloudflare rate-limit namespace IDs are user-defined integers.
+          // These V2 IDs are intentionally different from stable SmartSubs 9282001/9282002.
+          subtitleLimiter.namespace_id = '9282101'
+          generateLimiter.namespace_id = '9282102'
+
+          fs.writeFileSync(path, JSON.stringify(config, null, 2) + '\n')
+          NODE
+
+      - name: Verify V2 isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$(jq -r '.name' wrangler.jsonc)" = "smartsubsv2"
+          test "$(jq -r '.queues.producers[0].queue' wrangler.jsonc)" = "smartsubsv2-translation"
+          test "$(jq -r '.queues.consumers[0].queue' wrangler.jsonc)" = "smartsubsv2-translation"
+
+          kv="$(jq -r '.kv_namespaces[] | select(.binding=="SMARTSUBS_CACHE") | .id' wrangler.jsonc)"
+          test "$kv" = "${{ inputs.kv_namespace_id }}"
+
+          if [[ "$kv" == "4d1aa89065f44614bd7f5b7398f8b5b0" ]]; then
+            echo "ERROR: V2 must not reuse the stable SmartSubs KV namespace."
+            exit 1
+          fi
+
+          test "$(jq -r '.ratelimits[] | select(.name=="SMARTSUBS_SUBTITLE_LIMITER") | .namespace_id' wrangler.jsonc)" = "9282101"
+          test "$(jq -r '.ratelimits[] | select(.name=="SMARTSUBS_GENERATE_LIMITER") | .namespace_id' wrangler.jsonc)" = "9282102"
+
+          echo "SmartSubsV2 Cloudflare identity is isolated from stable SmartSubs."
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Full validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run check
+          npm test
+          git diff --check
+
+      - name: Commit V2 Cloudflare config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add wrangler.jsonc
+
+          if git diff --cached --quiet; then
+            echo "V2 Cloudflare configuration is already applied."
+            exit 0
+          fi
+
+          git commit -m "Configure isolated SmartSubsV2 Cloudflare runtime"
+          git push origin HEAD:main
