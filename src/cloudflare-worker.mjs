@@ -568,6 +568,10 @@ function playerQueueWaitMaxMs(env) {
   return Math.max(2000, Math.min(10000, Number(env.PLAYER_QUEUE_WAIT_MAX_MS || 5000)))
 }
 
+function playerQueueGraceMs(env) {
+  return Math.max(0, Math.min(1000, Number(env.PLAYER_QUEUE_GRACE_MS || 600)))
+}
+
 function translationPreparingResponse() {
   return send(
     503,
@@ -754,7 +758,9 @@ async function waitForQueueCache(options = {}) {
         waitMs: Math.max(0, nowFn() - startedAt),
         polls,
         jobStatus: String(job?.state || 'unknown'),
-        outcome: 'hit'
+        outcome: 'hit',
+        graceWaitMs: 0,
+        graceHit: false
       }
     }
 
@@ -771,7 +777,39 @@ async function waitForQueueCache(options = {}) {
       waitMs: Math.max(0, nowFn() - startedAt),
       polls,
       jobStatus: String(job?.state || 'unknown'),
-      outcome: 'hit'
+      outcome: 'hit',
+      graceWaitMs: 0,
+      graceHit: false
+    }
+  }
+
+  const graceMs = Math.max(0, Math.min(1000, Number(options.graceMs || 0)))
+  if (graceMs > 0 && queueJobActive(job)) {
+    const graceStartedAt = nowFn()
+    await sleepFn(graceMs)
+    const graceCached = await cache.get(cacheKey).catch(() => null)
+    const graceWaitMs = Math.max(0, nowFn() - graceStartedAt)
+
+    if (graceCached) {
+      return {
+        vtt: graceCached,
+        waitMs: Math.max(0, nowFn() - startedAt),
+        polls,
+        jobStatus: String(job?.state || 'unknown'),
+        outcome: 'hit',
+        graceWaitMs,
+        graceHit: true
+      }
+    }
+
+    return {
+      vtt: null,
+      waitMs: Math.max(0, nowFn() - startedAt),
+      polls,
+      jobStatus: String(job?.state || 'missing'),
+      outcome: job && job.state === 'failed' ? 'failed' : 'timeout',
+      graceWaitMs,
+      graceHit: false
     }
   }
 
@@ -780,7 +818,9 @@ async function waitForQueueCache(options = {}) {
     waitMs: Math.max(0, nowFn() - startedAt),
     polls,
     jobStatus: String(job?.state || 'missing'),
-    outcome: job && job.state === 'failed' ? 'failed' : 'timeout'
+    outcome: job && job.state === 'failed' ? 'failed' : 'timeout',
+    graceWaitMs: 0,
+    graceHit: false
   }
 }
 
@@ -1143,6 +1183,8 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
       const cacheKey = translationCacheKey(tokenData, userConfig.model, env)
       let joinWaitMs = 0
       let joinPolls = 0
+      let joinGraceMs = 0
+      let joinGraceHit = false
       let joinStatus = ''
       let result = null
 
@@ -1168,12 +1210,15 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
             cache,
             cacheKey,
             initialJob: job,
-            maxWaitMs: playerQueueWaitMaxMs(env)
+            maxWaitMs: playerQueueWaitMaxMs(env),
+            graceMs: playerQueueGraceMs(env)
           })
 
           joinWaitMs = joined.waitMs
           joinPolls = joined.polls
-          joinStatus = joined.outcome
+          joinGraceMs = Number(joined.graceWaitMs || 0)
+          joinGraceHit = joined.graceHit === true
+          joinStatus = joined.graceHit ? 'queue-join-grace-hit' : joined.outcome
 
           if (joined.vtt) {
             result = {
@@ -1186,14 +1231,26 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
               event: 'queue-join-hit',
               status: joined.jobStatus,
               waitMs: joinWaitMs,
-              polls: joinPolls
+              polls: joinPolls,
+              graceMs: joinGraceMs,
+              graceHit: joinGraceHit
             }).catch(() => {})
+            if (joinGraceHit) {
+              await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+                event: 'queue-grace-hit',
+                status: joined.jobStatus,
+                waitMs: joinWaitMs,
+                graceMs: joinGraceMs
+              }).catch(() => {})
+            }
           } else if (joined.outcome !== 'failed') {
             await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
               event: 'translation-pending',
               status: joined.jobStatus,
               waitMs: joinWaitMs,
               polls: joinPolls,
+              graceMs: joinGraceMs,
+              graceHit: joinGraceHit,
               reason: joined.outcome
             }).catch(() => {})
 
@@ -1226,16 +1283,27 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
             env,
             cache,
             cacheKey,
-            maxWaitMs: playerQueueWaitMaxMs(env)
+            maxWaitMs: playerQueueWaitMaxMs(env),
+            graceMs: playerQueueGraceMs(env)
           })
 
           joinWaitMs = joined.waitMs
           joinPolls = joined.polls
+          joinGraceMs = Number(joined.graceWaitMs || 0)
+          joinGraceHit = joined.graceHit === true
           joinStatus = joined.outcome === 'hit'
-            ? 'player-queue-hit'
+            ? (joined.graceHit ? 'player-queue-grace-hit' : 'player-queue-hit')
             : `player-queue-${joined.outcome}`
 
           if (joined.vtt) {
+            if (joinGraceHit) {
+              await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+                event: 'queue-grace-hit',
+                status: joined.jobStatus || 'queued',
+                waitMs: joinWaitMs,
+                graceMs: joinGraceMs
+              }).catch(() => {})
+            }
             result = {
               vtt: joined.vtt,
               cacheKey,
@@ -1248,6 +1316,8 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
               status: joined.jobStatus || 'queued',
               waitMs: joinWaitMs,
               polls: joinPolls,
+              graceMs: joinGraceMs,
+              graceHit: joinGraceHit,
               reason: joined.outcome
             }).catch(() => {})
 
@@ -1284,6 +1354,8 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
         totalMs,
         waitMs: joinWaitMs,
         polls: joinPolls,
+        graceMs: joinGraceMs,
+        graceHit: joinGraceHit,
         joinStatus,
         expected: repair.expected,
         received: repair.received,
@@ -1530,4 +1602,4 @@ export default {
   }
 }
 
-export { BUILD_ID, handleRequest, parseSubtitleArgs, safeMessage, classifyTranslationError, renderConfiguredDiagnosePage, prefetchTranslation, parseAutoTranslationToken, enqueuePrefetchTranslation, processQueueMessage, handleQueue, normaliseRequestedQueueProfile, queueTranslationProfile, queueTranslationOptions, translationCacheKey, readQueueJobState, writeQueueJobState, queueJobActive, waitForQueueCache, queueFailureStage, queueFinalEnabled, rateLimitAllowed, rateLimitedResponse, publicReady, shouldPrefetchAutoResult, playerQueueWaitMaxMs, translationPreparingResponse }
+export { BUILD_ID, handleRequest, parseSubtitleArgs, safeMessage, classifyTranslationError, renderConfiguredDiagnosePage, prefetchTranslation, parseAutoTranslationToken, enqueuePrefetchTranslation, processQueueMessage, handleQueue, normaliseRequestedQueueProfile, queueTranslationProfile, queueTranslationOptions, translationCacheKey, readQueueJobState, writeQueueJobState, queueJobActive, waitForQueueCache, queueFailureStage, queueFinalEnabled, rateLimitAllowed, rateLimitedResponse, publicReady, shouldPrefetchAutoResult, playerQueueWaitMaxMs, playerQueueGraceMs, translationPreparingResponse }
