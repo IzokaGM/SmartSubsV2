@@ -1,0 +1,428 @@
+name: SmartSubsV2 Part 4.3 - Strong Delivery Relay
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smartsubsv2-part4-3-strong-delivery-relay
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Checkout SmartSubsV2
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify Part 4.2 baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f src/cloudflare-worker.mjs
+          test -f src/diagnostics.js
+          test -f wrangler.jsonc
+          test -f test/v2-part4-2-auto-delivery-race.test.js
+          test -f package-lock.json
+          grep -Fq "function playerQueueGraceMs(env)" src/cloudflare-worker.mjs
+          grep -Fq "const graceCached = await cache.get(cacheKey)" src/cloudflare-worker.mjs
+          grep -Fq "queueProfile: 'user-selected-stable'" src/cloudflare-worker.mjs
+          grep -Fq '"PLAYER_QUEUE_WAIT_MAX_MS": "9000"' wrangler.jsonc
+          grep -Fq '"PLAYER_QUEUE_GRACE_MS": "600"' wrangler.jsonc
+          grep -Fq '"QUEUE_USER_SELECTED_CONCURRENCY": "3"' wrangler.jsonc
+
+      - name: Apply Part 4.3 strong delivery relay
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json
+          from pathlib import Path
+
+          worker_path = Path('src/cloudflare-worker.mjs')
+          worker = worker_path.read_text()
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label} anchor count was {count}, expected 1')
+              return text.replace(old, new, 1)
+
+          relay_block = r'''function deliveryRelayTtlMs(env) {
+            return Math.max(60000, Math.min(600000, Number(env.DELIVERY_RELAY_TTL_MS || 120000)))
+          }
+
+          function deliveryRelayStub(env, cacheKey) {
+            if (!validTranslationCacheKey(cacheKey)) return null
+            const namespace = env.SMARTSUBS_DELIVERY
+            if (!namespace || typeof namespace.idFromName !== 'function' || typeof namespace.get !== 'function') return null
+            return namespace.get(namespace.idFromName(cacheKey))
+          }
+
+          async function readDeliveryRelay(env, cacheKey) {
+            try {
+              const stub = deliveryRelayStub(env, cacheKey)
+              if (!stub || typeof stub.fetch !== 'function') return null
+              const response = await stub.fetch('https://smartsubs-delivery.internal/vtt')
+              if (!response.ok) return null
+              const value = await response.text()
+              return value.startsWith('WEBVTT') ? value : null
+            } catch {
+              return null
+            }
+          }
+
+          async function writeDeliveryRelay(env, cacheKey, value) {
+            try {
+              const text = String(value || '')
+              const stub = deliveryRelayStub(env, cacheKey)
+              if (!stub || typeof stub.fetch !== 'function' || !text.startsWith('WEBVTT')) return false
+              const response = await stub.fetch('https://smartsubs-delivery.internal/vtt', {
+                method: 'PUT',
+                headers: { 'content-type': 'text/vtt; charset=utf-8' },
+                body: text
+              })
+              return response.ok
+            } catch {
+              return false
+            }
+          }
+
+          async function readReadyTranslation(env, cache, cacheKey) {
+            const cached = await cache.get(cacheKey).catch(() => null)
+            if (cached) return { vtt: cached, source: 'HIT' }
+            const relayed = await readDeliveryRelay(env, cacheKey)
+            return relayed ? { vtt: relayed, source: 'DELIVERY_RELAY' } : null
+          }
+
+          export class TranslationDeliveryRelay {
+            constructor(ctx, env) {
+              this.ctx = ctx
+              this.env = env
+            }
+
+            async fetch(request) {
+              if (request.method === 'PUT') {
+                const value = await request.text()
+                if (!value.startsWith('WEBVTT') || value.length > 2 * 1024 * 1024) {
+                  return new Response('Invalid VTT', { status: 400 })
+                }
+                const expiresAt = Date.now() + deliveryRelayTtlMs(this.env)
+                await this.ctx.storage.put('result', { value, expiresAt })
+                await this.ctx.storage.setAlarm(expiresAt)
+                return new Response(null, { status: 204 })
+              }
+
+              if (request.method === 'GET') {
+                const result = await this.ctx.storage.get('result')
+                if (!result || typeof result.value !== 'string' || Number(result.expiresAt) <= Date.now()) {
+                  if (result) await this.ctx.storage.delete('result')
+                  return new Response(null, { status: 404 })
+                }
+                return new Response(result.value, {
+                  status: 200,
+                  headers: { 'content-type': 'text/vtt; charset=utf-8', 'cache-control': 'no-store' }
+                })
+              }
+
+              return new Response(null, { status: 405 })
+            }
+
+            async alarm() {
+              await this.ctx.storage.deleteAll()
+            }
+          }
+
+          '''
+
+          if 'export class TranslationDeliveryRelay' not in worker:
+              anchor = 'function translationPreparingResponse() {'
+              worker = replace_once(worker, anchor, relay_block + anchor, 'relay class')
+
+              worker = replace_once(worker, '''    const cached = await cache.get(cacheKey).catch(() => null)
+              if (cached) {
+                return {
+                  vtt: cached,
+                  waitMs: Math.max(0, nowFn() - startedAt),
+                  polls,
+                  jobStatus: String(job?.state || 'unknown'),
+                  outcome: 'hit',''', '''    const ready = await readReadyTranslation(env, cache, cacheKey)
+              if (ready) {
+                return {
+                  vtt: ready.vtt,
+                  waitMs: Math.max(0, nowFn() - startedAt),
+                  polls,
+                  jobStatus: String(job?.state || 'unknown'),
+                  outcome: 'hit',
+                  cacheSource: ready.source,''', 'poll relay read')
+
+              worker = replace_once(worker, '''  const finalCached = await cache.get(cacheKey).catch(() => null)
+            if (finalCached) {
+              return {
+                vtt: finalCached,
+                waitMs: Math.max(0, nowFn() - startedAt),
+                polls,
+                jobStatus: String(job?.state || 'unknown'),
+                outcome: 'hit',''', '''  const finalReady = await readReadyTranslation(env, cache, cacheKey)
+            if (finalReady) {
+              return {
+                vtt: finalReady.vtt,
+                waitMs: Math.max(0, nowFn() - startedAt),
+                polls,
+                jobStatus: String(job?.state || 'unknown'),
+                outcome: 'hit',
+                cacheSource: finalReady.source,''', 'final relay read')
+
+              worker = replace_once(worker, '''    const graceCached = await cache.get(cacheKey).catch(() => null)
+              const graceWaitMs = Math.max(0, nowFn() - graceStartedAt)
+
+              if (graceCached) {
+                return {
+                  vtt: graceCached,
+                  waitMs: Math.max(0, nowFn() - startedAt),
+                  polls,
+                  jobStatus: String(job?.state || 'unknown'),
+                  outcome: 'hit',''', '''    const graceReady = await readReadyTranslation(env, cache, cacheKey)
+              const graceWaitMs = Math.max(0, nowFn() - graceStartedAt)
+
+              if (graceReady) {
+                return {
+                  vtt: graceReady.vtt,
+                  waitMs: Math.max(0, nowFn() - startedAt),
+                  polls,
+                  jobStatus: String(job?.state || 'unknown'),
+                  outcome: 'hit',
+                  cacheSource: graceReady.source,''', 'grace relay read')
+
+              old_queue_write = "      translateOptions: queueProfile\n    })\n\n    await writeQueueJobState(env, cacheKey, {"
+              new_queue_write = "      translateOptions: queueProfile\n    })\n\n    const deliveryRelayStored = await writeDeliveryRelay(env, cacheKey, result.vtt)\n\n    await writeQueueJobState(env, cacheKey, {"
+              worker = replace_once(worker, old_queue_write, new_queue_write, 'queue relay write')
+
+              old_relay_diagnose = "      concurrency: repair.concurrency,\n      queueDelayMs,\n      sourceFetchMs: repair.sourceFetchMs,"
+              new_relay_diagnose = "      concurrency: repair.concurrency,\n      queueDelayMs,\n      delivery: deliveryRelayStored ? 'relay-stored' : 'kv-only',\n      sourceFetchMs: repair.sourceFetchMs,"
+              worker = replace_once(worker, old_relay_diagnose, new_relay_diagnose, 'relay diagnose')
+
+              old_initial_read = "      const cached = await cache.get(cacheKey).catch(() => null)\n      if (cached) {\n        result = {\n          vtt: cached,\n          cacheKey,\n          status: 'HIT',\n          translationStats: null\n        }\n        joinStatus = 'cache-hit'\n      } else {"
+              new_initial_read = "      const ready = await readReadyTranslation(env, cache, cacheKey)\n      if (ready) {\n        result = {\n          vtt: ready.vtt,\n          cacheKey,\n          status: ready.source,\n          translationStats: null\n        }\n        joinStatus = ready.source === 'DELIVERY_RELAY' ? 'delivery-relay-hit' : 'cache-hit'\n      } else {"
+              worker = replace_once(worker, old_initial_read, new_initial_read, 'initial relay read')
+
+              old_join_status = "              status: 'QUEUE_JOIN',"
+              new_join_status = "              status: joined.cacheSource === 'DELIVERY_RELAY' ? 'DELIVERY_RELAY' : 'QUEUE_JOIN',"
+              if worker.count(old_join_status) != 2:
+                  raise SystemExit(f'Queue Join result anchor count was {worker.count(old_join_status)}, expected 2')
+              worker = worker.replace(old_join_status, new_join_status)
+
+              old_export = 'playerQueueWaitMaxMs, playerQueueGraceMs, translationPreparingResponse }'
+              new_export = 'playerQueueWaitMaxMs, playerQueueGraceMs, deliveryRelayTtlMs, readDeliveryRelay, writeDeliveryRelay, readReadyTranslation, translationPreparingResponse }'
+              worker = replace_once(worker, old_export, new_export, 'relay exports')
+
+          worker_path.write_text(worker)
+
+          diagnostics_path = Path('src/diagnostics.js')
+          diagnostics = diagnostics_path.read_text()
+          if "'profile', 'delivery'," not in diagnostics:
+              diagnostics = replace_once(diagnostics, "'joinStatus', 'reason', 'profile',", "'joinStatus', 'reason', 'profile', 'delivery',", 'diagnostic field')
+          diagnostics_path.write_text(diagnostics)
+
+          config_path = Path('wrangler.jsonc')
+          config = json.loads(config_path.read_text())
+          config.setdefault('vars', {})['DELIVERY_RELAY_TTL_MS'] = '120000'
+          bindings = config.setdefault('durable_objects', {}).setdefault('bindings', [])
+          if not any(item.get('name') == 'SMARTSUBS_DELIVERY' for item in bindings):
+              bindings.append({'name': 'SMARTSUBS_DELIVERY', 'class_name': 'TranslationDeliveryRelay'})
+          migrations = config.setdefault('migrations', [])
+          if not any(item.get('tag') == 'v2-part4-3-delivery-relay' for item in migrations):
+              migrations.append({
+                  'tag': 'v2-part4-3-delivery-relay',
+                  'new_sqlite_classes': ['TranslationDeliveryRelay']
+              })
+          config_path.write_text(json.dumps(config, indent=2) + '\n')
+          PY
+
+          cp "$GITHUB_WORKSPACE/.github/workflows/smartsubsv2-part4-3-strong-delivery-relay.yml" /tmp/part4-3-workflow.yml
+
+      - name: Add Part 4.3 tests and notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp /tmp/part4-3-workflow.yml .github/workflows/smartsubsv2-part4-3-strong-delivery-relay.yml
+          cat > test/v2-part4-3-strong-delivery-relay.test.js <<'TEST'
+          'use strict'
+
+          const test = require('node:test')
+          const assert = require('node:assert/strict')
+          const fs = require('node:fs')
+
+          function relayNamespace() {
+            const values = new Map()
+            return {
+              idFromName(name) { return name },
+              get(id) {
+                return {
+                  async fetch(_url, init = {}) {
+                    const method = init.method || 'GET'
+                    if (method === 'PUT') {
+                      values.set(id, String(init.body || ''))
+                      return new Response(null, { status: 204 })
+                    }
+                    const value = values.get(id)
+                    return value ? new Response(value, { status: 200 }) : new Response(null, { status: 404 })
+                  }
+                }
+              }
+            }
+          }
+
+          test('Part 4.3 config binds a strongly consistent delivery relay and preserves stable settings', () => {
+            const config = JSON.parse(fs.readFileSync('wrangler.jsonc', 'utf8'))
+            const binding = config.durable_objects.bindings.find(item => item.name === 'SMARTSUBS_DELIVERY')
+            const migration = config.migrations.find(item => item.tag === 'v2-part4-3-delivery-relay')
+            assert.equal(binding.class_name, 'TranslationDeliveryRelay')
+            assert.deepEqual(migration.new_sqlite_classes, ['TranslationDeliveryRelay'])
+            assert.equal(config.vars.DELIVERY_RELAY_TTL_MS, '120000')
+            assert.equal(config.vars.PLAYER_QUEUE_WAIT_MAX_MS, '9000')
+            assert.equal(config.vars.PLAYER_QUEUE_GRACE_MS, '600')
+            assert.equal(config.vars.QUEUE_USER_SELECTED_CONCURRENCY, '3')
+          })
+
+          test('Part 4.3 relay exposes completed VTT while KV still returns a stale miss', async () => {
+            const { writeDeliveryRelay, readReadyTranslation } = await import('../src/cloudflare-worker.mjs')
+            const cacheKey = 'c'.repeat(64)
+            const vtt = 'WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nSiap\n'
+            const env = { SMARTSUBS_DELIVERY: relayNamespace() }
+            assert.equal(await writeDeliveryRelay(env, cacheKey, vtt), true)
+            assert.deepEqual(await readReadyTranslation(env, { async get() { return null } }, cacheKey), {
+              vtt,
+              source: 'DELIVERY_RELAY'
+            })
+          })
+
+          test('Part 4.3 Queue wait reads relay without another Gemini translation', async () => {
+            const { waitForQueueCache, writeDeliveryRelay } = await import('../src/cloudflare-worker.mjs')
+            const cacheKey = 'd'.repeat(64)
+            const vtt = 'WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nDihantar\n'
+            const env = {
+              SMARTSUBS_DELIVERY: relayNamespace(),
+              SMARTSUBS_CACHE: { async get() { return { state: 'running' } } }
+            }
+            let now = 0
+            const result = await waitForQueueCache({
+              env,
+              cache: { async get() { return null } },
+              cacheKey,
+              initialJob: { state: 'running' },
+              maxWaitMs: 10,
+              pollMs: 5,
+              sleepFn: async ms => {
+                now += ms
+                if (now === 5) await writeDeliveryRelay(env, cacheKey, vtt)
+              },
+              nowFn: () => now
+            })
+            assert.equal(result.outcome, 'hit')
+            assert.equal(result.vtt, vtt)
+            assert.equal(result.cacheSource, 'DELIVERY_RELAY')
+            assert.equal(result.polls, 1)
+          })
+          TEST
+
+          cat > docs/V2_PART4_3_STRONG_DELIVERY_RELAY.md <<'DOC'
+          # SmartSubsV2 Part 4.3: Strong Delivery Relay
+
+          The live run completed Queue translation at 23:17:44 MYT, but the player
+          still received `translation-pending` at 23:17:46. The next KV hit arrived
+          only at 23:18:32. This is longer than the Part 4.2 grace window and matches
+          an eventually consistent KV negative read.
+
+          Part 4.3 keeps Workers KV as the 180-day cache and adds a 120-second
+          `TranslationDeliveryRelay` Durable Object for immediate cross-location
+          delivery. The relay expires automatically. It does not add Gemini calls.
+
+          Preserved settings: player wait 9000 ms, grace 600 ms, stable profile,
+          concurrency 3, quota protection, Queue serialization and MYT Diagnose.
+          DOC
+
+      - name: Syntax check generated files
+        run: |
+          node --check src/cloudflare-worker.mjs
+          node --check src/diagnostics.js
+          node --check test/v2-part4-3-strong-delivery-relay.test.js
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Focused Part 4.3 tests
+        run: node --test test/v2-part4-3-strong-delivery-relay.test.js
+
+      - name: Preserve Part 4.1 and Part 4.2 tests
+        run: node --test test/v2-part4-1-stable-auto-delivery.test.js test/v2-part4-2-auto-delivery-race.test.js
+
+      - name: Validate Wrangler deployment bundle
+        run: npx wrangler deploy --dry-run --outdir /tmp/smartsubsv2-part4-3-dry-run
+
+      - name: Full regression suite
+        run: |
+          npm run check
+          npm test
+          git diff --check
+
+      - name: Verify patch scope and safety
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fq "export class TranslationDeliveryRelay" src/cloudflare-worker.mjs
+          grep -Fq "const deliveryRelayStored = await writeDeliveryRelay" src/cloudflare-worker.mjs
+          test "$(grep -Fc "readReadyTranslation(env, cache, cacheKey)" src/cloudflare-worker.mjs)" -eq 4
+          grep -Fq "status: ready.source" src/cloudflare-worker.mjs
+          grep -Fq '"DELIVERY_RELAY_TTL_MS": "120000"' wrangler.jsonc
+          grep -Fq '"name": "SMARTSUBS_DELIVERY"' wrangler.jsonc
+          grep -Fq '"new_sqlite_classes"' wrangler.jsonc
+          grep -Fq '"PLAYER_QUEUE_WAIT_MAX_MS": "9000"' wrangler.jsonc
+          grep -Fq '"PLAYER_QUEUE_GRACE_MS": "600"' wrangler.jsonc
+          grep -Fq '"QUEUE_USER_SELECTED_CONCURRENCY": "3"' wrangler.jsonc
+          grep -Fq "queueProfile: 'user-selected-stable'" src/cloudflare-worker.mjs
+
+          unexpected="$(
+            git status --porcelain |
+            awk '{print $2}' |
+            grep -Ev '^(\.github/workflows/smartsubsv2-part4-3-strong-delivery-relay\.yml|src/cloudflare-worker\.mjs|src/diagnostics\.js|wrangler\.jsonc|test/v2-part4-3-strong-delivery-relay\.test\.js|docs/V2_PART4_3_STRONG_DELIVERY_RELAY\.md)$' || true
+          )"
+          if [[ -n "$unexpected" ]]; then
+            echo "Unexpected files changed:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+      - name: Commit verified Part 4.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            .github/workflows/smartsubsv2-part4-3-strong-delivery-relay.yml \
+            src/cloudflare-worker.mjs \
+            src/diagnostics.js \
+            wrangler.jsonc \
+            test/v2-part4-3-strong-delivery-relay.test.js \
+            docs/V2_PART4_3_STRONG_DELIVERY_RELAY.md
+
+          if git diff --cached --quiet; then
+            echo "Part 4.3 is already applied."
+            exit 0
+          fi
+
+          git commit -m "Add strongly consistent subtitle delivery relay"
+          git push origin HEAD:main
