@@ -572,6 +572,91 @@ function playerQueueGraceMs(env) {
   return Math.max(0, Math.min(1000, Number(env.PLAYER_QUEUE_GRACE_MS || 600)))
 }
 
+function deliveryRelayTtlMs(env) {
+  return Math.max(60000, Math.min(600000, Number(env.DELIVERY_RELAY_TTL_MS || 120000)))
+}
+
+function deliveryRelayStub(env, cacheKey) {
+  if (!validTranslationCacheKey(cacheKey)) return null
+  const namespace = env.SMARTSUBS_DELIVERY
+  if (!namespace || typeof namespace.idFromName !== 'function' || typeof namespace.get !== 'function') return null
+  return namespace.get(namespace.idFromName(cacheKey))
+}
+
+async function readDeliveryRelay(env, cacheKey) {
+  try {
+    const stub = deliveryRelayStub(env, cacheKey)
+    if (!stub || typeof stub.fetch !== 'function') return null
+    const response = await stub.fetch('https://smartsubs-delivery.internal/vtt')
+    if (!response.ok) return null
+    const value = await response.text()
+    return value.startsWith('WEBVTT') ? value : null
+  } catch {
+    return null
+  }
+}
+
+async function writeDeliveryRelay(env, cacheKey, value) {
+  try {
+    const text = String(value || '')
+    const stub = deliveryRelayStub(env, cacheKey)
+    if (!stub || typeof stub.fetch !== 'function' || !text.startsWith('WEBVTT')) return false
+    const response = await stub.fetch('https://smartsubs-delivery.internal/vtt', {
+      method: 'PUT',
+      headers: { 'content-type': 'text/vtt; charset=utf-8' },
+      body: text
+    })
+    return response.ok
+  } catch {
+    return false
+  }
+}
+
+async function readReadyTranslation(env, cache, cacheKey) {
+  const cached = await cache.get(cacheKey).catch(() => null)
+  if (cached) return { vtt: cached, source: 'HIT' }
+  const relayed = await readDeliveryRelay(env, cacheKey)
+  return relayed ? { vtt: relayed, source: 'DELIVERY_RELAY' } : null
+}
+
+export class TranslationDeliveryRelay {
+  constructor(ctx, env) {
+    this.ctx = ctx
+    this.env = env
+  }
+
+  async fetch(request) {
+    if (request.method === 'PUT') {
+      const value = await request.text()
+      if (!value.startsWith('WEBVTT') || value.length > 2 * 1024 * 1024) {
+        return new Response('Invalid VTT', { status: 400 })
+      }
+      const expiresAt = Date.now() + deliveryRelayTtlMs(this.env)
+      await this.ctx.storage.put('result', { value, expiresAt })
+      await this.ctx.storage.setAlarm(expiresAt)
+      return new Response(null, { status: 204 })
+    }
+
+    if (request.method === 'GET') {
+      const result = await this.ctx.storage.get('result')
+      if (!result || typeof result.value !== 'string' || Number(result.expiresAt) <= Date.now()) {
+        if (result) await this.ctx.storage.delete('result')
+        return new Response(null, { status: 404 })
+      }
+      return new Response(result.value, {
+        status: 200,
+        headers: { 'content-type': 'text/vtt; charset=utf-8', 'cache-control': 'no-store' }
+      })
+    }
+
+    return new Response(null, { status: 405 })
+  }
+
+  async alarm() {
+    await this.ctx.storage.deleteAll()
+  }
+}
+
 function translationPreparingResponse() {
   return send(
     503,
@@ -751,14 +836,15 @@ async function waitForQueueCache(options = {}) {
     await sleepFn(waitMs)
     polls++
 
-    const cached = await cache.get(cacheKey).catch(() => null)
-    if (cached) {
+    const ready = await readReadyTranslation(env, cache, cacheKey)
+    if (ready) {
       return {
-        vtt: cached,
+        vtt: ready.vtt,
         waitMs: Math.max(0, nowFn() - startedAt),
         polls,
         jobStatus: String(job?.state || 'unknown'),
         outcome: 'hit',
+        cacheSource: ready.source,
         graceWaitMs: 0,
         graceHit: false
       }
@@ -770,14 +856,15 @@ async function waitForQueueCache(options = {}) {
     }
   }
 
-  const finalCached = await cache.get(cacheKey).catch(() => null)
-  if (finalCached) {
+  const finalReady = await readReadyTranslation(env, cache, cacheKey)
+  if (finalReady) {
     return {
-      vtt: finalCached,
+      vtt: finalReady.vtt,
       waitMs: Math.max(0, nowFn() - startedAt),
       polls,
       jobStatus: String(job?.state || 'unknown'),
       outcome: 'hit',
+      cacheSource: finalReady.source,
       graceWaitMs: 0,
       graceHit: false
     }
@@ -787,16 +874,17 @@ async function waitForQueueCache(options = {}) {
   if (graceMs > 0 && queueJobActive(job)) {
     const graceStartedAt = nowFn()
     await sleepFn(graceMs)
-    const graceCached = await cache.get(cacheKey).catch(() => null)
+    const graceReady = await readReadyTranslation(env, cache, cacheKey)
     const graceWaitMs = Math.max(0, nowFn() - graceStartedAt)
 
-    if (graceCached) {
+    if (graceReady) {
       return {
-        vtt: graceCached,
+        vtt: graceReady.vtt,
         waitMs: Math.max(0, nowFn() - startedAt),
         polls,
         jobStatus: String(job?.state || 'unknown'),
         outcome: 'hit',
+        cacheSource: graceReady.source,
         graceWaitMs,
         graceHit: true
       }
@@ -985,6 +1073,8 @@ async function processQueueMessage(body, env, options = {}) {
       translateOptions: queueProfile
     })
 
+    const deliveryRelayStored = await writeDeliveryRelay(env, cacheKey, result.vtt)
+
     await writeQueueJobState(env, cacheKey, {
       state: 'ready',
       configId,
@@ -1018,6 +1108,7 @@ async function processQueueMessage(body, env, options = {}) {
       chunkChars: repair.chunkChars,
       concurrency: repair.concurrency,
       queueDelayMs,
+      delivery: deliveryRelayStored ? 'relay-stored' : 'kv-only',
       sourceFetchMs: repair.sourceFetchMs,
       parseMs: repair.parseMs,
       sourceBytes: repair.sourceBytes,
@@ -1188,15 +1279,15 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
       let joinStatus = ''
       let result = null
 
-      const cached = await cache.get(cacheKey).catch(() => null)
-      if (cached) {
+      const ready = await readReadyTranslation(env, cache, cacheKey)
+      if (ready) {
         result = {
-          vtt: cached,
+          vtt: ready.vtt,
           cacheKey,
-          status: 'HIT',
+          status: ready.source,
           translationStats: null
         }
-        joinStatus = 'cache-hit'
+        joinStatus = ready.source === 'DELIVERY_RELAY' ? 'delivery-relay-hit' : 'cache-hit'
       } else {
         const job = await readQueueJobState(env, cacheKey)
         if (queueJobActive(job)) {
@@ -1224,7 +1315,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
             result = {
               vtt: joined.vtt,
               cacheKey,
-              status: 'QUEUE_JOIN',
+              status: joined.cacheSource === 'DELIVERY_RELAY' ? 'DELIVERY_RELAY' : 'QUEUE_JOIN',
               translationStats: null
             }
             await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
@@ -1307,7 +1398,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
             result = {
               vtt: joined.vtt,
               cacheKey,
-              status: 'QUEUE_JOIN',
+              status: joined.cacheSource === 'DELIVERY_RELAY' ? 'DELIVERY_RELAY' : 'QUEUE_JOIN',
               translationStats: null
             }
           } else if (joined.outcome !== 'failed') {
@@ -1602,4 +1693,4 @@ export default {
   }
 }
 
-export { BUILD_ID, handleRequest, parseSubtitleArgs, safeMessage, classifyTranslationError, renderConfiguredDiagnosePage, prefetchTranslation, parseAutoTranslationToken, enqueuePrefetchTranslation, processQueueMessage, handleQueue, normaliseRequestedQueueProfile, queueTranslationProfile, queueTranslationOptions, translationCacheKey, readQueueJobState, writeQueueJobState, queueJobActive, waitForQueueCache, queueFailureStage, queueFinalEnabled, rateLimitAllowed, rateLimitedResponse, publicReady, shouldPrefetchAutoResult, playerQueueWaitMaxMs, playerQueueGraceMs, translationPreparingResponse }
+export { BUILD_ID, handleRequest, parseSubtitleArgs, safeMessage, classifyTranslationError, renderConfiguredDiagnosePage, prefetchTranslation, parseAutoTranslationToken, enqueuePrefetchTranslation, processQueueMessage, handleQueue, normaliseRequestedQueueProfile, queueTranslationProfile, queueTranslationOptions, translationCacheKey, readQueueJobState, writeQueueJobState, queueJobActive, waitForQueueCache, queueFailureStage, queueFinalEnabled, rateLimitAllowed, rateLimitedResponse, publicReady, shouldPrefetchAutoResult, playerQueueWaitMaxMs, playerQueueGraceMs, deliveryRelayTtlMs, readDeliveryRelay, writeDeliveryRelay, readReadyTranslation, translationPreparingResponse }

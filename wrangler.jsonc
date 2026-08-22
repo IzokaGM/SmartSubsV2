@@ -31,7 +31,8 @@
     "QUEUE_USER_SELECTED_CHUNK_CHARS": "20000",
     "QUEUE_USER_SELECTED_CONCURRENCY": "3",
     "PLAYER_QUEUE_WAIT_MAX_MS": "9000",
-    "PLAYER_QUEUE_GRACE_MS": "600"
+    "PLAYER_QUEUE_GRACE_MS": "600",
+    "DELIVERY_RELAY_TTL_MS": "120000"
   },
   "kv_namespaces": [
     {
@@ -73,6 +74,22 @@
         "limit": 6,
         "period": 60
       }
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SMARTSUBS_DELIVERY",
+        "class_name": "TranslationDeliveryRelay"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v2-part4-3-delivery-relay",
+      "new_sqlite_classes": [
+        "TranslationDeliveryRelay"
+      ]
     }
   ]
 }
