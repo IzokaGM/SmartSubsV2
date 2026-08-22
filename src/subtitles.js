@@ -78,6 +78,20 @@ function buildAutoSubtitle(englishSubtitle, options = {}) {
   }
 }
 
+function buildEnglishTracks(upstream, extra = {}, limit = 5) {
+  const maxTracks = Math.max(1, Math.min(5, Number(limit) || 5))
+  return rankEnglishSubtitles(dedupeSubtitles(upstream), extra)
+    .slice(0, maxTracks)
+    .map((item, index) => {
+      const subtitle = item.subtitle
+      return {
+        id: `smartsubs-eng-${diagnosticSubtitleId(subtitle, index)}`,
+        url: String(subtitle.url),
+        lang: 'eng'
+      }
+    })
+}
+
 async function handleSubtitles(args, options = {}) {
   const startedAt = nowMs()
   const requestId = crypto.randomUUID()
@@ -121,6 +135,9 @@ async function handleSubtitles(args, options = {}) {
 
     const apiKey = options.apiKey || ''
     const auto = english && apiKey ? buildAutoSubtitle(english, options) : null
+    const englishTracks = options.includeEnglishTracks
+      ? buildEnglishTracks(upstream, args.extra || {}, options.englishTrackLimit)
+      : []
 
     if (malay.length) {
       const nativeSubtitles = malay.slice(0, 5).map(toNativeMalay)
@@ -138,9 +155,10 @@ async function handleSubtitles(args, options = {}) {
         : autoFallbackOffered
           ? 'weak-native-wait-for-user-selection'
           : 'auto-unavailable'
-      const subtitles = autoFallbackOffered
+      const malayOptions = autoFallbackOffered
         ? [...nativeSubtitles, auto]
         : nativeSubtitles
+      const subtitles = [...malayOptions, ...englishTracks]
       const resultName = autoFallbackOffered
         ? 'native-malay-with-auto-fallback'
         : 'native-malay'
@@ -161,6 +179,7 @@ async function handleSubtitles(args, options = {}) {
         autoPrefetch,
         autoPrefetchReason,
         geminiPrefetchAvoided: true,
+        englishTrackCount: englishTracks.length,
         result: resultName,
         totalMs: roundMs(nowMs() - startedAt)
       })
@@ -182,6 +201,7 @@ async function handleSubtitles(args, options = {}) {
         autoPrefetch,
         autoPrefetchReason,
         geminiPrefetchAvoided: true,
+        englishTrackCount: englishTracks.length,
         subtitleCount: subtitles.length,
         languages: subtitles.map(item => item.lang)
       })
@@ -196,6 +216,7 @@ async function handleSubtitles(args, options = {}) {
       }
     }
 
+    const subtitles = [...(auto ? [auto] : []), ...englishTracks]
     const resultName = auto ? 'auto-malay-ready' : english ? 'byok-not-configured' : 'no-english'
     logPerf({
       requestId,
@@ -216,6 +237,7 @@ async function handleSubtitles(args, options = {}) {
       autoPrefetch: Boolean(auto),
       autoPrefetchReason: auto ? 'no-native-malay-aggressive-prefetch' : 'auto-unavailable',
       geminiPrefetchAvoided: false,
+      englishTrackCount: englishTracks.length,
       result: resultName,
       totalMs: roundMs(nowMs() - startedAt)
     })
@@ -236,11 +258,12 @@ async function handleSubtitles(args, options = {}) {
       autoPrefetch: Boolean(auto),
       autoPrefetchReason: auto ? 'no-native-malay-aggressive-prefetch' : 'auto-unavailable',
       geminiPrefetchAvoided: false,
-      subtitleCount: auto ? 1 : 0,
-      languages: auto ? [auto.lang] : []
+      englishTrackCount: englishTracks.length,
+      subtitleCount: subtitles.length,
+      languages: subtitles.map(item => item.lang)
     })
     return {
-      subtitles: auto ? [auto] : [],
+      subtitles,
       autoPrefetch: Boolean(auto),
       autoPrefetchReason: auto ? 'no-native-malay-aggressive-prefetch' : 'auto-unavailable',
       cacheMaxAge: auto ? 120 : 60,
@@ -268,4 +291,10 @@ async function handleSubtitles(args, options = {}) {
   }
 }
 
-module.exports = { dedupeSubtitles, buildAutoSubtitle, handleSubtitles, englishSelectionDiagnostics }
+module.exports = {
+  dedupeSubtitles,
+  buildAutoSubtitle,
+  buildEnglishTracks,
+  handleSubtitles,
+  englishSelectionDiagnostics
+}

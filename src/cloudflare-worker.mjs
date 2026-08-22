@@ -1517,6 +1517,8 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
       const result = await handleSubtitles(args, {
         apiKey: userConfig.apiKey,
         model: userConfig.model,
+        includeEnglishTracks: true,
+        englishTrackLimit: 5,
         publicBaseUrl: configuredBase(request, token),
         tokenSecret: secret,
         onDiagnostic: event => recordDiagnostic(env.SMARTSUBS_CACHE, configId, event)

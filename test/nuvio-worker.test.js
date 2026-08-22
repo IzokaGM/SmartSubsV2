@@ -30,7 +30,7 @@ test('Nuvio diagnose build marker is exposed by production worker health', async
   assert.equal(body.diagnose, true)
 })
 
-test('English-only OpenSubtitles result returns one standard Malay subtitle and records diagnose verdict', async () => {
+test('English-only OpenSubtitles result returns Malay Auto and built-in English without the external addon', async () => {
   const { handleRequest } = await import('../src/cloudflare-worker.mjs')
   const secret = 'server-secret-for-tests'
   const token = createUserConfigToken('fake-gemini-key-12345678901234567890', {
@@ -59,9 +59,12 @@ test('English-only OpenSubtitles result returns one standard Malay subtitle and 
     )
     assert.equal(response.status, 200)
     const body = await response.json()
-    assert.equal(body.subtitles.length, 1)
+    assert.equal(body.subtitles.length, 2)
     assert.equal(body.subtitles[0].lang, 'msa')
     assert.match(body.subtitles[0].url, /\/translated\/.+\.vtt$/)
+    assert.equal(body.subtitles[1].lang, 'eng')
+    assert.equal(body.subtitles[1].id, 'smartsubs-eng-english-normal')
+    assert.equal(body.subtitles[1].url, 'https://example.test/subtitle-en.srt')
 
     const diagnose = await handleRequest(new Request(`${base}/diagnose`), {
       SMARTSUBS_SECRET: secret,
