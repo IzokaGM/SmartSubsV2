@@ -384,7 +384,11 @@ jobs:
           set -euo pipefail
           grep -Fq "export class TranslationDeliveryRelay" src/cloudflare-worker.mjs
           grep -Fq "const deliveryRelayStored = await writeDeliveryRelay" src/cloudflare-worker.mjs
-          test "$(grep -Fc "readReadyTranslation(env, cache, cacheKey)" src/cloudflare-worker.mjs)" -eq 4
+          relay_read_count="$(grep -Fc "readReadyTranslation(env, cache, cacheKey)" src/cloudflare-worker.mjs)"
+          if [[ "$relay_read_count" -ne 5 ]]; then
+            echo "Expected 5 readReadyTranslation declarations/usages, found $relay_read_count"
+            exit 1
+          fi
           grep -Fq "status: ready.source" src/cloudflare-worker.mjs
           grep -Fq '"DELIVERY_RELAY_TTL_MS": "120000"' wrangler.jsonc
           grep -Fq '"name": "SMARTSUBS_DELIVERY"' wrangler.jsonc
