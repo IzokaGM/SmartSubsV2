@@ -234,14 +234,16 @@ async function requestGemini(prompt, options = {}) {
 }
 function buildIndexedPrompt(items) {
   return [
-    'Translate these English subtitle cues into natural, conversational Bahasa Melayu for film and TV viewers.',
-    'Use surrounding cues as context so pronouns, tone, jokes, slang and recurring terminology stay consistent.',
-    'Avoid stiff word-for-word translation when a natural Malay expression preserves the meaning better.',
-    'Keep names, numbers, punctuation, speaker markers, HTML tags and ASS-style tags intact where appropriate.',
-    'Preserve line breaks inside each cue where practical.',
-    'Do not add explanations, notes, censorship or extra dialogue.',
-    'Every input object has a numeric id. Return one object with the SAME id for each translated cue.',
-    'Never renumber, merge, split or omit ids.',
+    'Translate these English subtitle cues into natural, concise Malaysian Bahasa Melayu for film and television viewers.',
+    'Use contemporary Malaysian vocabulary and expressions. Avoid unintended Indonesian vocabulary or sentence structures unless the dialogue specifically refers to Indonesia or an Indonesian character.',
+    'Use surrounding cues as context. Keep pronouns, relationships, tone, humour, slang, recurring terminology and character voices consistent across the batch.',
+    'Translate the intended meaning, emotion and level of formality instead of translating word for word. Preserve the original intensity of insults, profanity, threats and emotional dialogue without censoring or exaggerating them.',
+    'Choose pronouns such as saya, awak, anda, aku, kau, kami and kita according to the relationship, setting and tone. Do not insert particles such as lah, kan or weh unless the original tone supports them.',
+    'Keep translations concise and comfortable to read as subtitles. Do not unnecessarily expand short dialogue. Preserve line breaks where practical and avoid creating more lines than the source cue.',
+    'Keep character names, place names, brand names, numbers, speaker markers, musical symbols, HTML tags and ASS-style formatting tags intact where appropriate. Translate meaningful sound descriptions and on-screen text when intended for the viewer.',
+    'Do not add explanations, translator notes, censorship, invented context or extra dialogue.',
+    'Every input object has a numeric id. Return exactly one translated object with the SAME id for every input cue.',
+    'Never renumber, merge, split, duplicate or omit ids.',
     '',
     JSON.stringify(items)
   ].join('\n')
