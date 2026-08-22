@@ -1,0 +1,459 @@
+name: SmartSubsV2 Part 4.4 - Built-in English Tracks
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smartsubsv2-part4-4-built-in-english
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Checkout SmartSubsV2
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify stable Part 4.3 baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f src/subtitles.js
+          test -f src/diagnostics.js
+          test -f src/cloudflare-worker.mjs
+          test -f test/nuvio-worker.test.js
+          test -f test/v2-part4-3-strong-delivery-relay.test.js
+          test -f package-lock.json
+          grep -Fq "export class TranslationDeliveryRelay" src/cloudflare-worker.mjs
+          grep -Fq "async function readReadyTranslation(env, cache, cacheKey)" src/cloudflare-worker.mjs
+          grep -Fq "queueProfile: 'user-selected-stable'" src/cloudflare-worker.mjs
+          grep -Fq "JSON.stringify({ v: 1" src/token.js
+          grep -Fq '"PLAYER_QUEUE_WAIT_MAX_MS": "9000"' wrangler.jsonc
+          grep -Fq '"PLAYER_QUEUE_GRACE_MS": "600"' wrangler.jsonc
+          grep -Fq '"QUEUE_USER_SELECTED_CONCURRENCY": "3"' wrangler.jsonc
+
+      - name: Apply built-in English tracks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label} anchor count was {count}, expected 1')
+              return text.replace(old, new, 1)
+
+          subtitles_path = Path('src/subtitles.js')
+          subtitles = subtitles_path.read_text()
+
+          if 'function buildEnglishTracks(upstream, extra = {}, limit = 5)' not in subtitles:
+              helper = """function buildEnglishTracks(upstream, extra = {}, limit = 5) {
+            const maxTracks = Math.max(1, Math.min(5, Number(limit) || 5))
+            return rankEnglishSubtitles(dedupeSubtitles(upstream), extra)
+              .slice(0, maxTracks)
+              .map((item, index) => {
+                const subtitle = item.subtitle
+                return {
+                  id: `smartsubs-eng-${diagnosticSubtitleId(subtitle, index)}`,
+                  url: String(subtitle.url),
+                  lang: 'eng'
+                }
+              })
+          }
+
+          """
+              subtitles = replace_once(
+                  subtitles,
+                  'async function handleSubtitles(args, options = {}) {',
+                  helper + 'async function handleSubtitles(args, options = {}) {',
+                  'English track helper'
+              )
+
+              subtitles = replace_once(
+                  subtitles,
+                  """    const apiKey = options.apiKey || ''
+              const auto = english && apiKey ? buildAutoSubtitle(english, options) : null
+
+              if (malay.length) {""",
+                  """    const apiKey = options.apiKey || ''
+              const auto = english && apiKey ? buildAutoSubtitle(english, options) : null
+              const englishTracks = options.includeEnglishTracks
+                ? buildEnglishTracks(upstream, args.extra || {}, options.englishTrackLimit)
+                : []
+
+              if (malay.length) {""",
+                  'English tracks construction'
+              )
+
+              subtitles = replace_once(
+                  subtitles,
+                  """      const subtitles = autoFallbackOffered
+                  ? [...nativeSubtitles, auto]
+                  : nativeSubtitles""",
+                  """      const malayOptions = autoFallbackOffered
+                  ? [...nativeSubtitles, auto]
+                  : nativeSubtitles
+                const subtitles = [...malayOptions, ...englishTracks]""",
+                  'Native and English response order'
+              )
+
+              native_marker = """        autoPrefetchReason,
+                  geminiPrefetchAvoided: true,
+                  result: resultName,"""
+              native_replacement = """        autoPrefetchReason,
+                  geminiPrefetchAvoided: true,
+                  englishTrackCount: englishTracks.length,
+                  result: resultName,"""
+              count = subtitles.count(native_marker)
+              if count != 1:
+                  raise SystemExit(f'native log marker count was {count}, expected 1')
+              subtitles = subtitles.replace(native_marker, native_replacement, 1)
+
+              native_event_marker = """        autoPrefetchReason,
+                  geminiPrefetchAvoided: true,
+                  subtitleCount: subtitles.length,"""
+              native_event_replacement = """        autoPrefetchReason,
+                  geminiPrefetchAvoided: true,
+                  englishTrackCount: englishTracks.length,
+                  subtitleCount: subtitles.length,"""
+              count = subtitles.count(native_event_marker)
+              if count != 1:
+                  raise SystemExit(f'native event marker count was {count}, expected 1')
+              subtitles = subtitles.replace(native_event_marker, native_event_replacement, 1)
+
+              subtitles = replace_once(
+                  subtitles,
+                  "    const resultName = auto ? 'auto-malay-ready' : english ? 'byok-not-configured' : 'no-english'",
+                  """    const subtitles = [...(auto ? [auto] : []), ...englishTracks]
+              const resultName = auto ? 'auto-malay-ready' : english ? 'byok-not-configured' : 'no-english'""",
+                  'No-native response construction'
+              )
+
+              no_native_log = """      autoPrefetchReason: auto ? 'no-native-malay-aggressive-prefetch' : 'auto-unavailable',
+                geminiPrefetchAvoided: false,
+                result: resultName,"""
+              no_native_log_new = """      autoPrefetchReason: auto ? 'no-native-malay-aggressive-prefetch' : 'auto-unavailable',
+                geminiPrefetchAvoided: false,
+                englishTrackCount: englishTracks.length,
+                result: resultName,"""
+              count = subtitles.count(no_native_log)
+              if count != 1:
+                  raise SystemExit(f'no-native log marker count was {count}, expected 1')
+              subtitles = subtitles.replace(no_native_log, no_native_log_new, 1)
+
+              subtitles = replace_once(
+                  subtitles,
+                  """      autoPrefetchReason: auto ? 'no-native-malay-aggressive-prefetch' : 'auto-unavailable',
+                geminiPrefetchAvoided: false,
+                subtitleCount: auto ? 1 : 0,
+                languages: auto ? [auto.lang] : []""",
+                  """      autoPrefetchReason: auto ? 'no-native-malay-aggressive-prefetch' : 'auto-unavailable',
+                geminiPrefetchAvoided: false,
+                englishTrackCount: englishTracks.length,
+                subtitleCount: subtitles.length,
+                languages: subtitles.map(item => item.lang)""",
+                  'No-native diagnostic response'
+              )
+
+              subtitles = replace_once(
+                  subtitles,
+                  '      subtitles: auto ? [auto] : [],',
+                  '      subtitles,',
+                  'No-native subtitle return'
+              )
+
+              subtitles = replace_once(
+                  subtitles,
+                  'module.exports = { dedupeSubtitles, buildAutoSubtitle, handleSubtitles, englishSelectionDiagnostics }',
+                  """module.exports = {
+            dedupeSubtitles,
+            buildAutoSubtitle,
+            buildEnglishTracks,
+            handleSubtitles,
+            englishSelectionDiagnostics
+          }""",
+                  'Subtitle exports'
+              )
+              subtitles_path.write_text(subtitles)
+
+          diagnostics_path = Path('src/diagnostics.js')
+          diagnostics = diagnostics_path.read_text()
+          if "'englishFound', 'englishTrackCount'" not in diagnostics:
+              diagnostics = replace_once(
+                  diagnostics,
+                  "'englishFound', 'byokConfigured', 'autoReady', 'languages', 'totalMs',",
+                  "'englishFound', 'englishTrackCount', 'byokConfigured', 'autoReady', 'languages', 'totalMs',",
+                  'Diagnostic English track count'
+              )
+              diagnostics_path.write_text(diagnostics)
+
+          worker_path = Path('src/cloudflare-worker.mjs')
+          worker = worker_path.read_text()
+          if '        includeEnglishTracks: true,' not in worker:
+              worker = replace_once(
+                  worker,
+                  """        apiKey: userConfig.apiKey,
+                  model: userConfig.model,
+                  publicBaseUrl: configuredBase(request, token),""",
+                  """        apiKey: userConfig.apiKey,
+                  model: userConfig.model,
+                  includeEnglishTracks: true,
+                  englishTrackLimit: 5,
+                  publicBaseUrl: configuredBase(request, token),""",
+                  'Worker English track enablement'
+              )
+              worker_path.write_text(worker)
+
+          nuvio_path = Path('test/nuvio-worker.test.js')
+          nuvio = nuvio_path.read_text()
+          if "built-in English without the external addon" not in nuvio:
+              nuvio = replace_once(
+                  nuvio,
+                  "test('English-only OpenSubtitles result returns one standard Malay subtitle and records diagnose verdict', async () => {",
+                  "test('English-only OpenSubtitles result returns Malay Auto and built-in English without the external addon', async () => {",
+                  'Worker test title'
+              )
+              nuvio = replace_once(
+                  nuvio,
+                  """    assert.equal(body.subtitles.length, 1)
+              assert.equal(body.subtitles[0].lang, 'msa')
+              assert.match(body.subtitles[0].url, /\\/translated\\/.+\\.vtt$/)""",
+                  """    assert.equal(body.subtitles.length, 2)
+              assert.equal(body.subtitles[0].lang, 'msa')
+              assert.match(body.subtitles[0].url, /\\/translated\\/.+\\.vtt$/)
+              assert.equal(body.subtitles[1].lang, 'eng')
+              assert.equal(body.subtitles[1].id, 'smartsubs-eng-english-normal')
+              assert.equal(body.subtitles[1].url, 'https://example.test/subtitle-en.srt')""",
+                  'Worker English response assertions'
+              )
+              nuvio_path.write_text(nuvio)
+          PY
+
+      - name: Add Part 4.4 tests and documentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          Path('test/v2-part4-4-built-in-english.test.js').write_text(r'''
+          'use strict'
+
+          const test = require('node:test')
+          const assert = require('node:assert/strict')
+
+          const { buildEnglishTracks, handleSubtitles } = require('../src/subtitles')
+
+          function responseFor(subtitles) {
+            return async () => ({
+              ok: true,
+              status: 200,
+              json: async () => ({ subtitles })
+            })
+          }
+
+          test('Part 4.4 exposes up to five ranked and deduplicated English tracks', () => {
+            const upstream = [
+              { id: 'wrong', lang: 'eng', url: 'https://example.test/Show.720p.HDTV-WRONG.srt' },
+              { id: 'best', lang: 'eng', url: 'https://example.test/Show.1080p.WEB-DL.x265-GROUP.srt' },
+              { id: 'best-copy', lang: 'eng', url: 'https://example.test/Show.1080p.WEB-DL.x265-GROUP.srt' },
+              { id: 'third', lang: 'en', url: 'https://example.test/third.srt' },
+              { id: 'fourth', lang: 'english', url: 'https://example.test/fourth.srt' },
+              { id: 'fifth', lang: 'eng', url: 'https://example.test/fifth.srt' },
+              { id: 'sixth', lang: 'eng', url: 'https://example.test/sixth.srt' }
+            ]
+
+            const tracks = buildEnglishTracks(upstream, {
+              filename: 'Show.1080p.WEB-DL.x265-GROUP.mkv'
+            })
+
+            assert.equal(tracks.length, 5)
+            assert.equal(tracks[0].id, 'smartsubs-eng-best')
+            assert.deepEqual(new Set(tracks.map(item => item.url)).size, 5)
+            assert.deepEqual(new Set(tracks.map(item => item.lang)), new Set(['eng']))
+          })
+
+          test('Part 4.4 returns Malay Auto first and ranked English alternatives after it', async () => {
+            const result = await handleSubtitles({
+              type: 'series',
+              id: 'tt10986410:1:5',
+              extra: {}
+            }, {
+              apiKey: 'test-key',
+              publicBaseUrl: 'https://smartsubsv2.example/c/test',
+              tokenSecret: 'test-secret',
+              includeEnglishTracks: true,
+              fetchImpl: responseFor([
+                { id: 'eng-one', lang: 'eng', url: 'https://example.test/one.srt' },
+                { id: 'eng-two', lang: 'eng', url: 'https://example.test/two.srt' }
+              ])
+            })
+
+            assert.equal(result.subtitles.length, 3)
+            assert.equal(result.subtitles[0].lang, 'msa')
+            assert.match(result.subtitles[0].id, /^smartsubs-auto-/)
+            assert.deepEqual(result.subtitles.slice(1).map(item => item.lang), ['eng', 'eng'])
+            assert.deepEqual(result.subtitles.slice(1).map(item => item.id), [
+              'smartsubs-eng-eng-one',
+              'smartsubs-eng-eng-two'
+            ])
+            assert.equal(result.autoPrefetch, true)
+          })
+
+          test('Part 4.4 keeps weak-native quota protection and adds English after Malay choices', async () => {
+            const result = await handleSubtitles({
+              type: 'series',
+              id: 'tt10986410:1:5',
+              extra: { filename: 'Ted Lasso Season 1 (2020) S01E05-onetouchtv' }
+            }, {
+              apiKey: 'test-key',
+              publicBaseUrl: 'https://smartsubsv2.example/c/test',
+              tokenSecret: 'test-secret',
+              includeEnglishTracks: true,
+              fetchImpl: responseFor([
+                { id: 'native-weak', lang: 'may', url: 'https://example.test/native.srt' },
+                { id: 'english-weak', lang: 'eng', url: 'https://example.test/english.srt' }
+              ])
+            })
+
+            assert.deepEqual(result.subtitles.map(item => item.lang), ['msa', 'msa', 'eng'])
+            assert.equal(result.subtitles[2].id, 'smartsubs-eng-english-weak')
+            assert.equal(result.autoPrefetch, false)
+            assert.equal(result.autoPrefetchReason, 'weak-native-wait-for-user-selection')
+          })
+
+          test('Part 4.4 can still return English when Malay Auto is unavailable', async () => {
+            const events = []
+            const result = await handleSubtitles({
+              type: 'movie',
+              id: 'tt1375666',
+              extra: {}
+            }, {
+              includeEnglishTracks: true,
+              fetchImpl: responseFor([
+                { id: 'english-direct', lang: 'eng', url: 'https://example.test/direct.srt' }
+              ]),
+              onDiagnostic: async event => events.push(event)
+            })
+
+            assert.deepEqual(result.subtitles, [{
+              id: 'smartsubs-eng-english-direct',
+              lang: 'eng',
+              url: 'https://example.test/direct.srt'
+            }])
+            const event = events.find(item => item.event === 'subtitle-result')
+            assert.equal(event.englishTrackCount, 1)
+            assert.equal(event.subtitleCount, 1)
+            assert.deepEqual(event.languages, ['eng'])
+          })
+          ''')
+
+          Path('docs/V2_PART4_4_BUILT_IN_ENGLISH.md').write_text('''\
+          # SmartSubsV2 Part 4.4: Built-in English Tracks
+
+          ## Purpose
+
+          SmartSubsV2 already retrieves English subtitle candidates from OpenSubtitles v3
+          to select the source for Malay Auto. Part 4.4 returns those same ranked English
+          tracks in the SmartSubs subtitle list, so a separate OpenSubtitles v3 addon is
+          not required.
+
+          ## Subtitle order
+
+          1. Native Malay tracks, when available.
+          2. Malay Auto, when offered by the existing policy.
+          3. Up to five ranked English tracks.
+
+          The English track ranked first is the same source selected for Malay Auto.
+          Duplicate English URLs are removed before ranking.
+
+          ## Preserved behaviour
+
+          - OpenSubtitles v3 remains the only upstream provider.
+          - No additional upstream request is made.
+          - Weak-native quota protection remains unchanged.
+          - User-selected translation profile remains `user-selected-stable`.
+          - Translation concurrency remains 3.
+          - Player Queue wait remains 9000 ms with a 600 ms grace check.
+          - Delivery Relay and the 180-day KV cache remain unchanged.
+          - Translation tokens remain version 1.
+          ''')
+          PY
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify Part 4.4 scope and safety
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fq "function buildEnglishTracks" src/subtitles.js
+          grep -Fq "includeEnglishTracks: true" src/cloudflare-worker.mjs
+          grep -Fq "englishTrackLimit: 5" src/cloudflare-worker.mjs
+          grep -Fq "englishTrackCount" src/diagnostics.js
+          grep -Fq "JSON.stringify({ v: 1" src/token.js
+          grep -Fq "queueProfile: 'user-selected-stable'" src/cloudflare-worker.mjs
+          grep -Fq '"PLAYER_QUEUE_WAIT_MAX_MS": "9000"' wrangler.jsonc
+          grep -Fq '"PLAYER_QUEUE_GRACE_MS": "600"' wrangler.jsonc
+          grep -Fq '"QUEUE_USER_SELECTED_CONCURRENCY": "3"' wrangler.jsonc
+          if rg -n "SubSource|SUBSOURCE" src wrangler.jsonc; then
+            echo "SubSource must not be introduced by Part 4.4."
+            exit 1
+          fi
+
+          unexpected="$(
+            git status --porcelain |
+            awk '{print $2}' |
+            grep -Ev '^(\.github/workflows/smartsubsv2-part4-4-built-in-english\.yml|src/subtitles\.js|src/diagnostics\.js|src/cloudflare-worker\.mjs|test/nuvio-worker\.test\.js|test/v2-part4-4-built-in-english\.test\.js|docs/V2_PART4_4_BUILT_IN_ENGLISH\.md)$' || true
+          )"
+          if [[ -n "$unexpected" ]]; then
+            echo "Unexpected files changed:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+      - name: Run focused Part 4.4 tests
+        run: node --test test/v2-part4-4-built-in-english.test.js test/nuvio-worker.test.js
+
+      - name: Run syntax and full regression suite
+        run: |
+          npm run check
+          npm test
+
+      - name: Commit verified Part 4.4
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            .github/workflows/smartsubsv2-part4-4-built-in-english.yml \
+            src/subtitles.js \
+            src/diagnostics.js \
+            src/cloudflare-worker.mjs \
+            test/nuvio-worker.test.js \
+            test/v2-part4-4-built-in-english.test.js \
+            docs/V2_PART4_4_BUILT_IN_ENGLISH.md
+
+          if git diff --cached --quiet; then
+            echo "Part 4.4 is already applied."
+            exit 0
+          fi
+
+          git commit -m "Return built-in English subtitle tracks"
+          git push origin HEAD:main
