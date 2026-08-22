@@ -1,0 +1,253 @@
+name: SmartSubsV2 Part 4.5 - Malaysian Translation Prompt
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smartsubsv2-part4-5-malaysian-translation-prompt
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Checkout SmartSubsV2
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify stable Part 4.4 baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f src/translator.js
+          test -f src/subtitles.js
+          test -f src/cloudflare-worker.mjs
+          test -f test/v2-part4-4-built-in-english.test.js
+          test -f test/v2-part4-3-strong-delivery-relay.test.js
+          test -f package-lock.json
+          grep -Fq "function buildEnglishTracks" src/subtitles.js
+          grep -Fq "includeEnglishTracks: true" src/cloudflare-worker.mjs
+          grep -Fq "englishTrackLimit: 5" src/cloudflare-worker.mjs
+          grep -Fq "export class TranslationDeliveryRelay" src/cloudflare-worker.mjs
+          grep -Fq "queueProfile: 'user-selected-stable'" src/cloudflare-worker.mjs
+          grep -Fq "JSON.stringify({ v: 1" src/token.js
+          grep -Fq '"PLAYER_QUEUE_WAIT_MAX_MS": "9000"' wrangler.jsonc
+          grep -Fq '"PLAYER_QUEUE_GRACE_MS": "600"' wrangler.jsonc
+          grep -Fq '"QUEUE_USER_SELECTED_CONCURRENCY": "3"' wrangler.jsonc
+          if ! grep -Fq "Translate these English subtitle cues into natural, conversational Bahasa Melayu" src/translator.js && \
+             ! grep -Fq "Translate these English subtitle cues into natural, concise Malaysian Bahasa Melayu" src/translator.js; then
+            echo "Expected Part 4.4 translation prompt was not found."
+            exit 1
+          fi
+
+      - name: Apply Malaysian translation prompt
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label} anchor count was {count}, expected 1')
+              return text.replace(old, new, 1)
+
+          translator_path = Path('src/translator.js')
+          translator = translator_path.read_text()
+
+          new_marker = 'Translate these English subtitle cues into natural, concise Malaysian Bahasa Melayu'
+          if new_marker not in translator:
+              old_prompt = """function buildIndexedPrompt(items) {
+            return [
+              'Translate these English subtitle cues into natural, conversational Bahasa Melayu for film and TV viewers.',
+              'Use surrounding cues as context so pronouns, tone, jokes, slang and recurring terminology stay consistent.',
+              'Avoid stiff word-for-word translation when a natural Malay expression preserves the meaning better.',
+              'Keep names, numbers, punctuation, speaker markers, HTML tags and ASS-style tags intact where appropriate.',
+              'Preserve line breaks inside each cue where practical.',
+              'Do not add explanations, notes, censorship or extra dialogue.',
+              'Every input object has a numeric id. Return one object with the SAME id for each translated cue.',
+              'Never renumber, merge, split or omit ids.',
+              '',
+              JSON.stringify(items)
+            ].join('\\n')
+          }"""
+
+              new_prompt = """function buildIndexedPrompt(items) {
+            return [
+              'Translate these English subtitle cues into natural, concise Malaysian Bahasa Melayu for film and television viewers.',
+              'Use contemporary Malaysian vocabulary and expressions. Avoid unintended Indonesian vocabulary or sentence structures unless the dialogue specifically refers to Indonesia or an Indonesian character.',
+              'Use surrounding cues as context. Keep pronouns, relationships, tone, humour, slang, recurring terminology and character voices consistent across the batch.',
+              'Translate the intended meaning, emotion and level of formality instead of translating word for word. Preserve the original intensity of insults, profanity, threats and emotional dialogue without censoring or exaggerating them.',
+              'Choose pronouns such as saya, awak, anda, aku, kau, kami and kita according to the relationship, setting and tone. Do not insert particles such as lah, kan or weh unless the original tone supports them.',
+              'Keep translations concise and comfortable to read as subtitles. Do not unnecessarily expand short dialogue. Preserve line breaks where practical and avoid creating more lines than the source cue.',
+              'Keep character names, place names, brand names, numbers, speaker markers, musical symbols, HTML tags and ASS-style formatting tags intact where appropriate. Translate meaningful sound descriptions and on-screen text when intended for the viewer.',
+              'Do not add explanations, translator notes, censorship, invented context or extra dialogue.',
+              'Every input object has a numeric id. Return exactly one translated object with the SAME id for every input cue.',
+              'Never renumber, merge, split, duplicate or omit ids.',
+              '',
+              JSON.stringify(items)
+            ].join('\\n')
+          }"""
+
+              translator = replace_once(
+                  translator,
+                  old_prompt,
+                  new_prompt,
+                  'Malaysian translation prompt'
+              )
+              translator_path.write_text(translator)
+          PY
+
+      - name: Add Part 4.5 tests and documentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          Path('test/v2-part4-5-malaysian-prompt.test.js').write_text('''\
+          'use strict'
+
+          const test = require('node:test')
+          const assert = require('node:assert/strict')
+
+          const { buildIndexedPrompt } = require('../src/translator')
+
+          test('Part 4.5 requests natural Malaysian Malay with explicit locale controls', () => {
+            const prompt = buildIndexedPrompt([{ id: 0, text: 'Are you kidding me?' }])
+
+            assert.match(prompt, /Malaysian Bahasa Melayu/)
+            assert.match(prompt, /Avoid unintended Indonesian vocabulary/)
+            assert.match(prompt, /saya, awak, anda, aku, kau, kami and kita/)
+            assert.match(prompt, /without censoring or exaggerating/)
+            assert.match(prompt, /concise and comfortable to read as subtitles/)
+          })
+
+          test('Part 4.5 preserves structured cue ids and appends the input JSON unchanged', () => {
+            const items = [
+              { id: 17, text: 'Hello, <i>John</i>.' },
+              { id: 23, text: '[door closes]\\nWait!' }
+            ]
+            const prompt = buildIndexedPrompt(items)
+            const payload = JSON.parse(prompt.slice(prompt.lastIndexOf('\\n') + 1))
+
+            assert.deepEqual(payload, items)
+            assert.match(prompt, /exactly one translated object with the SAME id/)
+            assert.match(prompt, /Never renumber, merge, split, duplicate or omit ids/)
+          })
+
+          test('Part 4.5 keeps the fixed prompt instructions compact', () => {
+            const promptWithoutCues = buildIndexedPrompt([])
+            assert.ok(promptWithoutCues.length < 2500)
+          })
+          ''')
+
+          Path('docs/V2_PART4_5_MALAYSIAN_TRANSLATION_PROMPT.md').write_text('''\
+          # SmartSubsV2 Part 4.5: Malaysian Translation Prompt
+
+          ## Purpose
+
+          Part 4.5 improves the Gemini instruction used for Malay Auto subtitles. It asks
+          for concise, contemporary Malaysian Bahasa Melayu while preserving context,
+          tone, subtitle readability, formatting and cue identity.
+
+          ## Quality controls
+
+          - Prefer contemporary Malaysian vocabulary and expressions.
+          - Avoid unintended Indonesian vocabulary and constructions.
+          - Select pronouns according to relationship, setting and tone.
+          - Preserve humour, emotion, profanity intensity and character voice.
+          - Keep subtitle text concise and avoid unnecessary line expansion.
+          - Preserve names, formatting tags, speaker markers and musical symbols.
+          - Translate meaningful sound descriptions and on-screen text.
+          - Return exactly one structured translation for every cue id.
+
+          ## Preserved behaviour
+
+          - OpenSubtitles v3 remains the only upstream provider.
+          - Built-in English tracks remain enabled.
+          - The Gemini model and structured JSON response schema are unchanged.
+          - Translation chunk sizes, concurrency and retry behaviour are unchanged.
+          - User-selected translation profile remains `user-selected-stable`.
+          - Player Queue wait remains 9000 ms with a 600 ms grace check.
+          - Delivery Relay, cache policy and quota protection are unchanged.
+          ''')
+          PY
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify Part 4.5 scope and safety
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fq "natural, concise Malaysian Bahasa Melayu" src/translator.js
+          grep -Fq "Avoid unintended Indonesian vocabulary" src/translator.js
+          grep -Fq "without censoring or exaggerating" src/translator.js
+          grep -Fq "exactly one translated object with the SAME id" src/translator.js
+          grep -Fq "function buildEnglishTracks" src/subtitles.js
+          grep -Fq "includeEnglishTracks: true" src/cloudflare-worker.mjs
+          grep -Fq "englishTrackLimit: 5" src/cloudflare-worker.mjs
+          grep -Fq "export class TranslationDeliveryRelay" src/cloudflare-worker.mjs
+          grep -Fq "queueProfile: 'user-selected-stable'" src/cloudflare-worker.mjs
+          grep -Fq "JSON.stringify({ v: 1" src/token.js
+          grep -Fq '"PLAYER_QUEUE_WAIT_MAX_MS": "9000"' wrangler.jsonc
+          grep -Fq '"PLAYER_QUEUE_GRACE_MS": "600"' wrangler.jsonc
+          grep -Fq '"QUEUE_USER_SELECTED_CONCURRENCY": "3"' wrangler.jsonc
+
+          if rg -n "SubSource|SUBSOURCE" src wrangler.jsonc; then
+            echo "SubSource must not be introduced by Part 4.5."
+            exit 1
+          fi
+
+          unexpected="$(
+            git status --porcelain |
+            awk '{print $2}' |
+            grep -Ev '^(\.github/workflows/smartsubsv2-part4-5-malaysian-translation-prompt\.yml|src/translator\.js|test/v2-part4-5-malaysian-prompt\.test\.js|docs/V2_PART4_5_MALAYSIAN_TRANSLATION_PROMPT\.md)$' || true
+          )"
+          if [[ -n "$unexpected" ]]; then
+            echo "Unexpected files changed:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+      - name: Run focused Part 4.5 tests
+        run: node --test test/v2-part4-5-malaysian-prompt.test.js test/m5.test.js test/m11.test.js
+
+      - name: Run syntax and full regression suite
+        run: |
+          npm run check
+          npm test
+
+      - name: Commit verified Part 4.5
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            .github/workflows/smartsubsv2-part4-5-malaysian-translation-prompt.yml \
+            src/translator.js \
+            test/v2-part4-5-malaysian-prompt.test.js \
+            docs/V2_PART4_5_MALAYSIAN_TRANSLATION_PROMPT.md
+
+          if git diff --cached --quiet; then
+            echo "Part 4.5 is already applied."
+            exit 0
+          fi
+
+          git commit -m "Improve Malaysian subtitle translation prompt"
+          git push origin HEAD:main
