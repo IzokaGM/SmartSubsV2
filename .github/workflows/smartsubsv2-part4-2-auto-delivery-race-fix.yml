@@ -41,6 +41,207 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if ! grep -Fq "function playerQueueGraceMs(env)" src/cloudflare-worker.mjs; then
+            git apply --whitespace=error-all <<'PATCH'
+          --- a/src/cloudflare-worker.mjs
+          +++ b/src/cloudflare-worker.mjs
+          @@ -568,6 +568,10 @@
+             return Math.max(2000, Math.min(10000, Number(env.PLAYER_QUEUE_WAIT_MAX_MS || 5000)))
+           }
+           
+          +function playerQueueGraceMs(env) {
+          +  return Math.max(0, Math.min(1000, Number(env.PLAYER_QUEUE_GRACE_MS || 600)))
+          +}
+          +
+           function translationPreparingResponse() {
+             return send(
+               503,
+          @@ -754,7 +758,9 @@
+                   waitMs: Math.max(0, nowFn() - startedAt),
+                   polls,
+                   jobStatus: String(job?.state || 'unknown'),
+          -        outcome: 'hit'
+          +        outcome: 'hit',
+          +        graceWaitMs: 0,
+          +        graceHit: false
+                 }
+               }
+           
+          @@ -771,7 +777,39 @@
+                 waitMs: Math.max(0, nowFn() - startedAt),
+                 polls,
+                 jobStatus: String(job?.state || 'unknown'),
+          -      outcome: 'hit'
+          +      outcome: 'hit',
+          +      graceWaitMs: 0,
+          +      graceHit: false
+          +    }
+          +  }
+          +
+          +  const graceMs = Math.max(0, Math.min(1000, Number(options.graceMs || 0)))
+          +  if (graceMs > 0 && queueJobActive(job)) {
+          +    const graceStartedAt = nowFn()
+          +    await sleepFn(graceMs)
+          +    const graceCached = await cache.get(cacheKey).catch(() => null)
+          +    const graceWaitMs = Math.max(0, nowFn() - graceStartedAt)
+          +
+          +    if (graceCached) {
+          +      return {
+          +        vtt: graceCached,
+          +        waitMs: Math.max(0, nowFn() - startedAt),
+          +        polls,
+          +        jobStatus: String(job?.state || 'unknown'),
+          +        outcome: 'hit',
+          +        graceWaitMs,
+          +        graceHit: true
+          +      }
+          +    }
+          +
+          +    return {
+          +      vtt: null,
+          +      waitMs: Math.max(0, nowFn() - startedAt),
+          +      polls,
+          +      jobStatus: String(job?.state || 'missing'),
+          +      outcome: job && job.state === 'failed' ? 'failed' : 'timeout',
+          +      graceWaitMs,
+          +      graceHit: false
+               }
+             }
+           
+          @@ -780,7 +818,9 @@
+               waitMs: Math.max(0, nowFn() - startedAt),
+               polls,
+               jobStatus: String(job?.state || 'missing'),
+          -    outcome: job && job.state === 'failed' ? 'failed' : 'timeout'
+          +    outcome: job && job.state === 'failed' ? 'failed' : 'timeout',
+          +    graceWaitMs: 0,
+          +    graceHit: false
+             }
+           }
+           
+          @@ -1143,6 +1183,8 @@
+                 const cacheKey = translationCacheKey(tokenData, userConfig.model, env)
+                 let joinWaitMs = 0
+                 let joinPolls = 0
+          +      let joinGraceMs = 0
+          +      let joinGraceHit = false
+                 let joinStatus = ''
+                 let result = null
+           
+          @@ -1168,12 +1210,15 @@
+                       cache,
+                       cacheKey,
+                       initialJob: job,
+          -            maxWaitMs: playerQueueWaitMaxMs(env)
+          +            maxWaitMs: playerQueueWaitMaxMs(env),
+          +            graceMs: playerQueueGraceMs(env)
+                     })
+           
+                     joinWaitMs = joined.waitMs
+                     joinPolls = joined.polls
+          -          joinStatus = joined.outcome
+          +          joinGraceMs = Number(joined.graceWaitMs || 0)
+          +          joinGraceHit = joined.graceHit === true
+          +          joinStatus = joined.graceHit ? 'queue-join-grace-hit' : joined.outcome
+           
+                     if (joined.vtt) {
+                       result = {
+          @@ -1186,14 +1231,26 @@
+                         event: 'queue-join-hit',
+                         status: joined.jobStatus,
+                         waitMs: joinWaitMs,
+          -              polls: joinPolls
+          +              polls: joinPolls,
+          +              graceMs: joinGraceMs,
+          +              graceHit: joinGraceHit
+                       }).catch(() => {})
+          +            if (joinGraceHit) {
+          +              await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+          +                event: 'queue-grace-hit',
+          +                status: joined.jobStatus,
+          +                waitMs: joinWaitMs,
+          +                graceMs: joinGraceMs
+          +              }).catch(() => {})
+          +            }
+                     } else if (joined.outcome !== 'failed') {
+                       await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+                         event: 'translation-pending',
+                         status: joined.jobStatus,
+                         waitMs: joinWaitMs,
+                         polls: joinPolls,
+          +              graceMs: joinGraceMs,
+          +              graceHit: joinGraceHit,
+                         reason: joined.outcome
+                       }).catch(() => {})
+           
+          @@ -1226,16 +1283,27 @@
+                       env,
+                       cache,
+                       cacheKey,
+          -            maxWaitMs: playerQueueWaitMaxMs(env)
+          +            maxWaitMs: playerQueueWaitMaxMs(env),
+          +            graceMs: playerQueueGraceMs(env)
+                     })
+           
+                     joinWaitMs = joined.waitMs
+                     joinPolls = joined.polls
+          +          joinGraceMs = Number(joined.graceWaitMs || 0)
+          +          joinGraceHit = joined.graceHit === true
+                     joinStatus = joined.outcome === 'hit'
+          -            ? 'player-queue-hit'
+          +            ? (joined.graceHit ? 'player-queue-grace-hit' : 'player-queue-hit')
+                       : `player-queue-${joined.outcome}`
+           
+                     if (joined.vtt) {
+          +            if (joinGraceHit) {
+          +              await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+          +                event: 'queue-grace-hit',
+          +                status: joined.jobStatus || 'queued',
+          +                waitMs: joinWaitMs,
+          +                graceMs: joinGraceMs
+          +              }).catch(() => {})
+          +            }
+                       result = {
+                         vtt: joined.vtt,
+                         cacheKey,
+          @@ -1248,6 +1316,8 @@
+                         status: joined.jobStatus || 'queued',
+                         waitMs: joinWaitMs,
+                         polls: joinPolls,
+          +              graceMs: joinGraceMs,
+          +              graceHit: joinGraceHit,
+                         reason: joined.outcome
+                       }).catch(() => {})
+           
+          @@ -1284,6 +1354,8 @@
+                   totalMs,
+                   waitMs: joinWaitMs,
+                   polls: joinPolls,
+          +        graceMs: joinGraceMs,
+          +        graceHit: joinGraceHit,
+                   joinStatus,
+                   expected: repair.expected,
+                   received: repair.received,
+          @@ -1530,4 +1602,4 @@
+             }
+           }
+           
+          -export { BUILD_ID, handleRequest, parseSubtitleArgs, safeMessage, classifyTranslationError, renderConfiguredDiagnosePage, prefetchTranslation, parseAutoTranslationToken, enqueuePrefetchTranslation, processQueueMessage, handleQueue, normaliseRequestedQueueProfile, queueTranslationProfile, queueTranslationOptions, translationCacheKey, readQueueJobState, writeQueueJobState, queueJobActive, waitForQueueCache, queueFailureStage, queueFinalEnabled, rateLimitAllowed, rateLimitedResponse, publicReady, shouldPrefetchAutoResult, playerQueueWaitMaxMs, translationPreparingResponse }
+          +export { BUILD_ID, handleRequest, parseSubtitleArgs, safeMessage, classifyTranslationError, renderConfiguredDiagnosePage, prefetchTranslation, parseAutoTranslationToken, enqueuePrefetchTranslation, processQueueMessage, handleQueue, normaliseRequestedQueueProfile, queueTranslationProfile, queueTranslationOptions, translationCacheKey, readQueueJobState, writeQueueJobState, queueJobActive, waitForQueueCache, queueFailureStage, queueFinalEnabled, rateLimitAllowed, rateLimitedResponse, publicReady, shouldPrefetchAutoResult, playerQueueWaitMaxMs, playerQueueGraceMs, translationPreparingResponse }
+          --- a/wrangler.jsonc
+          +++ b/wrangler.jsonc
+          @@ -30,7 +30,8 @@
+               "QUEUE_USER_SELECTED_CHUNK_ITEMS": "160",
+               "QUEUE_USER_SELECTED_CHUNK_CHARS": "20000",
+               "QUEUE_USER_SELECTED_CONCURRENCY": "3",
+          -    "PLAYER_QUEUE_WAIT_MAX_MS": "9000"
+          +    "PLAYER_QUEUE_WAIT_MAX_MS": "9000",
+          +    "PLAYER_QUEUE_GRACE_MS": "600"
+             },
+             "kv_namespaces": [
+               {
+          PATCH
+          fi
           python3 <<'PY'
           from pathlib import Path
           import json
@@ -51,14 +252,17 @@ jobs:
           old = """function playerQueueWaitMaxMs(env) {
             return Math.max(2000, Math.min(10000, Number(env.PLAYER_QUEUE_WAIT_MAX_MS || 5000)))
           }
+
           function translationPreparingResponse() {"""
 
           new = """function playerQueueWaitMaxMs(env) {
             return Math.max(2000, Math.min(10000, Number(env.PLAYER_QUEUE_WAIT_MAX_MS || 5000)))
           }
+
           function playerQueueGraceMs(env) {
             return Math.max(0, Math.min(1000, Number(env.PLAYER_QUEUE_GRACE_MS || 600)))
           }
+
           function translationPreparingResponse() {"""
 
           if "function playerQueueGraceMs(env)" not in worker:
