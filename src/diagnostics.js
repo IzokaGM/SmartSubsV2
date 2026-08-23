@@ -30,13 +30,22 @@ function sanitiseEvent(event = {}) {
     'queueDelayMs', 'sourceFetchMs', 'parseMs', 'sourceBytes', 'cueCount', 'pipelineMs',
     'translationWallMs', 'chunkTimeline', 'maxChunkMs', 'avgChunkMs', 'sumChunkMs',
     'geminiCallMs', 'geminiStatuses', 'geminiPromptChars', 'failureStage',
-    'retryDelaySeconds', 'nextAttempt', 'abortRetries'
+    'retryDelaySeconds', 'nextAttempt', 'abortRetries',
+    'subsourceConfigured', 'subsourceStatus', 'subsourceHttpStatus', 'subsourceLatencyMs',
+    'subsourceLimit', 'subsourceRemaining', 'subsourceRateHeaderNames',
+    'subsourceLimitMinute', 'subsourceRemainingMinute', 'subsourceLimitHour',
+    'subsourceRemainingHour', 'subsourceLimitDay', 'subsourceRemainingDay',
+    'subsourceReset', 'subsourceResponseRootType', 'subsourceResponseTopKeys',
+    'subsourceResponseItemKeys', 'subsourceProbeCacheAgeMs'
   ]
   for (const key of allowed) {
     const value = event[key]
     if (value === undefined) continue
     if (typeof value === 'boolean' || typeof value === 'number') output[key] = value
-    else if (Array.isArray(value)) output[key] = value.slice(0, 8).map(item => safeText(item, 32))
+    else if (Array.isArray(value)) {
+      const limit = key.startsWith('subsource') ? 24 : 8
+      output[key] = value.slice(0, limit).map(item => safeText(item, 32))
+    }
     else output[key] = safeText(value)
   }
   return output

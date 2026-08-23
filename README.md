@@ -16,9 +16,9 @@ This repository was reconstructed from the supplied SmartSubs GitHub Actions rec
 8. Cloudflare KV stores the generated WebVTT for reuse.
 9. Queue Join prevents the player path from translating the same subtitle again while background translation is already running.
 
-## Final recovered profile
+## Current profile
 
-- Build ID: `final-stable-m20r3`
+- Build ID: `part5-1-subsource-discovery`
 - Player translation: 180 cues, 24000 chars, concurrency 2
 - Queue first attempt: 160 cues, 20000 chars, concurrency 3
 - Queue fallback attempt: 180 cues, 24000 chars, concurrency 2
@@ -36,11 +36,11 @@ The final recovered worker expects:
 - Secret: `SMARTSUBS_SECRET`
 - KV binding: `SMARTSUBS_CACHE`
 - Queue producer binding: `SMARTSUBS_TRANSLATION_QUEUE`
-- Queue name: `smartsubs-translation`
+- Queue name: `smartsubsv2-translation`
 - Rate limiter binding: `SMARTSUBS_SUBTITLE_LIMITER`
 - Rate limiter binding: `SMARTSUBS_GENERATE_LIMITER`
 
-`wrangler.jsonc` keeps the recovered settings. Replace `REPLACE_WITH_KV_NAMESPACE_ID` with the KV namespace ID from your Cloudflare account. The recovered rate limiter namespace IDs are also account specific in practice, so verify them before deployment.
+`wrangler.jsonc` keeps the deployed SmartSubsV2 resource identifiers. KV, Queue, rate limiter, and Durable Object identities are not changed by Part 5.1.
 
 ## Local validation
 
@@ -51,7 +51,7 @@ npm test
 npx wrangler deploy --dry-run --outdir .cf-build
 ```
 
-The reconstructed repository passed all 67 recovered Node tests in this package. A live Wrangler dry run was not confirmed in the reconstruction environment because the Wrangler package download timed out.
+The Part 5.1 source passes all 126 Node regression tests. Its migration workflow also runs a Wrangler dry run before committing the change.
 
 ## Configuration
 
@@ -64,6 +64,14 @@ After deployment:
 3. SmartSubs validates the key and generates a configured Stremio manifest URL.
 4. Install that configured manifest in Stremio.
 5. Use `/c/YOUR_CONFIG_TOKEN/diagnose` when debugging subtitle selection, queue activity, cache state, and translation failures.
+
+### Optional SubSource discovery
+
+Part 5.1 adds an optional SubSource API key field to `/configure`. Leaving it blank preserves the current OpenSubtitles-only behaviour. When configured, Diagnose provides a manual **Test SubSource connection** action that records only connection status, latency, rate-limit headers, and JSON field names. SubSource results do not affect subtitle ranking in Part 5.1.
+
+Existing configured addon tokens remain valid. To enable SubSource discovery, configure and install a new URL containing both the Gemini key and optional SubSource key.
+
+See `docs/PART5-1_SUBSOURCE_DISCOVERY.md` for the deployment test and the evidence needed before adaptive provider fusion is enabled.
 
 ## Recovery note
 

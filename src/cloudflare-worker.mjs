@@ -6,6 +6,7 @@ import userConfigModule from './user-config.js'
 import configureModule from './configure.js'
 import perfModule from './perf.js'
 import diagnosticsModule from './diagnostics.js'
+import subsourceModule from './subsource.js'
 import { CloudflareTranslationCache, cfGetOrTranslate, makeCacheKey } from './cf-cache.mjs'
 
 const { createConfiguredManifest } = configuredManifestModule
@@ -15,8 +16,9 @@ const { createUserConfigToken, decodeUserConfigToken, tokenFingerprint } = userC
 const { buildConfiguredUrls, validateGeminiApiKey, renderConfigurePage, escapeHtml } = configureModule
 const { nowMs, roundMs, logPerf } = perfModule
 const { recordDiagnostic, readDiagnostics, deriveVerdict } = diagnosticsModule
+const { probeSubsourceApi, validateSubsourceApiKey } = subsourceModule
 
-const BUILD_ID = 'final-stable-m20r3'
+const BUILD_ID = 'part5-1-subsource-discovery'
 const caches = new WeakMap()
 
 function responseHeaders(contentType, status = 200, options = {}) {
@@ -53,9 +55,11 @@ function json(body, status = 200, options = {}) {
   return send(status, 'application/json; charset=utf-8', JSON.stringify(body), options)
 }
 
-function safeMessage(error, apiKey) {
+function safeMessage(error, ...secrets) {
   let message = error && error.message ? String(error.message) : String(error || 'Unknown error')
-  if (apiKey) message = message.split(apiKey).join('[redacted]')
+  for (const secret of secrets.flat()) {
+    if (secret) message = message.split(String(secret)).join('[redacted]')
+  }
   return message.slice(0, 300)
 }
 
@@ -352,7 +356,7 @@ function verdictPresentation(verdict) {
   return { title: item[0], tone: item[1], explanation: item[2] }
 }
 
-function renderConfiguredDiagnosePage(configId, events) {
+function renderConfiguredDiagnosePage(configId, events, options = {}) {
   const sorted = [...events].sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0))
   const verdict = deriveVerdict(sorted)
   const status = verdictPresentation(verdict)
@@ -382,6 +386,20 @@ function renderConfiguredDiagnosePage(configId, events) {
   const nativeDecision = lastSubtitle?.nativeDecision || 'Not applicable'
   const nativeId = lastSubtitle?.malaySelectedId || 'Not available'
   const nativeScore = Number(lastSubtitle?.malaySelectedScore)
+  const subsourceConfigured = options.subsourceConfigured === true
+  const lastSubsourceProbe = sorted.find(item =>
+    ['subsource-probe', 'subsource-probe-cache-hit'].includes(item.event)
+  ) || null
+  const subsourceStatus = subsourceConfigured
+    ? (lastSubsourceProbe?.subsourceStatus || 'not-tested')
+    : 'not-configured'
+  const subsourceTone = !subsourceConfigured
+    ? 'neutral'
+    : subsourceStatus === 'connected' || subsourceStatus === 'reachable'
+      ? 'good'
+      : subsourceStatus === 'quota-limited' || subsourceStatus === 'not-tested'
+        ? 'warn'
+        : 'bad'
 
   const topCandidates = ranked.length
     ? ranked.map(item => {
@@ -425,7 +443,7 @@ function renderConfiguredDiagnosePage(configId, events) {
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SmartSubsV2 Diagnose</title>
 <style>
-:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101116;color:#f4f4f5;font-family:system-ui,-apple-system,sans-serif}.wrap{max-width:920px;margin:auto;padding:18px 12px 40px}.card{background:#181a21;border:1px solid #30333d;border-radius:16px;padding:16px;margin-bottom:12px}h1{font-size:24px;margin:0 0 8px}h2{font-size:17px;margin:0 0 12px}.muted{color:#aeb1bb;font-size:13px}.status{display:flex;gap:10px;align-items:flex-start}.pill{display:inline-flex;align-items:center;border-radius:999px;padding:5px 10px;font-weight:800;font-size:12px;letter-spacing:.02em}.good{background:#123b29;color:#a7f3d0}.warn{background:#493812;color:#fde68a}.bad{background:#4a1d24;color:#fecaca}.neutral{background:#30333d;color:#e5e7eb}.status-copy{flex:1}.status-title{font-size:20px;font-weight:800;margin-bottom:4px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric{background:#111319;border:1px solid #2b2e37;border-radius:12px;padding:12px}.metric .label{color:#aeb1bb;font-size:12px}.metric .value{font-size:18px;font-weight:800;margin-top:3px;word-break:break-word}.metric .sub{color:#aeb1bb;font-size:12px;margin-top:4px;word-break:break-word}.candidate{display:grid;grid-template-columns:34px 1fr auto auto;gap:8px;align-items:center;padding:9px 10px;border-bottom:1px solid #30333d;font-size:13px}.candidate:last-child{border-bottom:0}.candidate.selected{background:#16271e}.candidate em{font-style:normal;font-size:10px;font-weight:800;color:#a7f3d0}.meta-row{display:grid;grid-template-columns:90px 42px 1fr;gap:8px;padding:8px 0;border-bottom:1px solid #30333d;align-items:start}.meta-row:last-child{border-bottom:0}.meta-row .yes{color:#a7f3d0}.meta-row .no{color:#fca5a5}.meta-row small{color:#c7c9d1;word-break:break-word}.guide{font-size:15px;line-height:1.5}.event-card{border-top:1px solid #30333d;padding:12px 0}.event-card:first-child{border-top:0}.event-head{display:flex;gap:10px;justify-content:space-between;align-items:center;margin-bottom:7px}.event-head time{font-size:12px;color:#aeb1bb}.event-head code{font-size:12px;color:#c9ffdc}.event-detail{display:flex;flex-wrap:wrap;gap:6px}.event-detail span{background:#111319;border-radius:7px;padding:4px 6px;font-size:11px;word-break:break-word}.event-detail b{color:#aeb1bb;font-weight:600}details summary{cursor:pointer;font-weight:800;padding:4px 0}code{color:#c9ffdc}@media(max-width:640px){.grid{grid-template-columns:1fr}.candidate{grid-template-columns:28px 1fr auto}.candidate em{grid-column:2}.meta-row{grid-template-columns:82px 38px 1fr}.event-head{align-items:flex-start;flex-direction:column;gap:4px}}
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101116;color:#f4f4f5;font-family:system-ui,-apple-system,sans-serif}.wrap{max-width:920px;margin:auto;padding:18px 12px 40px}.card{background:#181a21;border:1px solid #30333d;border-radius:16px;padding:16px;margin-bottom:12px}h1{font-size:24px;margin:0 0 8px}h2{font-size:17px;margin:0 0 12px}.muted{color:#aeb1bb;font-size:13px}.status{display:flex;gap:10px;align-items:flex-start}.pill{display:inline-flex;align-items:center;border-radius:999px;padding:5px 10px;font-weight:800;font-size:12px;letter-spacing:.02em}.good{background:#123b29;color:#a7f3d0}.warn{background:#493812;color:#fde68a}.bad{background:#4a1d24;color:#fecaca}.neutral{background:#30333d;color:#e5e7eb}.status-copy{flex:1}.status-title{font-size:20px;font-weight:800;margin-bottom:4px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric{background:#111319;border:1px solid #2b2e37;border-radius:12px;padding:12px}.metric .label{color:#aeb1bb;font-size:12px}.metric .value{font-size:18px;font-weight:800;margin-top:3px;word-break:break-word}.metric .sub{color:#aeb1bb;font-size:12px;margin-top:4px;word-break:break-word}.probe{border:0;border-radius:10px;background:#c9ffdc;color:#102117;font-weight:800;padding:10px 14px;margin-top:12px;cursor:pointer}.probe:disabled{background:#30333d;color:#8f929b;cursor:not-allowed}.candidate{display:grid;grid-template-columns:34px 1fr auto auto;gap:8px;align-items:center;padding:9px 10px;border-bottom:1px solid #30333d;font-size:13px}.candidate:last-child{border-bottom:0}.candidate.selected{background:#16271e}.candidate em{font-style:normal;font-size:10px;font-weight:800;color:#a7f3d0}.meta-row{display:grid;grid-template-columns:90px 42px 1fr;gap:8px;padding:8px 0;border-bottom:1px solid #30333d;align-items:start}.meta-row:last-child{border-bottom:0}.meta-row .yes{color:#a7f3d0}.meta-row .no{color:#fca5a5}.meta-row small{color:#c7c9d1;word-break:break-word}.guide{font-size:15px;line-height:1.5}.event-card{border-top:1px solid #30333d;padding:12px 0}.event-card:first-child{border-top:0}.event-head{display:flex;gap:10px;justify-content:space-between;align-items:center;margin-bottom:7px}.event-head time{font-size:12px;color:#aeb1bb}.event-head code{font-size:12px;color:#c9ffdc}.event-detail{display:flex;flex-wrap:wrap;gap:6px}.event-detail span{background:#111319;border-radius:7px;padding:4px 6px;font-size:11px;word-break:break-word}.event-detail b{color:#aeb1bb;font-weight:600}details summary{cursor:pointer;font-weight:800;padding:4px 0}code{color:#c9ffdc}@media(max-width:640px){.grid{grid-template-columns:1fr}.candidate{grid-template-columns:28px 1fr auto}.candidate em{grid-column:2}.meta-row{grid-template-columns:82px 38px 1fr}.event-head{align-items:flex-start;flex-direction:column;gap:4px}}
 </style></head>
 <body><main class="wrap">
 <section class="card"><h1>SmartSubsV2 Diagnose</h1><div class="status"><span class="pill ${status.tone}">${escapeHtml(status.tone === 'good' ? 'OK' : status.tone === 'bad' ? 'PROBLEM' : status.tone === 'warn' ? 'CHECK' : 'INFO')}</span><div class="status-copy"><div class="status-title">${escapeHtml(status.title)}</div><div class="muted">${escapeHtml(status.explanation)}</div><div class="muted">Verdict code: <code>${escapeHtml(verdict)}</code></div></div></div><p class="muted">Malaysia time (MYT, Asia/Kuala_Lumpur) | Build ${BUILD_ID} | ${sorted.length} events retained for up to 24 hours.</p></section>
@@ -441,6 +459,8 @@ function renderConfiguredDiagnosePage(configId, events) {
 </div></section>
 
 <section class="card"><h2>What this means</h2><div class="guide">${escapeHtml(guidance)}</div></section>
+
+<section class="card"><h2>SubSource discovery</h2><div class="metric"><div class="label">Optional provider</div><div class="value"><span class="pill ${subsourceTone}">${escapeHtml(subsourceStatus)}</span></div><div class="sub">${subsourceConfigured ? `HTTP ${escapeHtml(lastSubsourceProbe?.subsourceHttpStatus || 'not tested')} | ${lastSubsourceProbe?.subsourceLatencyMs !== undefined ? formatDuration(lastSubsourceProbe.subsourceLatencyMs) : 'run the connection test'}${lastSubsourceProbe?.subsourceRemainingDay ? ` | day remaining ${escapeHtml(lastSubsourceProbe.subsourceRemainingDay)}` : ''}` : 'Configure a SubSource API key to enable discovery. Current OpenSubtitles behaviour is unchanged.'}</div></div><form method="post" action="subsource-probe"><button class="probe" type="submit"${subsourceConfigured ? '' : ' disabled'}>Test SubSource connection</button></form><p class="muted">Part 5.1 records only status, timing, rate-limit headers and response field names. It does not expose the API key or change subtitle ranking.</p></section>
 
 <section class="card"><h2>Player sync metadata</h2>${metadataItems}</section>
 
@@ -1255,7 +1275,73 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
 
   if (request.method === 'GET' && suffix === '/diagnose') {
     const events = await readDiagnostics(env.SMARTSUBS_CACHE, configId).catch(() => [])
-    return send(200, 'text/html; charset=utf-8', renderConfiguredDiagnosePage(configId, events), { noStore: true, csp: true })
+    return send(200, 'text/html; charset=utf-8', renderConfiguredDiagnosePage(configId, events, {
+      subsourceConfigured: Boolean(userConfig.subsourceApiKey)
+    }), { noStore: true, csp: true })
+  }
+
+  if (request.method === 'POST' && suffix === '/subsource-probe') {
+    const redirect = () => new Response(null, {
+      status: 303,
+      headers: {
+        location: `${configuredBase(request, token)}/diagnose`,
+        'cache-control': 'no-store'
+      }
+    })
+
+    if (!userConfig.subsourceApiKey) {
+      await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+        event: 'subsource-probe',
+        subsourceConfigured: false,
+        subsourceStatus: 'not-configured'
+      }).catch(() => {})
+      return redirect()
+    }
+
+    const previous = await readDiagnostics(env.SMARTSUBS_CACHE, configId).catch(() => [])
+    const recentProbe = previous.find(item => item.event === 'subsource-probe')
+    if (recentProbe && Date.now() - Number(recentProbe.ts || 0) < 5 * 60 * 1000) {
+      await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+        ...recentProbe,
+        event: 'subsource-probe-cache-hit',
+        ts: Date.now(),
+        cache: 'HIT',
+        subsourceProbeCacheAgeMs: Date.now() - Number(recentProbe.ts || 0)
+      }).catch(() => {})
+      return redirect()
+    }
+
+    try {
+      const probe = await probeSubsourceApi(userConfig.subsourceApiKey)
+      await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+        event: 'subsource-probe',
+        subsourceConfigured: true,
+        subsourceStatus: probe.status,
+        subsourceHttpStatus: probe.httpStatus,
+        subsourceLatencyMs: probe.latencyMs,
+        subsourceLimit: probe.limit,
+        subsourceRemaining: probe.remaining,
+        subsourceLimitMinute: probe.limitMinute,
+        subsourceRemainingMinute: probe.remainingMinute,
+        subsourceLimitHour: probe.limitHour,
+        subsourceRemainingHour: probe.remainingHour,
+        subsourceLimitDay: probe.limitDay,
+        subsourceRemainingDay: probe.remainingDay,
+        subsourceReset: probe.reset,
+        subsourceRateHeaderNames: probe.rateHeaderNames,
+        subsourceResponseRootType: probe.responseRootType,
+        subsourceResponseTopKeys: probe.responseTopKeys,
+        subsourceResponseItemKeys: probe.responseItemKeys
+      }).catch(() => {})
+    } catch (error) {
+      await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+        event: 'subsource-probe',
+        subsourceConfigured: true,
+        subsourceStatus: 'probe-failed',
+        error: safeMessage(error, userConfig.apiKey, userConfig.subsourceApiKey)
+      }).catch(() => {})
+    }
+    return redirect()
   }
 
   const translationMatch = request.method === 'GET' && suffix.match(/^\/translated\/([A-Za-z0-9_.-]+)\.vtt$/)
@@ -1592,6 +1678,7 @@ async function handleRequest(request, env, executionCtx = null) {
       rateLimitConfigured: Boolean(env.SMARTSUBS_SUBTITLE_LIMITER && env.SMARTSUBS_GENERATE_LIMITER),
       publicReady: publicReady(env),
       finalRelease: true,
+      subsourceDiscovery: true,
       model: geminiModel(env),
       cache: cache.stats()
     }, 200, { noStore: true, headers: { 'x-smartsubs-build': BUILD_ID } })
@@ -1614,15 +1701,21 @@ async function handleRequest(request, env, executionCtx = null) {
 
   if (request.method === 'POST' && url.pathname === '/configure') {
     let apiKey = ''
+    let subsourceApiKey = ''
     try {
       const secret = serverSecret(env)
       if (!secret) throw new Error('Server secret is not configured')
       const form = await readConfigureForm(request)
       apiKey = String(form.geminiApiKey || '').trim()
+      subsourceApiKey = String(form.subsourceApiKey || '').trim()
       await validateGeminiApiKey(apiKey, { model: geminiModel(env) })
+      const subsourceValidation = subsourceApiKey
+        ? await validateSubsourceApiKey(subsourceApiKey)
+        : { configured: false, status: 'not-configured' }
       const token = createUserConfigToken(apiKey, {
         secret,
-        model: geminiModel(env)
+        model: geminiModel(env),
+        subsourceApiKey
       })
       const urls = buildConfiguredUrls(requestBase(request), token)
       logPerf({
@@ -1637,16 +1730,18 @@ async function handleRequest(request, env, executionCtx = null) {
         manifestUrl: urls.manifestUrl,
         diagnoseUrl: `${urls.configuredBaseUrl}/diagnose`,
         installUrl: urls.installUrl,
+        subsourceConfigured: subsourceValidation.configured,
+        subsourceStatus: subsourceValidation.status
       }), { noStore: true, csp: true })
     } catch (error) {
       console.error(JSON.stringify({
         tag: 'SMARTSUBS_CONFIG_ERROR',
-        message: safeMessage(error, apiKey)
+        message: safeMessage(error, apiKey, subsourceApiKey)
       }))
       return send(400, 'text/html; charset=utf-8', renderConfigurePage({
         secretReady: Boolean(serverSecret(env)),
         model: geminiModel(env),
-        error: safeMessage(error, apiKey)
+        error: safeMessage(error, apiKey, subsourceApiKey)
       }), { noStore: true, csp: true })
     }
   }
