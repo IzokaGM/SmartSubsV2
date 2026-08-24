@@ -145,7 +145,8 @@ function selectMovie(items, media, type) {
   const seasonExact = media.season == null
     ? exact
     : exact.filter(item => Number(item && item.season) === media.season)
-  const pool = seasonExact.length ? seasonExact : exact
+  if (media.season != null && !seasonExact.length) return null
+  const pool = seasonExact
   return pool.find(item => !item.type || String(item.type).toLowerCase() === String(type || '').toLowerCase()) || pool[0] || null
 }
 
@@ -180,7 +181,7 @@ function subsourceLanguage(value) {
   return language
 }
 
-function normaliseSubsourceSubtitle(item, baseUrl, episode = 0) {
+function normaliseSubsourceSubtitle(item, baseUrl, season = 0, episode = 0) {
   const subtitleId = Number(item && item.subtitleId)
   if (!Number.isInteger(subtitleId) || subtitleId <= 0) return null
   const releases = Array.isArray(item.releaseInfo) ? item.releaseInfo.map(String).filter(Boolean).slice(0, 20) : []
@@ -190,7 +191,7 @@ function normaliseSubsourceSubtitle(item, baseUrl, episode = 0) {
     provider: 'subsource',
     lang: subsourceLanguage(item.language),
     language: String(item.language || ''),
-    url: `${String(baseUrl || '').replace(/\/+$/, '')}/subsource/${subtitleId}/${Math.max(0, Number(episode || 0))}.srt`,
+    url: `${String(baseUrl || '').replace(/\/+$/, '')}/subsource/${subtitleId}/${Math.max(0, Number(season || 0))}/${Math.max(0, Number(episode || 0))}.srt`,
     releaseInfo: releases,
     releaseName: releases.join(' '),
     commentary: String(item.commentary || ''),
@@ -248,7 +249,15 @@ async function fetchSubsourceCandidatesCore(args, apiKey, options = {}) {
   }
   const candidates = successful
     .flatMap(result => result.items)
-    .map(item => normaliseSubsourceSubtitle(item, options.publicBaseUrl, parseMediaId(args)?.episode || 0))
+    .map(item => {
+      const media = parseMediaId(args)
+      return normaliseSubsourceSubtitle(
+        item,
+        options.publicBaseUrl,
+        media?.season || 0,
+        media?.episode || 0
+      )
+    })
     .filter(item => item && ['msa', 'eng'].includes(item.lang) && item.url)
   return {
     candidates,
@@ -362,6 +371,7 @@ module.exports = {
   responseShape,
   subsourceStatus,
   parseMediaId,
+  selectMovie,
   subsourceLanguage,
   normaliseSubsourceSubtitle,
   findSubsourceMovie,

@@ -38,7 +38,7 @@ function sanitiseEvent(event = {}) {
     'subsourceReset', 'subsourceResponseRootType', 'subsourceResponseTopKeys',
     'subsourceResponseItemKeys', 'subsourceProbeCacheAgeMs', 'subsourceProbeVersion',
     'openSubtitlesCount', 'openSubtitlesStatus', 'subsourceTriggered', 'subsourceCandidateCount',
-    'subsourceCache', 'fallback'
+    'subsourceCache', 'subsourceAcceptedCount', 'subsourceRejectedCount', 'fallback'
   ]
   for (const key of allowed) {
     const value = event[key]

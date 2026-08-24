@@ -93,6 +93,40 @@ function buildEnglishTracks(upstream, extra = {}, limit = 5) {
     })
 }
 
+function seriesReleaseMatches(subtitle, id) {
+  const match = String(id || '').match(/^tt\d+:(\d+):(\d+)$/)
+  if (!match) return true
+  const season = Number(match[1])
+  const episode = Number(match[2])
+  const text = [subtitle?.releaseName, ...(Array.isArray(subtitle?.releaseInfo) ? subtitle.releaseInfo : [])]
+    .join(' ')
+  const seasonEpisodeTokens = [
+    ...text.matchAll(/\bs(\d{1,2})[ ._-]*e(\d{1,3})\b/gi),
+    ...text.matchAll(/\b(\d{1,2})x(\d{1,3})\b/gi)
+  ]
+  if (!seasonEpisodeTokens.length) return false
+  return seasonEpisodeTokens.some(token => Number(token[1]) === season && Number(token[2]) === episode)
+}
+
+function admitSubsourceCandidates(candidates, args = {}) {
+  const accepted = []
+  const rejected = []
+  for (const subtitle of candidates || []) {
+    if (!subtitle || subtitle.provider !== 'subsource') {
+      accepted.push(subtitle)
+      continue
+    }
+    const ranked = subtitle.lang === 'msa'
+      ? rankMalaySubtitles([subtitle], args.extra || {})
+      : rankEnglishSubtitles([subtitle], args.extra || {})
+    const confidence = ranked[0]?.confidence?.level || 'WEAK'
+    const episodeMatches = args.type !== 'series' || seriesReleaseMatches(subtitle, args.id)
+    if (confidence === 'STRONG' && episodeMatches) accepted.push(subtitle)
+    else rejected.push({ subtitle, confidence, episodeMatches })
+  }
+  return { accepted, rejected }
+}
+
 async function handleSubtitles(args, options = {}) {
   const startedAt = nowMs()
   const requestId = crypto.randomUUID()
@@ -165,7 +199,9 @@ async function handleSubtitles(args, options = {}) {
         })
       }
     }
-    const upstream = dedupeSubtitles([...openSubtitles, ...subsourceCandidates])
+    const admittedSubsource = admitSubsourceCandidates(subsourceCandidates, args)
+    const safeSubsourceCandidates = admittedSubsource.accepted
+    const upstream = dedupeSubtitles([...openSubtitles, ...safeSubsourceCandidates])
     const providerDiagnostic = {
       openSubtitlesCount: openSubtitles.length,
       openSubtitlesStatus,
@@ -173,6 +209,8 @@ async function handleSubtitles(args, options = {}) {
       subsourceTriggered,
       subsourceStatus,
       subsourceCandidateCount: subsourceCandidates.length,
+      subsourceAcceptedCount: safeSubsourceCandidates.length,
+      subsourceRejectedCount: admittedSubsource.rejected.length,
       subsourceLatencyMs,
       subsourceCache
     }
@@ -371,6 +409,8 @@ module.exports = {
   dedupeSubtitles,
   buildAutoSubtitle,
   buildEnglishTracks,
+  seriesReleaseMatches,
+  admitSubsourceCandidates,
   handleSubtitles,
   englishSelectionDiagnostics
 }
