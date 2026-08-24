@@ -2,6 +2,9 @@
 
 const API_BASE = 'https://api.subsource.net/api/v1'
 const DEFAULT_TIMEOUT_MS = 3500
+const PROBE_VERSION = 2
+const PROBE_QUERY = 'Toy Story'
+const PROBE_URL = `${API_BASE}/movies/search?searchType=text&q=${encodeURIComponent(PROBE_QUERY)}`
 
 function safeHeader(response, name) {
   if (!response || !response.headers || typeof response.headers.get !== 'function') return ''
@@ -63,7 +66,7 @@ async function probeSubsourceApi(apiKey, options = {}) {
   const startedAt = Date.now()
 
   try {
-    const response = await fetchImpl(`${API_BASE}/movies/1`, {
+    const response = await fetchImpl(PROBE_URL, {
       method: 'GET',
       headers: {
         accept: 'application/json',
@@ -123,6 +126,9 @@ async function validateSubsourceApiKey(apiKey, options = {}) {
 module.exports = {
   API_BASE,
   DEFAULT_TIMEOUT_MS,
+  PROBE_VERSION,
+  PROBE_QUERY,
+  PROBE_URL,
   responseShape,
   subsourceStatus,
   rateLimitHeaderNames,

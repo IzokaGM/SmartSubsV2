@@ -16,9 +16,9 @@ const { createUserConfigToken, decodeUserConfigToken, tokenFingerprint } = userC
 const { buildConfiguredUrls, validateGeminiApiKey, renderConfigurePage, escapeHtml } = configureModule
 const { nowMs, roundMs, logPerf } = perfModule
 const { recordDiagnostic, readDiagnostics, deriveVerdict } = diagnosticsModule
-const { probeSubsourceApi, validateSubsourceApiKey } = subsourceModule
+const { PROBE_VERSION, probeSubsourceApi, validateSubsourceApiKey } = subsourceModule
 
-const BUILD_ID = 'part5-1-subsource-discovery'
+const BUILD_ID = 'part5-1-1-subsource-probe-correction'
 const caches = new WeakMap()
 
 function responseHeaders(contentType, status = 200, options = {}) {
@@ -1299,7 +1299,9 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
     }
 
     const previous = await readDiagnostics(env.SMARTSUBS_CACHE, configId).catch(() => [])
-    const recentProbe = previous.find(item => item.event === 'subsource-probe')
+    const recentProbe = previous.find(item =>
+      item.event === 'subsource-probe' && Number(item.subsourceProbeVersion || 0) === PROBE_VERSION
+    )
     if (recentProbe && Date.now() - Number(recentProbe.ts || 0) < 5 * 60 * 1000) {
       await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
         ...recentProbe,
@@ -1315,6 +1317,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
       const probe = await probeSubsourceApi(userConfig.subsourceApiKey)
       await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
         event: 'subsource-probe',
+        subsourceProbeVersion: PROBE_VERSION,
         subsourceConfigured: true,
         subsourceStatus: probe.status,
         subsourceHttpStatus: probe.httpStatus,
@@ -1336,6 +1339,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
     } catch (error) {
       await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
         event: 'subsource-probe',
+        subsourceProbeVersion: PROBE_VERSION,
         subsourceConfigured: true,
         subsourceStatus: 'probe-failed',
         error: safeMessage(error, userConfig.apiKey, userConfig.subsourceApiKey)

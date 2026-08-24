@@ -36,7 +36,7 @@ function sanitiseEvent(event = {}) {
     'subsourceLimitMinute', 'subsourceRemainingMinute', 'subsourceLimitHour',
     'subsourceRemainingHour', 'subsourceLimitDay', 'subsourceRemainingDay',
     'subsourceReset', 'subsourceResponseRootType', 'subsourceResponseTopKeys',
-    'subsourceResponseItemKeys', 'subsourceProbeCacheAgeMs'
+    'subsourceResponseItemKeys', 'subsourceProbeCacheAgeMs', 'subsourceProbeVersion'
   ]
   for (const key of allowed) {
     const value = event[key]

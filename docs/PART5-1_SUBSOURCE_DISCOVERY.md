@@ -1,6 +1,6 @@
-# Part 5.1: Optional SubSource discovery
+# Part 5.1.1: Corrected optional SubSource discovery probe
 
-Part 5.1 establishes the optional SubSource provider boundary without changing SmartSubsV2 subtitle selection.
+Part 5.1 establishes the optional SubSource provider boundary without changing SmartSubsV2 subtitle selection. Part 5.1.1 corrects the discovery request after the original fixed movie ID returned HTTP 404.
 
 ## Safety contract
 
@@ -13,7 +13,7 @@ Part 5.1 establishes the optional SubSource provider boundary without changing S
 
 ## Discovery probe
 
-The configured Diagnose page includes **Test SubSource connection**. The probe calls the documented `GET /movies/{id}` endpoint using movie ID `1` and records only:
+The configured Diagnose page includes **Test SubSource connection**. The probe calls the documented `GET /movies/search` endpoint using `searchType=text` and the fixed public test title `Toy Story`. It records only:
 
 - connection classification and HTTP status;
 - request duration;
@@ -24,7 +24,7 @@ The result is reused for five minutes so repeated button presses do not consume 
 
 ## Deployment test
 
-1. Deploy Part 5.1.
+1. Deploy Part 5.1.1.
 2. Open `/configure`.
 3. Enter the Gemini key and the optional SubSource API key.
 4. Install the newly generated SmartSubsV2 configured URL.
@@ -36,4 +36,4 @@ Do not paste or screenshot either API key. Diagnose is designed not to display t
 
 ## Gate for Part 5.2
 
-Adaptive provider fusion must remain disabled until the live probe confirms authentication, response structure, rate-limit header names, and provider availability. Search parameters, subtitle metadata, and download format still require a separate live schema discovery step because the public API overview does not document those response bodies in full.
+Adaptive provider fusion must remain disabled until the corrected live probe confirms authentication, response structure, rate-limit header names, and provider availability. Subtitle metadata and download format still require a separate live schema discovery step because the public API overview does not document those response bodies in full.

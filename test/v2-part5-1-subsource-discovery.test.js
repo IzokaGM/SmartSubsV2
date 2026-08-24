@@ -7,6 +7,9 @@ const { createUserConfigToken, decodeUserConfigToken } = require('../src/user-co
 const { renderConfigurePage } = require('../src/configure')
 const {
   API_BASE,
+  PROBE_VERSION,
+  PROBE_QUERY,
+  PROBE_URL,
   responseShape,
   probeSubsourceApi,
   validateSubsourceApiKey
@@ -80,7 +83,7 @@ test('Part 5.1 Configure makes SubSource optional and preserves OpenSubtitles-on
   assert.match(html, /Leave blank to keep the current OpenSubtitles-only behaviour/)
 })
 
-test('Part 5.1 probes only the official API base with the key in a header', async () => {
+test('Part 5.1.1 probes the documented movie search with a public title and key header', async () => {
   const key = 'subsource-test-key'
   let received
   const result = await probeSubsourceApi(key, {
@@ -96,7 +99,11 @@ test('Part 5.1 probes only the official API base with the key in a header', asyn
     }
   })
 
-  assert.equal(received.url, `${API_BASE}/movies/1`)
+  assert.equal(received.url, PROBE_URL)
+  const parsed = new URL(received.url)
+  assert.equal(`${parsed.origin}${parsed.pathname}`, `${API_BASE}/movies/search`)
+  assert.equal(parsed.searchParams.get('searchType'), 'text')
+  assert.equal(parsed.searchParams.get('q'), PROBE_QUERY)
   assert.equal(received.options.headers['x-api-key'], key)
   assert.equal(received.url.includes(key), false)
   assert.equal(result.status, 'connected')
@@ -163,7 +170,7 @@ test('Part 5.1 Diagnose probe is cached for five minutes and does not change sub
   let calls = 0
   global.fetch = async url => {
     calls++
-    assert.equal(String(url), `${API_BASE}/movies/1`)
+    assert.equal(String(url), PROBE_URL)
     return new Response(JSON.stringify({ data: [{ id: 1, title: 'Probe' }] }), {
       status: 200,
       headers: {
@@ -186,6 +193,11 @@ test('Part 5.1 Diagnose probe is cached for five minutes and does not change sub
     assert.equal(first.status, 303)
     assert.equal(second.status, 303)
     assert.equal(calls, 1)
+
+    const events = []
+    const listing = await kv.list({ prefix: 'diag:v1:' })
+    for (const item of listing.keys) events.push(JSON.parse(await kv.get(item.name)))
+    assert.equal(events.some(item => item.event === 'subsource-probe' && item.subsourceProbeVersion === PROBE_VERSION), true)
 
     const diagnose = await handleRequest(new Request(`${base}/diagnose`), {
       SMARTSUBS_SECRET: secret,

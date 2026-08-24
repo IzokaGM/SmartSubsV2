@@ -18,7 +18,7 @@ This repository was reconstructed from the supplied SmartSubs GitHub Actions rec
 
 ## Current profile
 
-- Build ID: `part5-1-subsource-discovery`
+- Build ID: `part5-1-1-subsource-probe-correction`
 - Player translation: 180 cues, 24000 chars, concurrency 2
 - Queue first attempt: 160 cues, 20000 chars, concurrency 3
 - Queue fallback attempt: 180 cues, 24000 chars, concurrency 2
@@ -51,7 +51,7 @@ npm test
 npx wrangler deploy --dry-run --outdir .cf-build
 ```
 
-The Part 5.1 source passes all 126 Node regression tests. Its migration workflow also runs a Wrangler dry run before committing the change.
+The Part 5.1.1 source corrects the discovery probe to use the documented movie-search endpoint. Its migration workflow runs the focused tests, full regression suite, and a Wrangler dry run before committing the change.
 
 ## Configuration
 
@@ -67,7 +67,7 @@ After deployment:
 
 ### Optional SubSource discovery
 
-Part 5.1 adds an optional SubSource API key field to `/configure`. Leaving it blank preserves the current OpenSubtitles-only behaviour. When configured, Diagnose provides a manual **Test SubSource connection** action that records only connection status, latency, rate-limit headers, and JSON field names. SubSource results do not affect subtitle ranking in Part 5.1.
+Part 5.1 adds an optional SubSource API key field to `/configure`. Part 5.1.1 corrects its Diagnose probe to call the documented `GET /movies/search` endpoint with `searchType=text` and a fixed public test title. Leaving the key blank preserves the current OpenSubtitles-only behaviour. The manual **Test SubSource connection** action records only connection status, latency, rate-limit headers, and JSON field names. SubSource results do not affect subtitle ranking.
 
 Existing configured addon tokens remain valid. To enable SubSource discovery, configure and install a new URL containing both the Gemini key and optional SubSource key.
 
