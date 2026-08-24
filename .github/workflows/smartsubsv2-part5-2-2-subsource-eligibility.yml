@@ -1,0 +1,122 @@
+name: SmartSubsV2 Part 5.2.2 - SubSource Eligibility Gate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smartsubsv2-part5-2-2-subsource-eligibility
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout SmartSubsV2
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Verify exact Part 5.2.1 baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -Fq "part5-2-2-subsource-eligibility-gate" src/cloudflare-worker.mjs; then
+            echo "Part 5.2.2 is already present. No files were changed."
+            exit 1
+          fi
+          sha256sum -c <<'HASHES'
+          1852ce0359a105a93ce0bae6712d47fabcd9851e9405eb33404a20333bb3b6e9  src/cloudflare-worker.mjs
+          e266ac45d38de2953c45342db4287555558fa1c778816922248131132898921a  src/diagnostics.js
+          f514ae68d104bbc62f9a514d8ac35a6d6db974ff2e35f5b58c30a4b76172d3d8  src/subtitles.js
+          793d31d02bb25dbdf3a68ade2fe97846e02764f3be52d5ff012717f84b72f80c  test/nuvio-worker.test.js
+          HASHES
+          test ! -e test/v2-part5-2-2-subsource-eligibility.test.js
+          grep -Fq "part5-2-1-subsource-native-safety" src/cloudflare-worker.mjs
+          grep -Fq '"PLAYER_QUEUE_WAIT_MAX_MS": "9000"' wrangler.jsonc
+          grep -Fq '"PLAYER_QUEUE_GRACE_MS": "600"' wrangler.jsonc
+          grep -Fq '"QUEUE_USER_SELECTED_CONCURRENCY": "3"' wrangler.jsonc
+          grep -Fq '"SMARTSUBS_CACHE_VERSION": "m8-v1"' wrangler.jsonc
+
+      - name: Apply Part 5.2.2 exact payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          base64 -d <<'PAYLOAD' | gzip -d > /tmp/smartsubsv2-part5-2-2.patch
+          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
+          PAYLOAD
+          git apply --check /tmp/smartsubsv2-part5-2-2.patch
+          git apply /tmp/smartsubsv2-part5-2-2.patch
+
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Focused Part 5.2 safety tests
+        run: node --test test/v2-part5-2-subsource-fusion.test.js test/v2-part5-2-1-subsource-native-safety.test.js test/v2-part5-2-2-subsource-eligibility.test.js
+
+      - name: Full regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run check
+          npm test
+          git diff --check
+
+      - name: Verify safety and stable runtime settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fq "part5-2-2-subsource-eligibility-gate" src/cloudflare-worker.mjs
+          grep -Fq "skipped-no-sync-metadata" src/subtitles.js
+          grep -Fq "hasPlayerSyncMetadata" src/subtitles.js
+          grep -Fq "Only strong release and exact series episode matches are admitted" src/cloudflare-worker.mjs
+          grep -Fq "OpenSubtitles remains the permanent fallback" src/cloudflare-worker.mjs
+          grep -Fq "queueProfile: 'user-selected-stable'" src/cloudflare-worker.mjs
+          grep -Fq "JSON.stringify({ v: 1" src/token.js
+          grep -Fq '"PLAYER_QUEUE_WAIT_MAX_MS": "9000"' wrangler.jsonc
+          grep -Fq '"PLAYER_QUEUE_GRACE_MS": "600"' wrangler.jsonc
+          grep -Fq '"QUEUE_USER_SELECTED_CONCURRENCY": "3"' wrangler.jsonc
+          grep -Fq '"SMARTSUBS_CACHE_VERSION": "m8-v1"' wrangler.jsonc
+
+          unexpected="$(
+            git status --porcelain |
+            awk '{print $2}' |
+            grep -Ev '^(src/cloudflare-worker\.mjs|src/diagnostics\.js|src/subtitles\.js|test/nuvio-worker\.test\.js|test/v2-part5-2-2-subsource-eligibility\.test\.js)$' || true
+          )"
+          if [[ -n "$unexpected" ]]; then
+            echo "Unexpected files changed:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+          if rg -n "subsourceApiKey.*(url|query)|[?&](apiKey|key)=" src --glob '!configure.js'; then
+            echo "Potential SubSource key exposure path detected."
+            exit 1
+          fi
+
+      - name: Cloudflare Worker dry run
+        env:
+          WRANGLER_SEND_METRICS: 'false'
+        run: npx wrangler deploy --dry-run --outdir .cf-build
+
+      - name: Commit verified Part 5.2.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/cloudflare-worker.mjs src/diagnostics.js src/subtitles.js \
+            test/nuvio-worker.test.js test/v2-part5-2-2-subsource-eligibility.test.js
+          git commit -m "Skip SubSource without sync metadata"
+          git push origin HEAD:main
+
