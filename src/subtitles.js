@@ -108,6 +108,14 @@ function seriesReleaseMatches(subtitle, id) {
   return seasonEpisodeTokens.some(token => Number(token[1]) === season && Number(token[2]) === episode)
 }
 
+function hasPlayerSyncMetadata(extra = {}) {
+  return Boolean(
+    String(extra.filename || extra.fileName || extra.file_name || '').trim() ||
+    String(extra.videoHash || '').trim() ||
+    String(extra.videoSize || '').trim()
+  )
+}
+
 function admitSubsourceCandidates(candidates, args = {}) {
   const accepted = []
   const rejected = []
@@ -162,12 +170,17 @@ async function handleSubtitles(args, options = {}) {
     )
     const initialEnglish = rankEnglishSubtitles(openSubtitles, args.extra || {})
     const subsourceConfigured = Boolean(options.subsourceApiKey)
-    const subsourceTriggered = subsourceConfigured && (
+    const subsourceEligible = hasPlayerSyncMetadata(args.extra || {})
+    const subsourceTriggered = subsourceConfigured && subsourceEligible && (
       initialMalay[0]?.confidence?.level !== 'STRONG' ||
       initialEnglish[0]?.confidence?.level !== 'STRONG'
     )
     let subsourceCandidates = []
-    let subsourceStatus = subsourceConfigured ? 'not-needed' : 'not-configured'
+    let subsourceStatus = !subsourceConfigured
+      ? 'not-configured'
+      : !subsourceEligible
+        ? 'skipped-no-sync-metadata'
+        : 'not-needed'
     let subsourceLatencyMs = 0
     let subsourceCache = ''
     if (subsourceTriggered) {
@@ -206,6 +219,8 @@ async function handleSubtitles(args, options = {}) {
       openSubtitlesCount: openSubtitles.length,
       openSubtitlesStatus,
       subsourceConfigured,
+      subsourceEligible,
+      subsourceEligibilityReason: subsourceEligible ? 'player-sync-metadata-available' : 'no-player-sync-metadata',
       subsourceTriggered,
       subsourceStatus,
       subsourceCandidateCount: subsourceCandidates.length,
@@ -214,7 +229,7 @@ async function handleSubtitles(args, options = {}) {
       subsourceLatencyMs,
       subsourceCache
     }
-    if (subsourceTriggered && subsourceStatus !== 'fallback') {
+    if (subsourceConfigured && subsourceStatus !== 'not-needed' && subsourceStatus !== 'fallback') {
       await emitDiagnostic(options, {
         event: 'subsource-fusion',
         ...providerDiagnostic
@@ -411,6 +426,7 @@ module.exports = {
   buildEnglishTracks,
   seriesReleaseMatches,
   admitSubsourceCandidates,
+  hasPlayerSyncMetadata,
   handleSubtitles,
   englishSelectionDiagnostics
 }

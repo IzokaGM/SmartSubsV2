@@ -19,14 +19,14 @@ function memoryKv() {
 
 test('Nuvio diagnose build marker is exposed by production worker health', async () => {
   const { BUILD_ID, handleRequest } = await import('../src/cloudflare-worker.mjs')
-  assert.equal(BUILD_ID, 'part5-2-1-subsource-native-safety')
+  assert.equal(BUILD_ID, 'part5-2-2-subsource-eligibility-gate')
   const response = await handleRequest(new Request('https://smartsubs.example/health'), {
     SMARTSUBS_SECRET: 'server-secret-for-tests',
     SMARTSUBS_CACHE: memoryKv()
   })
   assert.equal(response.status, 200)
   const body = await response.json()
-  assert.equal(body.build, 'part5-2-1-subsource-native-safety')
+  assert.equal(body.build, 'part5-2-2-subsource-eligibility-gate')
   assert.equal(body.diagnose, true)
   assert.equal(body.subsourceDiscovery, true)
   assert.equal(body.subsourceFusion, true)
