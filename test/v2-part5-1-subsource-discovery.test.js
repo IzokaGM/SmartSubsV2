@@ -80,7 +80,7 @@ test('Part 5.1 Configure makes SubSource optional and preserves OpenSubtitles-on
   assert.match(html, /name="geminiApiKey"[^>]+required/)
   assert.match(html, /name="subsourceApiKey"/)
   assert.doesNotMatch(html, /name="subsourceApiKey"[^>]+required/)
-  assert.match(html, /Leave blank to keep the current OpenSubtitles-only behaviour/)
+  assert.match(html, /Leave blank for OpenSubtitles-only mode/)
 })
 
 test('Part 5.1.1 probes the documented movie search with a public title and key header', async () => {
@@ -204,10 +204,10 @@ test('Part 5.1 Diagnose probe is cached for five minutes and does not change sub
       SMARTSUBS_CACHE: kv
     })
     const html = await diagnose.text()
-    assert.match(html, /SubSource discovery/)
+    assert.match(html, /SubSource fusion/)
     assert.match(html, /connected/)
-    assert.match(html, /day remaining 7199/)
-    assert.match(html, /does not expose the API key or change subtitle ranking/)
+    assert.match(html, /7199/)
+    assert.match(html, /API key is never placed in subtitle URLs, logs or Queue messages/)
   } finally {
     global.fetch = originalFetch
   }

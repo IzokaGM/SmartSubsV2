@@ -144,6 +144,13 @@ function scoreEnglishSubtitle(subtitle, index = 0, context = {}) {
   if (/\b(commentary|lyrics)\b/.test(candidateText)) score -= 3000
   if (/\b(utf[ ._-]?8|web[ ._-]?dl|web[ ._-]?rip|bluray|blu ray|bdrip)\b/.test(candidateText)) score += 20
 
+  const downloads = Math.max(0, Number(subtitle && subtitle.downloads || 0))
+  if (downloads > 0) score += Math.min(24, Math.round(Math.log10(downloads + 1) * 6))
+  const ratingGood = Math.max(0, Number(subtitle?.rating?.good || 0))
+  const ratingBad = Math.max(0, Number(subtitle?.rating?.bad || 0))
+  const ratingVotes = ratingGood + ratingBad
+  if (ratingVotes >= 3) score += Math.round(((ratingGood / ratingVotes) - 0.5) * 20)
+
   const filename = contextFilename(context)
   if (filename) {
     const requestText = normaliseText(filename)

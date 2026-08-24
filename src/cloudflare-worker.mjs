@@ -7,6 +7,7 @@ import configureModule from './configure.js'
 import perfModule from './perf.js'
 import diagnosticsModule from './diagnostics.js'
 import subsourceModule from './subsource.js'
+import subsourceArchiveModule from './subsource-archive.js'
 import { CloudflareTranslationCache, cfGetOrTranslate, makeCacheKey } from './cf-cache.mjs'
 
 const { createConfiguredManifest } = configuredManifestModule
@@ -16,9 +17,10 @@ const { createUserConfigToken, decodeUserConfigToken, tokenFingerprint } = userC
 const { buildConfiguredUrls, validateGeminiApiKey, renderConfigurePage, escapeHtml } = configureModule
 const { nowMs, roundMs, logPerf } = perfModule
 const { recordDiagnostic, readDiagnostics, deriveVerdict } = diagnosticsModule
-const { PROBE_VERSION, probeSubsourceApi, validateSubsourceApiKey } = subsourceModule
+const { PROBE_VERSION, probeSubsourceApi, validateSubsourceApiKey, downloadSubsourceArchive } = subsourceModule
+const { extractSubtitleArchive } = subsourceArchiveModule
 
-const BUILD_ID = 'part5-1-1-subsource-probe-correction'
+const BUILD_ID = 'part5-2-final-subsource-fusion'
 const caches = new WeakMap()
 
 function responseHeaders(contentType, status = 200, options = {}) {
@@ -388,8 +390,10 @@ function renderConfiguredDiagnosePage(configId, events, options = {}) {
   const nativeScore = Number(lastSubtitle?.malaySelectedScore)
   const subsourceConfigured = options.subsourceConfigured === true
   const lastSubsourceProbe = sorted.find(item =>
-    ['subsource-probe', 'subsource-probe-cache-hit'].includes(item.event)
+    ['subsource-probe', 'subsource-probe-cache-hit'].includes(item.event) &&
+    Number(item.subsourceProbeVersion || 0) === PROBE_VERSION
   ) || null
+  const lastSubsourceFusion = sorted.find(item => item.event === 'subsource-fusion') || null
   const subsourceStatus = subsourceConfigured
     ? (lastSubsourceProbe?.subsourceStatus || 'not-tested')
     : 'not-configured'
@@ -460,7 +464,7 @@ function renderConfiguredDiagnosePage(configId, events, options = {}) {
 
 <section class="card"><h2>What this means</h2><div class="guide">${escapeHtml(guidance)}</div></section>
 
-<section class="card"><h2>SubSource discovery</h2><div class="metric"><div class="label">Optional provider</div><div class="value"><span class="pill ${subsourceTone}">${escapeHtml(subsourceStatus)}</span></div><div class="sub">${subsourceConfigured ? `HTTP ${escapeHtml(lastSubsourceProbe?.subsourceHttpStatus || 'not tested')} | ${lastSubsourceProbe?.subsourceLatencyMs !== undefined ? formatDuration(lastSubsourceProbe.subsourceLatencyMs) : 'run the connection test'}${lastSubsourceProbe?.subsourceRemainingDay ? ` | day remaining ${escapeHtml(lastSubsourceProbe.subsourceRemainingDay)}` : ''}` : 'Configure a SubSource API key to enable discovery. Current OpenSubtitles behaviour is unchanged.'}</div></div><form method="post" action="subsource-probe"><button class="probe" type="submit"${subsourceConfigured ? '' : ' disabled'}>Test SubSource connection</button></form><p class="muted">Part 5.1 records only status, timing, rate-limit headers and response field names. It does not expose the API key or change subtitle ranking.</p></section>
+<section class="card"><h2>SubSource fusion</h2><div class="metric"><div class="label">Optional provider</div><div class="value"><span class="pill ${subsourceTone}">${escapeHtml(subsourceStatus)}</span></div><div class="sub">${subsourceConfigured ? `HTTP ${escapeHtml(lastSubsourceProbe?.subsourceHttpStatus || 'not tested')} | ${lastSubsourceProbe?.subsourceLatencyMs !== undefined ? formatDuration(lastSubsourceProbe.subsourceLatencyMs) : 'run the connection test'}${lastSubsourceProbe?.subsourceRemaining ? ` | remaining ${escapeHtml(lastSubsourceProbe.subsourceRemaining)}` : ''}` : 'Configure a SubSource API key to enable adaptive fusion.'}</div></div><div class="metric"><div class="label">Latest adaptive lookup</div><div class="value">${escapeHtml(lastSubsourceFusion?.status || 'not used yet')}</div><div class="sub">${lastSubsourceFusion ? `${escapeHtml(lastSubsourceFusion.subsourceCandidateCount || 0)} candidates | ${formatDuration(lastSubsourceFusion.subsourceLatencyMs || 0)} | cache ${escapeHtml(lastSubsourceFusion.subsourceCache || 'unknown')}` : 'SubSource is called only when current sync evidence can be improved.'}</div></div><form method="post" action="subsource-probe"><button class="probe" type="submit"${subsourceConfigured ? '' : ' disabled'}>Test SubSource connection</button></form><p class="muted">OpenSubtitles remains the permanent fallback. The API key is never placed in subtitle URLs, logs or Queue messages.</p></section>
 
 <section class="card"><h2>Player sync metadata</h2>${metadataItems}</section>
 
@@ -1348,6 +1352,52 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
     return redirect()
   }
 
+  const subsourceDownloadMatch = request.method === 'GET' && suffix.match(/^\/subsource\/(\d+)\/(\d+)\.srt$/)
+  if (subsourceDownloadMatch) {
+    if (!userConfig.subsourceApiKey) {
+      return send(404, 'text/plain; charset=utf-8', 'SubSource is not configured', { noStore: true })
+    }
+    const subtitleId = Number(subsourceDownloadMatch[1])
+    const episode = Number(subsourceDownloadMatch[2])
+    const cacheKey = `subsource:file:v1:${subtitleId}:${episode}`
+    try {
+      let text = ''
+      let cache = 'MISS'
+      if (env.SMARTSUBS_CACHE && typeof env.SMARTSUBS_CACHE.get === 'function') {
+        text = String(await env.SMARTSUBS_CACHE.get(cacheKey) || '')
+      }
+      if (text) {
+        cache = 'HIT'
+      } else {
+        const archive = await downloadSubsourceArchive(subtitleId, userConfig.subsourceApiKey)
+        text = extractSubtitleArchive(archive, episode).text
+        if (env.SMARTSUBS_CACHE && typeof env.SMARTSUBS_CACHE.put === 'function') {
+          await env.SMARTSUBS_CACHE.put(cacheKey, text, { expirationTtl: 7 * 24 * 60 * 60 }).catch(() => {})
+        }
+      }
+      await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+        event: 'subsource-download',
+        status: 'ready',
+        cache,
+        sourceBytes: new TextEncoder().encode(text).length
+      }).catch(() => {})
+      return send(200, 'application/x-subrip; charset=utf-8', text, {
+        cacheControl: 'private, max-age=86400, immutable',
+        headers: { 'x-smartsubs-cache': cache, 'x-smartsubs-build': BUILD_ID }
+      })
+    } catch (error) {
+      await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+        event: 'subsource-download',
+        status: 'failed',
+        error: safeMessage(error, userConfig.subsourceApiKey)
+      }).catch(() => {})
+      return send(502, 'text/plain; charset=utf-8', 'SubSource subtitle is temporarily unavailable', {
+        noStore: true,
+        headers: { 'x-smartsubs-build': BUILD_ID }
+      })
+    }
+  }
+
   const translationMatch = request.method === 'GET' && suffix.match(/^\/translated\/([A-Za-z0-9_.-]+)\.vtt$/)
   if (translationMatch) {
     const startedAt = nowMs()
@@ -1611,6 +1661,9 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
         englishTrackLimit: 5,
         publicBaseUrl: configuredBase(request, token),
         tokenSecret: secret,
+        subsourceApiKey: userConfig.subsourceApiKey,
+        subsourceKv: env.SMARTSUBS_CACHE,
+        subsourceTimeoutMs: 2500,
         onDiagnostic: event => recordDiagnostic(env.SMARTSUBS_CACHE, configId, event)
       })
 
@@ -1683,6 +1736,7 @@ async function handleRequest(request, env, executionCtx = null) {
       publicReady: publicReady(env),
       finalRelease: true,
       subsourceDiscovery: true,
+      subsourceFusion: true,
       model: geminiModel(env),
       cache: cache.stats()
     }, 200, { noStore: true, headers: { 'x-smartsubs-build': BUILD_ID } })

@@ -7,6 +7,7 @@ const { isSupportedRequest, fetchOpenSubtitles } = require('./opensubtitles')
 const { getMalaySubtitles, toNativeMalay } = require('./languages')
 const { selectBestEnglish, rankEnglishSubtitles, rankMalaySubtitles } = require('./selector')
 const { createTranslationToken } = require('./token')
+const { fetchSubsourceCandidates } = require('./subsource')
 
 async function emitDiagnostic(options, payload) {
   if (typeof options.onDiagnostic !== 'function') return
@@ -108,8 +109,79 @@ async function handleSubtitles(args, options = {}) {
 
   try {
     const upstreamStartedAt = nowMs()
-    const upstream = await fetchOpenSubtitles(args, options)
+    let openSubtitles = []
+    let openSubtitlesStatus = 'connected'
+    try {
+      openSubtitles = await fetchOpenSubtitles(args, options)
+    } catch (error) {
+      openSubtitlesStatus = 'fallback'
+      await emitDiagnostic(options, {
+        event: 'opensubtitles-provider',
+        status: 'fallback',
+        error: String(error?.message || error || '').slice(0, 120)
+      })
+    }
     const upstreamMs = roundMs(nowMs() - upstreamStartedAt)
+    const initialMalay = rankMalaySubtitles(
+      dedupeSubtitles(getMalaySubtitles(openSubtitles)),
+      args.extra || {}
+    )
+    const initialEnglish = rankEnglishSubtitles(openSubtitles, args.extra || {})
+    const subsourceConfigured = Boolean(options.subsourceApiKey)
+    const subsourceTriggered = subsourceConfigured && (
+      initialMalay[0]?.confidence?.level !== 'STRONG' ||
+      initialEnglish[0]?.confidence?.level !== 'STRONG'
+    )
+    let subsourceCandidates = []
+    let subsourceStatus = subsourceConfigured ? 'not-needed' : 'not-configured'
+    let subsourceLatencyMs = 0
+    let subsourceCache = ''
+    if (subsourceTriggered) {
+      try {
+        const fetchCandidates = options.fetchSubsourceCandidatesFn || fetchSubsourceCandidates
+        const fusion = await fetchCandidates(args, options.subsourceApiKey, {
+          fetchImpl: options.subsourceFetchImpl,
+          timeoutMs: options.subsourceTimeoutMs,
+          kv: options.subsourceKv,
+          publicBaseUrl: options.publicBaseUrl
+        })
+        subsourceCandidates = Array.isArray(fusion?.candidates) ? fusion.candidates : []
+        subsourceLatencyMs = Number(fusion?.latencyMs || 0)
+        subsourceCache = String(fusion?.cache || '')
+        subsourceStatus = fusion?.partial ? 'partial' : 'connected'
+      } catch (error) {
+        subsourceStatus = /429/.test(String(error?.message || ''))
+          ? 'quota-limited'
+          : /401|403/.test(String(error?.message || ''))
+            ? 'key-rejected'
+            : /abort|timeout/i.test(String(error?.message || error || ''))
+              ? 'timeout'
+              : 'fallback'
+        await emitDiagnostic(options, {
+          event: 'subsource-fusion',
+          status: subsourceStatus,
+          fallback: 'opensubtitles',
+          error: String(error?.message || error || '').slice(0, 120)
+        })
+      }
+    }
+    const upstream = dedupeSubtitles([...openSubtitles, ...subsourceCandidates])
+    const providerDiagnostic = {
+      openSubtitlesCount: openSubtitles.length,
+      openSubtitlesStatus,
+      subsourceConfigured,
+      subsourceTriggered,
+      subsourceStatus,
+      subsourceCandidateCount: subsourceCandidates.length,
+      subsourceLatencyMs,
+      subsourceCache
+    }
+    if (subsourceTriggered && subsourceStatus !== 'fallback') {
+      await emitDiagnostic(options, {
+        event: 'subsource-fusion',
+        ...providerDiagnostic
+      })
+    }
     const rankedMalay = rankMalaySubtitles(
       dedupeSubtitles(getMalaySubtitles(upstream)),
       args.extra || {}
@@ -170,6 +242,7 @@ async function handleSubtitles(args, options = {}) {
         id: args.id,
         upstreamMs,
         upstreamCount: upstream.length,
+        ...providerDiagnostic,
         malayCount: malay.length,
         ...malaySelectionDiagnostic,
         englishFound: Boolean(english),
@@ -190,6 +263,7 @@ async function handleSubtitles(args, options = {}) {
         id: args.id,
         result: resultName,
         upstreamCount: upstream.length,
+        ...providerDiagnostic,
         malayCount: malay.length,
         ...malaySelectionDiagnostic,
         englishFound: Boolean(english),
@@ -225,6 +299,7 @@ async function handleSubtitles(args, options = {}) {
       id: args.id,
       upstreamMs,
       upstreamCount: upstream.length,
+      ...providerDiagnostic,
       malayCount: 0,
       ...malaySelectionDiagnostic,
       englishFound: Boolean(english),
@@ -247,6 +322,7 @@ async function handleSubtitles(args, options = {}) {
       id: args.id,
       result: resultName,
       upstreamCount: upstream.length,
+      ...providerDiagnostic,
       malayCount: 0,
       ...malaySelectionDiagnostic,
       englishFound: Boolean(english),

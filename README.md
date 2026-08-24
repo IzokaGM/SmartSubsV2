@@ -7,8 +7,8 @@ This repository was reconstructed from the supplied SmartSubs GitHub Actions rec
 ## Runtime flow
 
 1. Stremio requests subtitles from a configured SmartSubs URL.
-2. SmartSubs forwards the subtitle request to `https://opensubtitles-v3.strem.io`.
-3. Existing Malay subtitles are returned directly.
+2. SmartSubs checks OpenSubtitles v3 first and adaptively queries optional SubSource when sync evidence can be improved.
+3. Candidates from both providers enter one metadata-aware ranking engine and existing Malay subtitles are returned directly.
 4. If Malay is unavailable, SmartSubs ranks English candidates using stream metadata such as filename, video hash, video size, resolution, codec, HDR markers, source type, and release group.
 5. SmartSubs exposes a signed Malay Auto subtitle URL.
 6. Cloudflare Queue can pretranslate the selected English source before the player opens it.
@@ -18,7 +18,7 @@ This repository was reconstructed from the supplied SmartSubs GitHub Actions rec
 
 ## Current profile
 
-- Build ID: `part5-1-1-subsource-probe-correction`
+- Build ID: `part5-2-final-subsource-fusion`
 - Player translation: 180 cues, 24000 chars, concurrency 2
 - Queue first attempt: 160 cues, 20000 chars, concurrency 3
 - Queue fallback attempt: 180 cues, 24000 chars, concurrency 2
@@ -40,7 +40,7 @@ The final recovered worker expects:
 - Rate limiter binding: `SMARTSUBS_SUBTITLE_LIMITER`
 - Rate limiter binding: `SMARTSUBS_GENERATE_LIMITER`
 
-`wrangler.jsonc` keeps the deployed SmartSubsV2 resource identifiers. KV, Queue, rate limiter, and Durable Object identities are not changed by Part 5.1.
+`wrangler.jsonc` keeps the deployed SmartSubsV2 resource identifiers. KV, Queue, rate limiter, and Durable Object identities are not changed by Part 5.2.
 
 ## Local validation
 
@@ -51,7 +51,7 @@ npm test
 npx wrangler deploy --dry-run --outdir .cf-build
 ```
 
-The Part 5.1.1 source corrects the discovery probe to use the documented movie-search endpoint. Its migration workflow runs the focused tests, full regression suite, and a Wrangler dry run before committing the change.
+The Part 5.2 source adds adaptive SubSource fusion, ZIP extraction and safe provider fallback. Its migration workflow runs focused tests, the full regression suite, and a Wrangler dry run before committing the change.
 
 ## Configuration
 
@@ -65,13 +65,15 @@ After deployment:
 4. Install that configured manifest in Stremio.
 5. Use `/c/YOUR_CONFIG_TOKEN/diagnose` when debugging subtitle selection, queue activity, cache state, and translation failures.
 
-### Optional SubSource discovery
+### Optional SubSource fusion
 
-Part 5.1 adds an optional SubSource API key field to `/configure`. Part 5.1.1 corrects its Diagnose probe to call the documented `GET /movies/search` endpoint with `searchType=text` and a fixed public test title. Leaving the key blank preserves the current OpenSubtitles-only behaviour. The manual **Test SubSource connection** action records only connection status, latency, rate-limit headers, and JSON field names. SubSource results do not affect subtitle ranking.
+Part 5.2 uses the optional SubSource key only when OpenSubtitles lacks strong native Malay or English sync evidence. It searches by IMDb identity, fetches Malay and English release metadata, merges both providers into the existing ranker, and proxies selected ZIP files through SmartSubsV2 without exposing the key. OpenSubtitles remains the permanent fallback.
 
-Existing configured addon tokens remain valid. To enable SubSource discovery, configure and install a new URL containing both the Gemini key and optional SubSource key.
+Movie mappings are cached for 30 days, subtitle lists for 6 hours, and extracted subtitle text for 7 days. A short provider timeout and per-key quota circuit breaker protect playback latency and quota. Leaving the key blank preserves OpenSubtitles-only behaviour.
 
-See `docs/PART5-1_SUBSOURCE_DISCOVERY.md` for the deployment test and the evidence needed before adaptive provider fusion is enabled.
+Existing configured addon tokens remain valid. Installations already configured with a SubSource key do not need a new token.
+
+See `docs/PART5-2_SUBSOURCE_FUSION.md` for behaviour, safeguards and live validation.
 
 ## Recovery note
 
