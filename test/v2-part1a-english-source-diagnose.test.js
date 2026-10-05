@@ -15,70 +15,34 @@ const responseFor = subtitles => async () => ({
   json: async () => ({ subtitles })
 })
 
-test('Part 1A reports the selected English ID and top candidates without changing selection', async () => {
+test('Direct English selection uses first eligible OpenSubtitles source regardless of release metadata', async () => {
   const upstream = [
-    {
-      id: 'wrong-release',
-      lang: 'eng',
-      url: 'https://example.test/Show.S01E01.1080p.BluRay.x264-OTHER.srt'
-    },
-    {
-      id: 'matching-release',
-      lang: 'eng',
-      url: 'https://example.test/Show.S01E01.1080p.WEB-DL.x265-GROUP.srt'
-    }
+    { id:'first', lang:'eng', url:'https://example.test/BluRay.srt' },
+    { id:'second', lang:'eng', url:'https://example.test/WEB-DL.srt' }
   ]
-
-  const extra = {
-    filename: 'Show.S01E01.1080p.WEB-DL.x265-GROUP.mkv'
-  }
-
-  const expected = selectBestEnglish(upstream, extra)
-  const events = []
-
-  const result = await handleSubtitles({
-    type: 'series',
-    id: 'tt11198330:1:1',
-    extra
-  }, {
-    apiKey: 'test-key',
-    publicBaseUrl: 'https://smartsubsv2.example/c/test',
-    tokenSecret: 'test-secret',
-    fetchImpl: responseFor(upstream),
-    onDiagnostic: async event => events.push(event)
+  const events=[]
+  const result=await handleSubtitles({type:'series',id:'tt11198330:1:1',extra:{filename:'WEB-DL.mkv'}}, {
+    apiKey:'key',publicBaseUrl:'https://smartsubs.example/c/test',tokenSecret:'test-secret',
+    fetchImpl:responseFor(upstream),onDiagnostic: async event=>events.push(event)
   })
-
-  const event = events.find(item => item.event === 'subtitle-result')
-  assert.ok(event)
-  assert.equal(result.subtitles.length, 1)
-  assert.equal(event.englishSelectedId, expected.id)
-  assert.equal(event.englishSelectedId, 'matching-release')
-  assert.equal(event.englishSelectionStable, true)
-  assert.equal(event.englishCandidateCount, 2)
-  assert.equal(event.sourceFilenameProvided, true)
-  assert.equal(event.sourceVideoHashProvided, false)
-  assert.equal(event.sourceVideoSizeProvided, false)
-  assert.equal(event.sourceFilename, extra.filename)
-  assert.deepEqual(event.requestExtraKeys, ['filename'])
-  assert.match(event.englishTop[0], /^1:matching-release:/)
+  const event=events.find(item=>item.event==='subtitle-result')
+  assert.equal(result.subtitles.length,1)
+  assert.equal(event.englishSelectedId,'first')
+  assert.deepEqual(event.englishSourceIds,['first','second'])
+  assert.equal(event.englishCandidateCount,2)
+  assert.equal('englishSelectedScore' in event,false)
+  assert.equal('englishConfidence' in event,false)
 })
 
-test('Part 1A makes weak no-metadata selection visible', () => {
-  const upstream = [
-    { id: 'first', lang: 'eng', url: 'https://example.test/first.srt' },
-    { id: 'second', lang: 'eng', url: 'https://example.test/second.srt' }
-  ]
-
-  const selected = selectBestEnglish(upstream, {})
-  const info = englishSelectionDiagnostics(upstream, selected, {})
-
-  assert.equal(info.sourceFilenameProvided, false)
-  assert.equal(info.sourceVideoHashProvided, false)
-  assert.equal(info.sourceVideoSizeProvided, false)
-  assert.equal(info.englishSelectedId, 'first')
-  assert.equal(info.englishCandidateCount, 2)
-  assert.equal(info.englishSelectionStable, true)
-  assert.match(info.englishTop[0], /^1:first:/)
+test('Direct English selection skips missing URLs and preserves remaining order', () => {
+  const upstream=[{id:'unusable',lang:'eng'},
+    {id:'first',lang:'eng',url:'https://example.test/first.srt'},
+    {id:'second',lang:'eng',url:'https://example.test/second.srt'}]
+  const info=englishSelectionDiagnostics(upstream, upstream[1], {})
+  assert.equal(info.englishSelectedId,'first')
+  assert.deepEqual(info.englishSourceIds,['first','second'])
+  assert.equal(info.englishCandidateCount,2)
+  assert.equal('sourceVideoHashProvided' in info,false)
 })
 
 test('Part 1A diagnostic sanitizer keeps source-selection fields', () => {

@@ -22,8 +22,8 @@ export class CloudflareTranslationCache {
     this.kv = options.kv || null
     this.ttlMs = Math.max(60000, Number(options.ttlMs || 180 * 24 * 60 * 60 * 1000))
     this.version = String(options.version || 'm8-v1')
-    this.memory = new Map()
-    this.counters = { memoryHits: 0, kvHits: 0, misses: 0, stores: 0, expired: 0 }
+    this.memory = options.memory || new Map()
+    this.counters = options.counters || { memoryHits: 0, kvHits: 0, misses: 0, stores: 0, expired: 0 }
   }
   remember(key, value, expiresAt) {
     this.memory.delete(key)
@@ -116,6 +116,9 @@ export async function cfGetOrTranslate(options = {}) {
   const translateOptions = options.translateOptions && typeof options.translateOptions === 'object'
     ? options.translateOptions
     : {}
+  const translateContext = options.translateContext && typeof options.translateContext === 'object'
+    ? options.translateContext
+    : {}
   if (!cache) throw new Error('Translation cache is required')
   if (!upstreamUrl) throw new Error('Subtitle source URL is required')
   if (!model) throw new Error('Translation model is required')
@@ -141,6 +144,7 @@ export async function cfGetOrTranslate(options = {}) {
     let translationStats = null
     const vtt = await translateFn(upstreamUrl, {
       ...translateOptions,
+      ...translateContext,
       apiKey,
       model,
       onTranslationStats: stats => { translationStats = stats }

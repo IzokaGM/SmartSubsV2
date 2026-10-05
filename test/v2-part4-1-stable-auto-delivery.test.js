@@ -4,12 +4,12 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 
-test('Part 4.1 deployed player Queue wait is nine seconds', async () => {
+test('Part 4.1 deployed series player Queue wait is 30 seconds', async () => {
   const { playerQueueWaitMaxMs } = await import('../src/cloudflare-worker.mjs')
   const config = JSON.parse(fs.readFileSync('wrangler.jsonc', 'utf8'))
 
-  assert.equal(config.vars.PLAYER_QUEUE_WAIT_MAX_MS, '9000')
-  assert.equal(playerQueueWaitMaxMs({ PLAYER_QUEUE_WAIT_MAX_MS: '9000' }), 9000)
+  assert.equal(config.vars.PLAYER_QUEUE_WAIT_MAX_MS, '30000')
+  assert.equal(playerQueueWaitMaxMs({ PLAYER_QUEUE_WAIT_MAX_MS: '30000' }, 'series'), 30000)
 })
 
 test('Part 4.1 selected profile is stable concurrency three', async () => {
@@ -40,7 +40,7 @@ test('Part 4.1 selected route uses stable profile and durable Queue wait', () =>
   const route = source.slice(routeStart, routeEnd)
 
   assert.match(route, /queueProfile: 'user-selected-stable'/)
-  assert.match(route, /maxWaitMs: playerQueueWaitMaxMs\(env\)/)
+  assert.match(route, /maxWaitMs: playerQueueWaitMaxMs\(env, tokenData\.media\?\.type\)/)
   assert.match(route, /translationPreparingResponse/)
   assert.match(route, /player-translation-queued/)
 })

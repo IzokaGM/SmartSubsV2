@@ -14,7 +14,7 @@ function cue(i) {
   }
 }
 
-test('Part 4.1 caps explicit translation concurrency at stable value three', async () => {
+test('Part 4.1 caps explicit translation concurrency at five', async () => {
   const cues = Array.from({ length: 653 }, (_, i) => cue(i))
   let active = 0
   let maxActive = 0
@@ -24,7 +24,7 @@ test('Part 4.1 caps explicit translation concurrency at stable value three', asy
   const output = await translateCues(cues, {
     maxItems: 160,
     maxChars: 20000,
-    concurrency: 4,
+    concurrency: 5,
     translateTextsFn: async (texts, options) => {
       calls++
       active++
@@ -48,10 +48,10 @@ test('Part 4.1 caps explicit translation concurrency at stable value three', asy
   })
 
   assert.equal(calls, 5)
-  assert.equal(maxActive, 3)
+  assert.equal(maxActive, 5)
   assert.equal(output.length, 653)
   assert.equal(stats.chunks, 5)
-  assert.equal(stats.concurrency, 3)
+  assert.equal(stats.concurrency, 5)
   assert.equal(stats.chunkItems, 160)
   assert.equal(stats.chunkChars, 20000)
 })
@@ -131,7 +131,7 @@ test('Part 4 enqueue serialises only the approved user-selected profile', async 
 
   let sent = null
   const ok = await enqueuePrefetchTranslation({
-    autoUrl: `https://smartsubsv2.example/c/x/translated/${translationToken}.vtt`,
+    autoUrl: `https://smartsubs.example/c/x/translated/${translationToken}.vtt`,
     env: {
       SMARTSUBS_TRANSLATION_QUEUE: {
         async send(body) {
@@ -242,9 +242,9 @@ test('Part 4 selected translated route explicitly requests fast profile', () => 
 test('Part 4 Wrangler keeps background profile and adds isolated fast profile', () => {
   const config = JSON.parse(fs.readFileSync('wrangler.jsonc', 'utf8'))
 
-  assert.equal(config.vars.QUEUE_FINAL_CONCURRENCY, '3')
+  assert.equal(config.vars.QUEUE_FINAL_CONCURRENCY, '5')
   assert.equal(config.vars.QUEUE_USER_SELECTED_CHUNK_ITEMS, '160')
   assert.equal(config.vars.QUEUE_USER_SELECTED_CHUNK_CHARS, '20000')
-  assert.equal(config.vars.QUEUE_USER_SELECTED_CONCURRENCY, '3')
+  assert.equal(config.vars.QUEUE_USER_SELECTED_CONCURRENCY, '5')
   assert.equal(config.queues.consumers[0].max_concurrency, 1)
 })

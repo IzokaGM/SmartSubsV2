@@ -1,16 +1,13 @@
 {
-  "name": "smartsubs",
+  "name": "smartsubsv2",
   "version": "1.0.0",
   "private": true,
-  "description": "SmartSubs Malay subtitle Stremio addon",
+  "description": "SmartSubsV2 Malay subtitle Stremio addon test baseline cloned from latest SmartSubs",
   "scripts": {
     "test": "node --test test/*.test.js",
-    "check": "node --check src/*.js && node --check src/cloudflare-worker.mjs && node --check src/cf-cache.mjs"
+    "check": "node --check src/*.js && node --check src/cloudflare-worker.mjs && node --check src/cf-cache.mjs && node --check src/kv-usage.mjs && node --check src/kv-monitor.mjs"
   },
   "devDependencies": {
     "wrangler": "4.123.0"
-  },
-  "dependencies": {
-    "fflate": "0.8.2"
   }
 }

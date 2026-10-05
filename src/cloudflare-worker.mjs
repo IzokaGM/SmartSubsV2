@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from 'node:crypto'
 import manifest from './manifest.js'
 import configuredManifestModule from './configured-manifest.js'
 import subtitlesModule from './subtitles.js'
@@ -6,9 +7,9 @@ import userConfigModule from './user-config.js'
 import configureModule from './configure.js'
 import perfModule from './perf.js'
 import diagnosticsModule from './diagnostics.js'
-import subsourceModule from './subsource.js'
-import subsourceArchiveModule from './subsource-archive.js'
 import { CloudflareTranslationCache, cfGetOrTranslate, makeCacheKey } from './cf-cache.mjs'
+import { createKvUsageTracker, trackedEnvironment } from './kv-usage.mjs'
+import { monitorStub, publishKvUsage, storeMonitorReport, readMonitorReports, pruneMonitorReports, renderKvMonitor, startMonitorTest, endMonitorTest, readMonitorTestState, pruneMonitorTestHistory } from './kv-monitor.mjs'
 
 const { createConfiguredManifest } = configuredManifestModule
 const { handleSubtitles } = subtitlesModule
@@ -17,11 +18,60 @@ const { createUserConfigToken, decodeUserConfigToken, tokenFingerprint } = userC
 const { buildConfiguredUrls, validateGeminiApiKey, renderConfigurePage, escapeHtml } = configureModule
 const { nowMs, roundMs, logPerf } = perfModule
 const { recordDiagnostic, readDiagnostics, deriveVerdict } = diagnosticsModule
-const { PROBE_VERSION, probeSubsourceApi, validateSubsourceApiKey, downloadSubsourceArchive } = subsourceModule
-const { extractSubtitleArchive } = subsourceArchiveModule
 
-const BUILD_ID = 'part5-2-2-subsource-eligibility-gate'
+const BUILD_ID = 'final-stable-m20r3'
 const caches = new WeakMap()
+// Per-request memoization only. No cross-request stale state when the owner switches OFF.
+const diagnosticStateByEnv = new WeakMap()
+
+async function diagnosticState(env, configId) {
+  if (!env || !diagnosticAdminReady(env) || !/^[a-f0-9]{16}$/.test(String(configId || ''))) return { enabled: false, since: 0 }
+  const fetchState = async () => {
+    const stub = monitorStub(env, configId)
+    if (!stub) return { enabled: false, since: 0 }
+    try {
+      const response = await stub.fetch('https://smartsubs-monitor.internal/diagnostics/state')
+      if (!response.ok) return { enabled: false, since: 0 }
+      const data = await response.json()
+      return { enabled: data.enabled === true, since: Number(data.since) || 0 }
+    } catch { return { enabled: false, since: 0 } } // fail closed; never disrupt playback
+  }
+  // The tracked environment is newly created for each live Worker/Queue invocation.
+  // Untracked direct calls are intentionally not cached across distinct invocations.
+  if (!env.__kvUsageTracker) return fetchState()
+  let byConfig = diagnosticStateByEnv.get(env)
+  if (!byConfig) { byConfig = new Map(); diagnosticStateByEnv.set(env, byConfig) }
+  if (!byConfig.has(configId)) byConfig.set(configId, fetchState())
+  return byConfig.get(configId)
+}
+
+async function recordConfiguredDiagnostic(env, configId, event) {
+  if (!(await diagnosticState(env, configId)).enabled) return false
+  return recordDiagnostic(env.SMARTSUBS_CACHE, configId, event)
+}
+
+function diagnosticAdminReady(env) {
+  return String(env?.SMARTSUBS_DIAG_ADMIN_KEY || '').length >= 6 && String(env?.SMARTSUBS_DIAG_ADMIN_KEY || '').length <= 256
+}
+
+function validDiagnosticAdminKey(submitted, stored) {
+  if (typeof submitted !== 'string' || submitted.length < 6 || submitted.length > 256 ||
+      typeof stored !== 'string' || stored.length < 6) return false
+  const a = createHash('sha256').update(submitted, 'utf8').digest()
+  const b = createHash('sha256').update(stored, 'utf8').digest()
+  return timingSafeEqual(a, b)
+}
+
+function diagnosticControlHtml(state = { enabled: false }, ready = false, error = '') {
+  const enabled = state.enabled === true
+  const heading = enabled ? 'ON' : 'OFF'
+  // When ON, keep the control compact and allow a one-tap OFF without re-entering the key.
+  // Turning ON still requires the configured server-side admin key.
+  if (enabled) {
+    return `<section class="card"><div class="diag-control-row"><h2>Diagnostics: <span class="pill good">${heading}</span></h2><form method="POST" action="diagnose/toggle" autocomplete="off"><button class="diag-off-btn" type="submit" name="action" value="off">Turn OFF</button></form></div><p class="muted">Diagnostic events are being recorded to Workers KV.</p>${error ? `<p class="bad-text">${escapeHtml(error)}</p>` : ''}</section>`
+  }
+  return `<section class="card"><h2>Diagnostics: <span class="pill neutral">${heading}</span></h2><p class="muted">Diagnostic recording is OFF. Translation, Queue and cache still work normally.</p><form method="POST" action="diagnose/toggle" autocomplete="off"><label for="diag-admin">Admin key</label><input id="diag-admin" name="adminKey" type="password" minlength="6" maxlength="256" required autocomplete="off" placeholder="Admin key (not Gemini API key)" ${ready ? '' : 'disabled'}><div><button type="submit" name="action" value="on" ${ready ? '' : 'disabled'}>Turn ON</button></div></form>${!ready ? '<p class="muted">Set secret SMARTSUBS_DIAG_ADMIN_KEY (6+ characters) and ensure SMARTSUBS_DELIVERY is available.</p>' : ''}${error ? `<p class="bad-text">${escapeHtml(error)}</p>` : ''}</section>`
+}
 
 function responseHeaders(contentType, status = 200, options = {}) {
   const headers = new Headers({
@@ -57,12 +107,53 @@ function json(body, status = 200, options = {}) {
   return send(status, 'application/json; charset=utf-8', JSON.stringify(body), options)
 }
 
-function safeMessage(error, ...secrets) {
+function safeMessage(error, apiKey) {
   let message = error && error.message ? String(error.message) : String(error || 'Unknown error')
-  for (const secret of secrets.flat()) {
-    if (secret) message = message.split(String(secret)).join('[redacted]')
-  }
+  if (apiKey) message = message.split(apiKey).join('[redacted]')
   return message.slice(0, 300)
+}
+
+function safeDiagnosticHeader(request, name, maxLength = 180) {
+  const value = String(request?.headers?.get?.(name) || '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .trim()
+  return value ? value.slice(0, maxLength) : ''
+}
+
+function translationRequestProbe(request) {
+  // Record only non-secret metadata useful for identifying duplicate subtitle
+  // GET patterns. Never include URL/config token, IP, Cookie, Authorization,
+  // Origin or Referer in diagnostic KV.
+  const method = String(request?.method || 'GET').toUpperCase().slice(0, 12)
+  const userAgent = safeDiagnosticHeader(request, 'user-agent', 180)
+  const range = safeDiagnosticHeader(request, 'range', 96)
+  const accept = safeDiagnosticHeader(request, 'accept', 120)
+  const cacheControl = safeDiagnosticHeader(request, 'cache-control', 96)
+  const pragma = safeDiagnosticHeader(request, 'pragma', 64)
+  const secFetchMode = safeDiagnosticHeader(request, 'sec-fetch-mode', 32)
+  const secFetchDest = safeDiagnosticHeader(request, 'sec-fetch-dest', 32)
+  const purpose = safeDiagnosticHeader(request, 'purpose', 32) || safeDiagnosticHeader(request, 'sec-purpose', 32)
+  const requestKind = range ? 'range' : 'full'
+  const signatureInput = [
+    method, requestKind, userAgent, range, accept, cacheControl, pragma,
+    secFetchMode, secFetchDest, purpose
+  ].join('\n')
+
+  const probe = {
+    probeVersion: 'request-probe-v1',
+    method,
+    requestKind,
+    requestSignature: createHash('sha256').update(signatureInput, 'utf8').digest('hex').slice(0, 12)
+  }
+  if (userAgent) probe.userAgent = userAgent
+  if (range) probe.range = range
+  if (accept) probe.accept = accept
+  if (cacheControl) probe.cacheControl = cacheControl
+  if (pragma) probe.pragma = pragma
+  if (secFetchMode) probe.secFetchMode = secFetchMode
+  if (secFetchDest) probe.secFetchDest = secFetchDest
+  if (purpose) probe.purpose = purpose
+  return probe
 }
 
 function classifyTranslationError(error) {
@@ -173,16 +264,29 @@ function getCache(env) {
       version: cacheVersion(env)
     })
   }
-  let cache = caches.get(binding)
+  // A tracked request gets its own KV wrapper but shares the original isolate's
+  // LRU memory and counters. Tracking must not silently disable memory caching.
+  const original = env.__kvUsageOriginal || binding
+  let cache = caches.get(original)
   if (!cache) {
     cache = new CloudflareTranslationCache({
-      kv: binding,
+      kv: original,
       ttlMs: cacheTtlMs(env),
       version: cacheVersion(env)
     })
-    caches.set(binding, cache)
+    caches.set(original, cache)
   }
-  return cache
+  if (!env.__kvUsageTracker) return cache
+  if (!env.__kvUsageTracker.cache) {
+    env.__kvUsageTracker.cache = new CloudflareTranslationCache({
+      kv: binding,
+      ttlMs: cacheTtlMs(env),
+      version: cacheVersion(env),
+      memory: cache.memory,
+      counters: cache.counters
+    })
+  }
+  return env.__kvUsageTracker.cache
 }
 
 function parseSubtitleArgs(pathname) {
@@ -229,26 +333,42 @@ async function readConfigureForm(request) {
 }
 
 function renderRootDiagnosePage() {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SmartSubs Diagnose</title><style>:root{color-scheme:dark}body{margin:0;background:#101116;color:#f4f4f5;font-family:system-ui,sans-serif}.wrap{max-width:720px;margin:auto;padding:28px 18px}.card{background:#181a21;border:1px solid #30333d;border-radius:16px;padding:20px}code{word-break:break-all;color:#c9ffdc}</style></head><body><main class="wrap"><section class="card"><h1>SmartSubs Diagnose</h1><p>Build: <code>${BUILD_ID}</code></p><p>Open diagnose through your configured SmartSubs URL:</p><code>https://.../c/YOUR_CONFIG_TOKEN/diagnose</code><p>The config token is required so diagnostics stay isolated to that SmartSubs installation.</p></section></main></body></html>`
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SmartSubsV2 Diagnose</title><style>:root{color-scheme:dark}body{margin:0;background:#101116;color:#f4f4f5;font-family:system-ui,sans-serif}.wrap{max-width:720px;margin:auto;padding:28px 18px}.card{background:#181a21;border:1px solid #30333d;border-radius:16px;padding:20px}code{word-break:break-all;color:#c9ffdc}</style></head><body><main class="wrap"><section class="card"><h1>SmartSubsV2 Diagnose</h1><p>Build: <code>${BUILD_ID}</code></p><p>Open diagnose through your configured SmartSubs URL:</p><code>https://.../c/YOUR_CONFIG_TOKEN/diagnose</code><p>The config token is required so diagnostics stay isolated to that SmartSubs installation.</p></section></main></body></html>`
 }
 
 function formatMalaysiaTime(timestamp) {
   const value = Number(timestamp || 0)
   if (!Number.isFinite(value) || value <= 0) return 'Unknown time'
   try {
-    return `${new Intl.DateTimeFormat('en-MY', {
-      timeZone: 'Asia/Kuala_Lumpur',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hour12: false
-    }).format(new Date(value))} MYT`
+    const date = new Date(value)
+    const datePart = new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Kuala_Lumpur', day: '2-digit', month: '2-digit', year: 'numeric'
+    }).format(date)
+    const timePart = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Asia/Kuala_Lumpur', hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: true
+    }).format(date).replace(/\s?(AM|PM)$/, (_, meridiem) => ` ${meridiem.toLowerCase()}`)
+    return `${datePart}, ${timePart} MYT`
   } catch {
     return `${new Date(value).toISOString()} UTC`
   }
+}
+
+function compactMediaLabel(subtitle) {
+  if (!subtitle) return 'No request'
+  const id = String(subtitle.id || '')
+  const episode = id.match(/^(.+?):(\d+):(\d+)$/)
+  if (episode && ['series', 'tv'].includes(String(subtitle.type || '').toLowerCase())) {
+    return `S${Number(episode[2])}E${Number(episode[3])} · ${id}`
+  }
+  return `${String(subtitle.type || '').toLowerCase() === 'movie' ? 'Movie' : 'Media'} · ${id || 'Unknown ID'}`
+}
+
+function compactMalayAutoStatus(subtitle) {
+  if (!subtitle) return 'Not requested'
+  if (subtitle.result === 'auto-malay-ready' || subtitle.autoReady === true) return 'Ready'
+  if (subtitle.result === 'native-malay') return 'Not available'
+  if (subtitle.result === 'native-malay-with-auto-fallback') return 'Ready'
+  return String(subtitle.result || 'Not available')
 }
 
 function formatDuration(value) {
@@ -258,107 +378,42 @@ function formatDuration(value) {
   return `${(ms / 1000).toFixed(ms < 10000 ? 2 : 1)} s`
 }
 
-function parseEnglishTop(values = []) {
-  if (!Array.isArray(values)) return []
-  return values.map(value => {
-    const text = String(value || '')
-    const match = text.match(/^(\d+):([^:]+):(-?\d+(?:\.\d+)?)$/)
-    if (!match) return { raw: text }
-    return {
-      rank: Number(match[1]),
-      id: match[2],
-      score: Number(match[3])
-    }
-  })
-}
-
-function syncAssessment(lastSubtitle) {
-  if (!lastSubtitle) {
-    return {
-      level: 'UNKNOWN',
-      tone: 'neutral',
-      reason: 'No subtitle request has been recorded yet.'
-    }
-  }
-
-  const ranked = parseEnglishTop(lastSubtitle.englishTop)
-  const top = ranked[0]
-  const second = ranked[1]
-  const gap = top && second && Number.isFinite(top.score) && Number.isFinite(second.score)
-    ? top.score - second.score
-    : null
-  const candidates = Number(lastSubtitle.englishCandidateCount || ranked.length || 0)
-
-  if (lastSubtitle.sourceVideoHashProvided) {
-    return {
-      level: 'STRONG',
-      tone: 'good',
-      reason: 'Player supplied a video hash, which gives SmartSubs a strong sync signal.'
-    }
-  }
-
-  if (lastSubtitle.sourceVideoSizeProvided && lastSubtitle.sourceFilenameProvided) {
-    return {
-      level: 'GOOD',
-      tone: 'good',
-      reason: 'Player supplied both filename and video size, giving the selector useful release evidence.'
-    }
-  }
-
-  if (candidates > 1 && gap !== null && gap <= 5 && !lastSubtitle.sourceVideoSizeProvided) {
-    return {
-      level: 'HIGH RISK',
-      tone: 'bad',
-      reason: `Top English candidates are almost tied${gap !== null ? ` by only ${gap} point${gap === 1 ? '' : 's'}` : ''}, with no video hash or size. Sync may depend heavily on OpenSubtitles ordering.`
-    }
-  }
-
-  if (!lastSubtitle.sourceVideoHashProvided && !lastSubtitle.sourceVideoSizeProvided) {
-    return {
-      level: 'LIMITED',
-      tone: 'warn',
-      reason: lastSubtitle.sourceFilenameProvided
-        ? 'Only the player filename is available. If it is a provider label rather than a real release filename, sync confidence is limited.'
-        : 'The player supplied no filename, video hash, or video size for release matching.'
-    }
-  }
-
-  return {
-    level: 'MODERATE',
-    tone: 'warn',
-    reason: 'Some source metadata is available, but SmartSubs does not have a high-confidence video hash match.'
-  }
-}
-
 function verdictPresentation(verdict) {
   const map = {
-    NO_SUBTITLE_REQUEST_SEEN: ['Waiting for subtitle request', 'neutral', 'The player has not requested this configured SmartSubsV2 addon yet.'],
-    NATIVE_MALAY_RETURNED: ['Native Malay returned', 'good', 'SmartSubsV2 returned an existing Malay subtitle without Gemini translation.'],
-    NATIVE_MALAY_WITH_AUTO_FALLBACK: ['Native Malay + Auto fallback', 'warn', 'Native Malay sync evidence is weak. Malay Auto is available, but Gemini is not used unless you select it.'],
-    SUBTITLE_REQUEST_FAILED: ['Subtitle request failed', 'bad', 'SmartSubsV2 received the request but the subtitle request failed.'],
-    NO_ENGLISH_SOURCE_FOUND: ['No English source found', 'bad', 'OpenSubtitles returned no recognised English source for Malay Auto.'],
-    BYOK_NOT_CONFIGURED: ['Gemini key not configured', 'bad', 'Malay Auto cannot run until BYOK configuration is valid.'],
-    SUBTITLE_REQUEST_RETURNED_ZERO: ['No subtitle returned', 'bad', 'SmartSubsV2 was requested but returned zero subtitle tracks.'],
+    NO_SUBTITLE_REQUEST_SEEN: ['Waiting for subtitle request', 'neutral', 'The player has not requested this configured SmartSubs addon yet.'],
+    NATIVE_MALAY_RETURNED: ['Native Malay returned', 'good', 'SmartSubs returned an existing Malay subtitle without Gemini translation.'],
+    NATIVE_MALAY_WITH_AUTO_FALLBACK: ['Native Malay and Malay AI offered', 'good', 'Both subtitle choices were returned to the player.'],
+    SUBTITLE_REQUEST_FAILED: ['Subtitle request failed', 'bad', 'SmartSubs received the request but the subtitle request failed.'],
+    NO_ENGLISH_SOURCE_FOUND: ['No English source found', 'bad', 'OpenSubtitles returned no recognised English source for Malay AI.'],
+    BYOK_NOT_CONFIGURED: ['Gemini key not configured', 'bad', 'Malay AI cannot run until BYOK configuration is valid.'],
+    SUBTITLE_REQUEST_RETURNED_ZERO: ['No subtitle returned', 'bad', 'SmartSubs was requested but returned zero subtitle tracks.'],
     TRANSLATION_DELIVERED: ['Malay subtitle delivered', 'good', 'The translated Malay VTT was successfully returned to the player.'],
     TRANSLATION_FAILED: ['Translation failed', 'bad', 'The Malay translation request failed. Check the error event below.'],
-    QUEUE_JOIN_WAITING: ['Waiting for queued translation', 'warn', 'The player selected Malay Auto while the background Queue job is still running.'],
-    TRANSLATION_REQUESTED_WAITING_FOR_RESULT: ['Translation requested', 'warn', 'The player requested Malay Auto and SmartSubsV2 is waiting for the result.'],
-    TRANSLATION_PREPARING_IN_QUEUE: ['Translation preparing', 'warn', 'Malay Auto is translating safely in Cloudflare Queue. Retry or select Malay Auto again shortly.'],
-    QUEUE_PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION: ['Malay Auto ready in cache', 'good', 'Background Queue translation finished before player selection.'],
-    QUEUE_PREFETCH_FAILED_WAITING_FOR_PLAYER_SELECTION: ['Background translation failed', 'bad', 'Queue prefetch failed. Selecting Malay Auto may still retry.'],
-    QUEUE_PREFETCH_TRANSLATING: ['Background translation running', 'warn', 'Cloudflare Queue is translating Malay Auto now.'],
-    QUEUE_PREFETCH_QUEUED: ['Translation queued', 'warn', 'The Malay Auto translation job is safely queued.'],
-    PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION: ['Malay Auto ready', 'good', 'Background translation completed and is waiting for player selection.'],
+    QUEUE_JOIN_WAITING: ['Waiting for queued translation', 'warn', 'The player selected Malay AI while the background Queue job is still running.'],
+    TRANSLATION_REQUESTED_WAITING_FOR_RESULT: ['Translation requested', 'warn', 'The player requested Malay AI and SmartSubs is waiting for the result.'],
+    TRANSLATION_PREPARING_IN_QUEUE: ['Translation preparing', 'warn', 'Malay AI is translating safely in Cloudflare Queue. Retry or select Malay AI again shortly.'],
+    QUEUE_PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION: ['Malay AI ready in cache', 'good', 'Background Queue translation finished before player selection.'],
+    QUEUE_PREFETCH_FAILED_WAITING_FOR_PLAYER_SELECTION: ['Background translation failed', 'bad', 'Queue prefetch failed. Selecting Malay AI may still retry.'],
+    QUEUE_PREFETCH_TRANSLATING: ['Background translation running', 'warn', 'Cloudflare Queue is translating Malay AI now.'],
+    QUEUE_PREFETCH_QUEUED: ['Translation queued', 'warn', 'The Malay AI translation job is safely queued.'],
+    PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION: ['Malay AI ready', 'good', 'Background translation completed and is waiting for player selection.'],
     PREFETCH_FAILED_WAITING_FOR_PLAYER_SELECTION: ['Prefetch failed', 'bad', 'Background translation failed.'],
-    PREFETCH_TRANSLATING: ['Prefetch translating', 'warn', 'Malay Auto is translating in the background.'],
-    SUBTITLE_RETURNED_WAITING_FOR_PLAYER_SELECTION: ['Malay Auto offered', 'good', 'SmartSubsV2 returned a Malay Auto track to the player.'],
-    SUBTITLE_RETURNED: ['Subtitle returned', 'good', 'SmartSubsV2 returned a subtitle track.']
+    PREFETCH_TRANSLATING: ['Prefetch translating', 'warn', 'Malay AI is translating in the background.'],
+    SUBTITLE_RETURNED_WAITING_FOR_PLAYER_SELECTION: ['Malay AI offered', 'good', 'SmartSubs returned a Malay AI track to the player.'],
+    SUBTITLE_RETURNED: ['Subtitle returned', 'good', 'SmartSubs returned a subtitle track.']
   }
   const item = map[verdict] || [verdict, 'neutral', 'See the recent events for more detail.']
   return { title: item[0], tone: item[1], explanation: item[2] }
 }
 
-function renderConfiguredDiagnosePage(configId, events, options = {}) {
+function renderConfiguredDiagnosePage(configId, events, control = { enabled: true, ready: false, error: '' }) {
+  const controls = diagnosticControlHtml(control, control.ready, control.error)
+  if (control.enabled === false) {
+    return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>SmartSubsV2 Diagnose</title><style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101116;color:#f4f4f5;font-family:system-ui,-apple-system,sans-serif}.wrap{max-width:920px;margin:auto;padding:18px 12px 40px}.card{background:#181a21;border:1px solid #30333d;border-radius:16px;padding:16px;margin-bottom:12px}h1{font-size:24px;margin:0 0 8px}.diagnose-heading{text-align:center;margin-bottom:20px}.diagnose-heading h1{margin:0 0 6px}.diagnose-heading .muted{font-variant-numeric:tabular-nums}h2{font-size:17px;margin:0 0 12px}.muted{color:#aeb1bb;font-size:13px}.status{display:flex;gap:10px;align-items:flex-start}.pill{display:inline-flex;align-items:center;border-radius:999px;padding:5px 10px;font-weight:800;font-size:12px;letter-spacing:.02em}.good{background:#123b29;color:#a7f3d0}.warn{background:#493812;color:#fde68a}.bad{background:#4a1d24;color:#fecaca}.neutral{background:#30333d;color:#e5e7eb}.status-copy{flex:1}.status-title{font-size:20px;font-weight:800;margin-bottom:4px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric{background:#111319;border:1px solid #2b2e37;border-radius:12px;padding:12px}.metric .label{color:#aeb1bb;font-size:12px}.metric .value{font-size:18px;font-weight:800;margin-top:3px;word-break:break-word}.metric .sub{color:#aeb1bb;font-size:12px;margin-top:4px;word-break:break-word}.candidate{display:grid;grid-template-columns:34px 1fr auto auto;gap:8px;align-items:center;padding:9px 10px;border-bottom:1px solid #30333d;font-size:13px}.candidate:last-child{border-bottom:0}.candidate.selected{background:#16271e}.candidate em{font-style:normal;font-size:10px;font-weight:800;color:#a7f3d0}.meta-row{display:grid;grid-template-columns:90px 42px 1fr;gap:8px;padding:8px 0;border-bottom:1px solid #30333d;align-items:start}.meta-row:last-child{border-bottom:0}.meta-row .yes{color:#a7f3d0}.meta-row .no{color:#fca5a5}.meta-row small{color:#c7c9d1;word-break:break-word}.guide{font-size:15px;line-height:1.5}.event-card{border-top:1px solid #30333d;padding:12px 0}.event-card:first-child{border-top:0}.event-head{display:flex;gap:10px;justify-content:space-between;align-items:center;margin-bottom:7px}.event-head time{font-size:12px;color:#aeb1bb}.event-head code{font-size:12px;color:#c9ffdc}.event-detail{display:flex;flex-wrap:wrap;gap:6px}.event-detail span{background:#111319;border-radius:7px;padding:4px 6px;font-size:11px;word-break:break-word}.event-detail b{color:#aeb1bb;font-weight:600}details summary{cursor:pointer;font-weight:800;padding:4px 0}code{color:#c9ffdc}@media(max-width:640px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.media-metric{grid-column:1/-1}.candidate{grid-template-columns:28px 1fr auto}.candidate em{grid-column:2}.meta-row{grid-template-columns:82px 38px 1fr}.event-head{align-items:flex-start;flex-direction:column;gap:4px}}
+input{display:block;width:100%;max-width:430px;min-height:44px;margin:10px 0;padding:10px;background:#101116;color:#fff;border:1px solid #59606b;border-radius:8px}button{min-height:44px;padding:10px 18px;border:0;border-radius:9px;background:#3879d7;color:#fff;font-weight:bold}button:disabled{opacity:.5}.bad-text{color:#fecaca}.diag-control-row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.diag-control-row h2{margin:0}.diag-off-btn{background:#30333d;border:1px solid #59606b;font-size:12px;min-height:36px;padding:6px 12px;white-space:nowrap}
+</style></head><body><main class="wrap"><section class="card"><header class="diagnose-heading"><h1>SmartSubsV2 Diagnose</h1><div class="muted">${escapeHtml(formatMalaysiaTime(Date.now()))}</div></header><div class="status"><span class="pill neutral">OFF</span><div class="status-copy"><div class="status-title">Diagnostics recording is off</div><div class="muted">Translation, Queue and cache still work normally.</div></div></div></section>${controls}<p class="muted">Old events remain in KV until their existing 24-hour expiry. No diagnostic history is read while OFF.</p></main></body></html>`
+  }
   const sorted = [...events].sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0))
   const verdict = deriveVerdict(sorted)
   const status = verdictPresentation(verdict)
@@ -371,70 +426,31 @@ function renderConfiguredDiagnosePage(configId, events, options = {}) {
   const lastFailure = sorted.find(item =>
     ['translation-failed', 'queue-translation-failed', 'prefetch-failed'].includes(item.event)
   ) || null
-  const latest = sorted[0] || null
-  const sync = syncAssessment(lastSubtitle)
-  const ranked = parseEnglishTop(lastSubtitle?.englishTop)
   const selectedId = lastSubtitle?.englishSelectedId || 'Not available'
-  const sourceName = lastSubtitle?.sourceFilename || 'Not provided'
-  const candidateCount = Number(lastSubtitle?.englishCandidateCount || ranked.length || 0)
-  const topScore = Number(lastSubtitle?.englishSelectedScore)
-  const cacheEvent = lastDelivery || lastTranslationComplete
-  const cacheStatus = cacheEvent?.cache || 'Not seen yet'
-  const cacheTime = cacheEvent?.totalMs
-  const coldTime = lastTranslationComplete?.totalMs
-  const pipelineTime = lastTranslationComplete?.pipelineMs
-  const wallTime = lastTranslationComplete?.translationWallMs
-  const nativeConfidence = lastSubtitle?.nativeConfidence || (Number(lastSubtitle?.malayCount || 0) > 0 ? 'UNKNOWN' : 'NONE')
-  const nativeDecision = lastSubtitle?.nativeDecision || 'Not applicable'
-  const nativeId = lastSubtitle?.malaySelectedId || 'Not available'
-  const nativeScore = Number(lastSubtitle?.malaySelectedScore)
-  const subsourceConfigured = options.subsourceConfigured === true
-  const lastSubsourceProbe = sorted.find(item =>
-    ['subsource-probe', 'subsource-probe-cache-hit'].includes(item.event) &&
-    Number(item.subsourceProbeVersion || 0) === PROBE_VERSION
-  ) || null
-  const lastSubsourceFusion = sorted.find(item => item.event === 'subsource-fusion') || null
-  const subsourceStatus = subsourceConfigured
-    ? (lastSubsourceProbe?.subsourceStatus || 'not-tested')
-    : 'not-configured'
-  const subsourceTone = !subsourceConfigured
-    ? 'neutral'
-    : subsourceStatus === 'connected' || subsourceStatus === 'reachable'
-      ? 'good'
-      : subsourceStatus === 'quota-limited' || subsourceStatus === 'not-tested'
-        ? 'warn'
-        : 'bad'
+  const sourceIds = Array.isArray(lastSubtitle?.englishSourceIds) ? lastSubtitle.englishSourceIds : []
+  const candidateCount = Number(lastSubtitle?.englishCandidateCount || sourceIds.length || 0)
+  // The log does not tag delivery/Queue-complete events with a media ID. Never
+  // reuse an older media's duration for the latest subtitle request.
+  const latestRequestTs = Number(lastSubtitle?.ts || 0)
+  const deliveryForRequest = lastSubtitle && lastDelivery && Number(lastDelivery.ts || 0) >= latestRequestTs
+    ? lastDelivery : null
+  const coldForRequest = lastSubtitle && lastTranslationComplete && Number(lastTranslationComplete.ts || 0) >= latestRequestTs
+    ? lastTranslationComplete : null
+  const deliveryTime = deliveryForRequest?.totalMs
+  const coldTime = coldForRequest?.totalMs
+  const hasNativeMalay = Number(lastSubtitle?.malayCount || 0) > 0
+  const activeFailure = lastFailure && (!lastDelivery || Number(lastFailure.ts || 0) > Number(lastDelivery.ts || 0)) ? lastFailure : null
 
-  const topCandidates = ranked.length
-    ? ranked.map(item => {
-        if (item.raw) return `<div class="candidate">${escapeHtml(item.raw)}</div>`
-        const selected = String(item.id) === String(selectedId)
-        return `<div class="candidate${selected ? ' selected' : ''}"><span>#${item.rank}</span><strong>${escapeHtml(item.id)}</strong><span>score ${escapeHtml(item.score)}</span>${selected ? '<em>SELECTED</em>' : ''}</div>`
+  // Source order is the unchanged order of eligible, deduplicated OpenSubtitles tracks.
+  // No score or sync-confidence inference is made from missing player metadata.
+  const sourceList = sourceIds.length
+    ? sourceIds.map((id, index) => {
+        const selected = String(id) === String(selectedId)
+        return `<div class="candidate${selected ? ' selected' : ''}"><span>#${index + 1}</span><strong>${escapeHtml(id)}</strong>${selected ? '<em>SELECTED</em>' : ''}</div>`
       }).join('')
-    : '<div class="muted">No ranked English candidates recorded.</div>'
-
-  const metadataItems = [
-    ['Filename', lastSubtitle?.sourceFilenameProvided, sourceName],
-    ['Video hash', lastSubtitle?.sourceVideoHashProvided, lastSubtitle?.sourceVideoHashProvided ? 'Provided' : 'Not provided'],
-    ['Video size', lastSubtitle?.sourceVideoSizeProvided, lastSubtitle?.sourceVideoSizeProvided ? 'Provided' : 'Not provided']
-  ].map(([label, available, detail]) =>
-    `<div class="meta-row"><span>${escapeHtml(label)}</span><strong class="${available ? 'yes' : 'no'}">${available ? 'YES' : 'NO'}</strong><small>${escapeHtml(detail)}</small></div>`
-  ).join('')
-
-  let guidance = 'Run a title and refresh this page after the subtitle list appears.'
-  if (lastSubtitle) {
-    if (lastSubtitle.nativeDecision === 'dual-fallback') {
-      guidance = 'Native Malay sync evidence is weak. Try Native Malay first. Malay Auto is available as a fallback, and Gemini translation starts only if you select Malay Auto.'
-    } else if (sync.tone === 'bad') {
-      guidance = `English source sync is uncertain. Selected source ${selectedId} should be compared with a known synced OpenSubtitles track before changing Gemini settings.`
-    } else if (lastFailure) {
-      guidance = `A recent failure was recorded at ${escapeHtml(lastFailure.failureStage || lastFailure.event)}. Check the failure card and raw events.`
-    } else if (lastDelivery?.cache === 'HIT') {
-      guidance = 'Subtitle delivery is healthy and came from cache. Any timing problem is more likely source selection than translation speed.'
-    } else if (status.tone === 'good') {
-      guidance = 'Delivery looks healthy. If subtitles are out of sync, focus on the English source ID and sync confidence section.'
-    }
-  }
+    : '<p class="muted">Source IDs were not recorded for this request.</p>'
+  const guidance = activeFailure
+    ? 'A recent failure was recorded. See the failure details and recent events below.' : ''
 
   const rawEvents = sorted.map(item => {
     const detail = Object.entries(item)
@@ -447,34 +463,29 @@ function renderConfiguredDiagnosePage(configId, events, options = {}) {
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SmartSubsV2 Diagnose</title>
 <style>
-:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101116;color:#f4f4f5;font-family:system-ui,-apple-system,sans-serif}.wrap{max-width:920px;margin:auto;padding:18px 12px 40px}.card{background:#181a21;border:1px solid #30333d;border-radius:16px;padding:16px;margin-bottom:12px}h1{font-size:24px;margin:0 0 8px}h2{font-size:17px;margin:0 0 12px}.muted{color:#aeb1bb;font-size:13px}.status{display:flex;gap:10px;align-items:flex-start}.pill{display:inline-flex;align-items:center;border-radius:999px;padding:5px 10px;font-weight:800;font-size:12px;letter-spacing:.02em}.good{background:#123b29;color:#a7f3d0}.warn{background:#493812;color:#fde68a}.bad{background:#4a1d24;color:#fecaca}.neutral{background:#30333d;color:#e5e7eb}.status-copy{flex:1}.status-title{font-size:20px;font-weight:800;margin-bottom:4px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric{background:#111319;border:1px solid #2b2e37;border-radius:12px;padding:12px}.metric .label{color:#aeb1bb;font-size:12px}.metric .value{font-size:18px;font-weight:800;margin-top:3px;word-break:break-word}.metric .sub{color:#aeb1bb;font-size:12px;margin-top:4px;word-break:break-word}.probe{border:0;border-radius:10px;background:#c9ffdc;color:#102117;font-weight:800;padding:10px 14px;margin-top:12px;cursor:pointer}.probe:disabled{background:#30333d;color:#8f929b;cursor:not-allowed}.candidate{display:grid;grid-template-columns:34px 1fr auto auto;gap:8px;align-items:center;padding:9px 10px;border-bottom:1px solid #30333d;font-size:13px}.candidate:last-child{border-bottom:0}.candidate.selected{background:#16271e}.candidate em{font-style:normal;font-size:10px;font-weight:800;color:#a7f3d0}.meta-row{display:grid;grid-template-columns:90px 42px 1fr;gap:8px;padding:8px 0;border-bottom:1px solid #30333d;align-items:start}.meta-row:last-child{border-bottom:0}.meta-row .yes{color:#a7f3d0}.meta-row .no{color:#fca5a5}.meta-row small{color:#c7c9d1;word-break:break-word}.guide{font-size:15px;line-height:1.5}.event-card{border-top:1px solid #30333d;padding:12px 0}.event-card:first-child{border-top:0}.event-head{display:flex;gap:10px;justify-content:space-between;align-items:center;margin-bottom:7px}.event-head time{font-size:12px;color:#aeb1bb}.event-head code{font-size:12px;color:#c9ffdc}.event-detail{display:flex;flex-wrap:wrap;gap:6px}.event-detail span{background:#111319;border-radius:7px;padding:4px 6px;font-size:11px;word-break:break-word}.event-detail b{color:#aeb1bb;font-weight:600}details summary{cursor:pointer;font-weight:800;padding:4px 0}code{color:#c9ffdc}@media(max-width:640px){.grid{grid-template-columns:1fr}.candidate{grid-template-columns:28px 1fr auto}.candidate em{grid-column:2}.meta-row{grid-template-columns:82px 38px 1fr}.event-head{align-items:flex-start;flex-direction:column;gap:4px}}
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101116;color:#f4f4f5;font-family:system-ui,-apple-system,sans-serif}.wrap{max-width:920px;margin:auto;padding:18px 12px 40px}.card{background:#181a21;border:1px solid #30333d;border-radius:16px;padding:16px;margin-bottom:12px}h1{font-size:24px;margin:0 0 8px}.diagnose-heading{text-align:center;margin-bottom:20px}.diagnose-heading h1{margin:0 0 6px}.diagnose-heading .muted{font-variant-numeric:tabular-nums}h2{font-size:17px;margin:0 0 12px}.muted{color:#aeb1bb;font-size:13px}.status{display:flex;gap:10px;align-items:flex-start}.pill{display:inline-flex;align-items:center;border-radius:999px;padding:5px 10px;font-weight:800;font-size:12px;letter-spacing:.02em}.good{background:#123b29;color:#a7f3d0}.warn{background:#493812;color:#fde68a}.bad{background:#4a1d24;color:#fecaca}.neutral{background:#30333d;color:#e5e7eb}.status-copy{flex:1}.status-title{font-size:20px;font-weight:800;margin-bottom:4px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric{background:#111319;border:1px solid #2b2e37;border-radius:12px;padding:12px}.metric .label{color:#aeb1bb;font-size:12px}.metric .value{font-size:18px;font-weight:800;margin-top:3px;word-break:break-word}.metric .sub{color:#aeb1bb;font-size:12px;margin-top:4px;word-break:break-word}.candidate{display:grid;grid-template-columns:34px 1fr auto auto;gap:8px;align-items:center;padding:9px 10px;border-bottom:1px solid #30333d;font-size:13px}.candidate:last-child{border-bottom:0}.candidate.selected{background:#16271e}.candidate em{font-style:normal;font-size:10px;font-weight:800;color:#a7f3d0}.meta-row{display:grid;grid-template-columns:90px 42px 1fr;gap:8px;padding:8px 0;border-bottom:1px solid #30333d;align-items:start}.meta-row:last-child{border-bottom:0}.meta-row .yes{color:#a7f3d0}.meta-row .no{color:#fca5a5}.meta-row small{color:#c7c9d1;word-break:break-word}.guide{font-size:15px;line-height:1.5}.event-card{border-top:1px solid #30333d;padding:12px 0}.event-card:first-child{border-top:0}.event-head{display:flex;gap:10px;justify-content:space-between;align-items:center;margin-bottom:7px}.event-head time{font-size:12px;color:#aeb1bb}.event-head code{font-size:12px;color:#c9ffdc}.event-detail{display:flex;flex-wrap:wrap;gap:6px}.event-detail span{background:#111319;border-radius:7px;padding:4px 6px;font-size:11px;word-break:break-word}.event-detail b{color:#aeb1bb;font-weight:600}details summary{cursor:pointer;font-weight:800;padding:4px 0}code{color:#c9ffdc}input{display:block;width:100%;max-width:430px;min-height:44px;margin:10px 0;padding:10px;background:#101116;color:#fff;border:1px solid #59606b;border-radius:8px}button{min-height:44px;padding:10px 18px;border:0;border-radius:9px;background:#3879d7;color:#fff;font-weight:bold}button:disabled{opacity:.5}.bad-text{color:#fecaca}.diag-control-row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.diag-control-row h2{margin:0}.diag-off-btn{background:#30333d;border:1px solid #59606b;font-size:12px;min-height:36px;padding:6px 12px;white-space:nowrap}@media(max-width:640px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.media-metric{grid-column:1/-1}.candidate{grid-template-columns:28px 1fr auto}.candidate em{grid-column:2}.meta-row{grid-template-columns:82px 38px 1fr}.event-head{align-items:flex-start;flex-direction:column;gap:4px}}
 </style></head>
 <body><main class="wrap">
-<section class="card"><h1>SmartSubsV2 Diagnose</h1><div class="status"><span class="pill ${status.tone}">${escapeHtml(status.tone === 'good' ? 'OK' : status.tone === 'bad' ? 'PROBLEM' : status.tone === 'warn' ? 'CHECK' : 'INFO')}</span><div class="status-copy"><div class="status-title">${escapeHtml(status.title)}</div><div class="muted">${escapeHtml(status.explanation)}</div><div class="muted">Verdict code: <code>${escapeHtml(verdict)}</code></div></div></div><p class="muted">Malaysia time (MYT, Asia/Kuala_Lumpur) | Build ${BUILD_ID} | ${sorted.length} events retained for up to 24 hours.</p></section>
+<section class="card"><header class="diagnose-heading"><h1>SmartSubsV2 Diagnose</h1><div class="muted">${escapeHtml(formatMalaysiaTime(Date.now()))}</div></header><div class="status"><span class="pill ${status.tone}">${escapeHtml(status.tone === 'good' ? 'OK' : status.tone === 'bad' ? 'ERROR' : status.tone === 'warn' ? 'WAIT' : 'INFO')}</span><div class="status-copy"><div class="status-title">${escapeHtml(status.title)}</div><div class="muted">${escapeHtml(status.explanation)}</div></div></div><p class="muted">Latest subtitle request: ${escapeHtml(lastSubtitle ? formatMalaysiaTime(lastSubtitle.ts) : 'Not recorded')}</p></section>
 
-<section class="card"><h2>Quick diagnosis</h2><div class="grid">
-<div class="metric"><div class="label">Latest media</div><div class="value">${escapeHtml(lastSubtitle ? `${lastSubtitle.type || ''} ${lastSubtitle.id || ''}`.trim() : 'No request')}</div><div class="sub">${escapeHtml(lastSubtitle ? formatMalaysiaTime(lastSubtitle.ts) : 'Waiting for player')}</div></div>
-<div class="metric"><div class="label">Subtitle result</div><div class="value">${escapeHtml(lastSubtitle?.result || 'Not available')}</div><div class="sub">${escapeHtml(lastSubtitle ? `${lastSubtitle.subtitleCount || 0} returned | ${lastSubtitle.languages || 'language unknown'}` : '')}</div></div>
-<div class="metric"><div class="label">Native Malay decision</div><div class="value">${escapeHtml(nativeDecision)}</div><div class="sub">source ${escapeHtml(nativeId)} | confidence ${escapeHtml(nativeConfidence)}${Number.isFinite(nativeScore) ? ` | score ${escapeHtml(nativeScore)}` : ''}</div></div>
-<div class="metric"><div class="label">Selected English source</div><div class="value">${escapeHtml(selectedId)}</div><div class="sub">${Number.isFinite(topScore) ? `score ${escapeHtml(topScore)}` : 'score unavailable'} | ${candidateCount} candidates</div></div>
-<div class="metric"><div class="label">Sync confidence</div><div class="value"><span class="pill ${sync.tone}">${escapeHtml(sync.level)}</span></div><div class="sub">${escapeHtml(sync.reason)}</div></div>
-<div class="metric"><div class="label">Latest delivery cache</div><div class="value">${escapeHtml(cacheStatus)}</div><div class="sub">${cacheTime !== undefined ? formatDuration(cacheTime) : 'No delivery timing yet'}</div></div>
-<div class="metric"><div class="label">Cold translation</div><div class="value">${coldTime !== undefined ? formatDuration(coldTime) : 'Not seen yet'}</div><div class="sub">${pipelineTime !== undefined ? `pipeline ${formatDuration(pipelineTime)}` : ''}${wallTime !== undefined ? ` | Gemini wall ${formatDuration(wallTime)}` : ''}</div></div>
+${controls}
+
+<section class="card"><h2>Overview</h2><div class="grid">
+<div class="metric media-metric"><div class="label">Latest media</div><div class="value">${escapeHtml(compactMediaLabel(lastSubtitle))}</div></div>
+<div class="metric"><div class="label">Malay AI</div><div class="value">${escapeHtml(compactMalayAutoStatus(lastSubtitle))}</div><div class="sub">${escapeHtml(lastSubtitle ? `${lastSubtitle.subtitleCount || 0} tracks returned` : 'No subtitle request')}</div></div>
+<div class="metric"><div class="label">English source</div><div class="value">${escapeHtml(selectedId === 'Not available' ? '—' : selectedId)}</div></div>
+<div class="metric"><div class="label">Delivery</div><div class="value">${deliveryTime === undefined ? '—' : formatDuration(deliveryTime)}</div><div class="sub">${escapeHtml(deliveryForRequest?.cache || 'Not recorded')}</div></div>
+<div class="metric"><div class="label">Cold translation</div><div class="value">${coldTime === undefined ? '—' : formatDuration(coldTime)}</div><div class="sub">${coldTime === undefined ? 'Not recorded for this request' : 'Latest request'}</div></div>
+${hasNativeMalay ? `<div class="metric"><div class="label">Native Malay</div><div class="value">Available</div></div>` : ''}
 </div></section>
 
-<section class="card"><h2>What this means</h2><div class="guide">${escapeHtml(guidance)}</div></section>
+${guidance ? `<section class="card"><h2>Note</h2><div class="guide">${escapeHtml(guidance)}</div></section>` : ''}
 
-<section class="card"><h2>SubSource fusion</h2><div class="metric"><div class="label">Optional provider</div><div class="value"><span class="pill ${subsourceTone}">${escapeHtml(subsourceStatus)}</span></div><div class="sub">${subsourceConfigured ? `HTTP ${escapeHtml(lastSubsourceProbe?.subsourceHttpStatus || 'not tested')} | ${lastSubsourceProbe?.subsourceLatencyMs !== undefined ? formatDuration(lastSubsourceProbe.subsourceLatencyMs) : 'run the connection test'}${lastSubsourceProbe?.subsourceRemaining ? ` | remaining ${escapeHtml(lastSubsourceProbe.subsourceRemaining)}` : ''}` : 'Configure a SubSource API key to enable adaptive fusion.'}</div></div><div class="metric"><div class="label">Latest adaptive lookup</div><div class="value">${escapeHtml(lastSubsourceFusion?.status || lastSubsourceFusion?.subsourceStatus || 'not used yet')}</div><div class="sub">${lastSubsourceFusion ? `${escapeHtml(lastSubsourceFusion.subsourceAcceptedCount || 0)} accepted, ${escapeHtml(lastSubsourceFusion.subsourceRejectedCount || 0)} rejected | ${formatDuration(lastSubsourceFusion.subsourceLatencyMs || 0)} | cache ${escapeHtml(lastSubsourceFusion.subsourceCache || 'not used')}` : 'SubSource is called only when current sync evidence can be improved.'}</div></div><form method="post" action="subsource-probe"><button class="probe" type="submit"${subsourceConfigured ? '' : ' disabled'}>Test SubSource connection</button></form><p class="muted">SubSource is skipped when the player supplies no filename, video hash or video size. Only strong release and exact series episode matches are admitted. OpenSubtitles remains the permanent fallback. The API key is never placed in subtitle URLs, logs or Queue messages.</p></section>
+${activeFailure ? `<section class="card"><h2>Latest failure</h2><div class="metric"><div class="label">${escapeHtml(activeFailure.event)}</div><div class="value">${escapeHtml(activeFailure.failureStage || activeFailure.status || 'Unknown stage')}</div><div class="sub">${escapeHtml(activeFailure.error || activeFailure.reason || '')}</div></div></section>` : ''}
 
-<section class="card"><h2>Player sync metadata</h2>${metadataItems}</section>
+<section class="card"><details><summary>Source details</summary><p class="muted">${candidateCount} English sources in OpenSubtitles order. Source timing is not verified.</p>${sourceList}</details></section>
 
-<section class="card"><h2>English candidates</h2><p class="muted">SmartSubs selected <strong>${escapeHtml(selectedId)}</strong>. A very small score gap without hash or size means selection confidence is weak.</p>${topCandidates}</section>
-
-${lastFailure ? `<section class="card"><h2>Latest failure</h2><div class="metric"><div class="label">${escapeHtml(lastFailure.event)}</div><div class="value">${escapeHtml(lastFailure.failureStage || lastFailure.status || 'Unknown stage')}</div><div class="sub">${escapeHtml(lastFailure.error || lastFailure.reason || '')}</div></div></section>` : ''}
-
-<section class="card"><details><summary>Verdict reference</summary><p class="muted">Legacy diagnostic codes retained for compatibility and deep debugging.</p><div class="event-detail"><span><code>NO_SUBTITLE_REQUEST_SEEN</code></span><span><code>NO_ENGLISH_SOURCE_FOUND</code></span><span><code>NATIVE_MALAY_WITH_AUTO_FALLBACK</code></span><span><code>SUBTITLE_RETURNED_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>PREFETCH_FAILED_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>QUEUE_PREFETCH_QUEUED</code></span><span><code>QUEUE_PREFETCH_TRANSLATING</code></span><span><code>QUEUE_PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>QUEUE_PREFETCH_FAILED_WAITING_FOR_PLAYER_SELECTION</code></span><span><code>QUEUE_JOIN_WAITING</code></span><span><code>TRANSLATION_PREPARING_IN_QUEUE</code></span><span><code>TRANSLATION_DELIVERED</code></span><span><code>TRANSLATION_FAILED</code></span></div></details></section>
-
-<section class="card"><details><summary>Raw recent events</summary><p class="muted">Shown in Malaysia time. Use this only when the summary above is not enough.</p>${rawEvents}</details></section>
+<section class="card"><details><summary>Technical events (${sorted.length})</summary><p class="muted">Build ${BUILD_ID} | Verdict <code>${escapeHtml(verdict)}</code> | Events retained for up to 24 hours (MYT).</p>${rawEvents}</details></section>
 </main></body></html>`
 }
 async function prefetchTranslation(options = {}) {
@@ -484,7 +495,7 @@ async function prefetchTranslation(options = {}) {
   const secret = String(options.secret || '')
   const configId = String(options.configId || '')
   const getOrTranslateFn = options.getOrTranslateFn || cfGetOrTranslate
-  const diagnosticFn = options.diagnosticFn || recordDiagnostic
+  const diagnosticFn = options.diagnosticFn || ((_kv, id, event) => recordConfiguredDiagnostic(env, id, event))
   const startedAt = nowMs()
 
   if (!autoUrl || !secret || !userConfig.apiKey) return null
@@ -537,6 +548,9 @@ async function prefetchTranslation(options = {}) {
       transientRetries: repair.transientRetries,
       abortRetries: repair.abortRetries,
       retryWaitMs: repair.retryWaitMs,
+      hedgeStarts: repair.hedgeStarts,
+      hedgeReplicaWins: repair.hedgeReplicaWins,
+      hedgeCancels: repair.hedgeCancels,
       chunkItems: repair.chunkItems,
       chunkChars: repair.chunkChars,
       concurrency: repair.concurrency
@@ -588,8 +602,135 @@ function queueJoinPollMs(env) {
   return Math.max(500, Math.min(5000, Number(env.QUEUE_JOIN_POLL_MS || 1500)))
 }
 
-function playerQueueWaitMaxMs(env) {
-  return Math.max(2000, Math.min(10000, Number(env.PLAYER_QUEUE_WAIT_MAX_MS || 5000)))
+function playerQueuePollEarlyMs(env) {
+  return Math.max(1000, Math.min(10000, Number(env.PLAYER_QUEUE_POLL_EARLY_MS || 6000)))
+}
+
+function playerQueuePollFastStartMs(env) {
+  return Math.max(0, Math.min(30000, Number(env.PLAYER_QUEUE_POLL_FAST_START_MS || 12000)))
+}
+
+function playerQueuePollLateStartMs(env) {
+  return Math.max(playerQueuePollFastStartMs(env), Math.min(60000, Number(env.PLAYER_QUEUE_POLL_LATE_START_MS || 25000)))
+}
+
+function playerQueuePollLateMs(env) {
+  return Math.max(1000, Math.min(10000, Number(env.PLAYER_QUEUE_POLL_LATE_MS || 3000)))
+}
+
+function playerMoviePollStepMs(env) {
+  return Math.max(1000, Math.min(10000, Number(env.PLAYER_MOVIE_POLL_STEP_MS || 7000)))
+}
+
+function playerMoviePollFastStartMs(env) {
+  return Math.max(
+    playerMoviePollStepMs(env),
+    Math.min(30000, Number(env.PLAYER_MOVIE_POLL_FAST_START_MS || 21000))
+  )
+}
+
+function playerMoviePollLateMs(env) {
+  return Math.max(1000, Math.min(10000, Number(env.PLAYER_MOVIE_POLL_LATE_MS || 3000)))
+}
+
+function playerMovieQueuePollPlan(env, job, now = Date.now()) {
+  const state = String(job?.state || '')
+  const updatedAt = Number(job?.updatedAt || 0)
+  const fastMs = queueJoinPollMs(env)
+
+  if (state === 'ready') return { pollMs: fastMs, boundaryMs: 0, phase: 'movie-fast' }
+  if (state === 'retrying' || state === 'failed') {
+    return { pollMs: playerQueuePollLateMs(env), boundaryMs: 0, phase: 'movie-retry' }
+  }
+
+  if ((state === 'queued' || state === 'running') && updatedAt > 0) {
+    const ageMs = Math.max(0, Number(now) - updatedAt)
+    const stepMs = playerMoviePollStepMs(env)
+    const fastStartMs = playerMoviePollFastStartMs(env)
+
+    if (ageMs < fastStartMs) {
+      const nextBoundaryMs = Math.min(
+        fastStartMs,
+        Math.max(stepMs, (Math.floor(ageMs / stepMs) + 1) * stepMs)
+      )
+      return {
+        pollMs: stepMs,
+        boundaryMs: Math.max(1, nextBoundaryMs - ageMs),
+        phase: 'movie-sparse'
+      }
+    }
+
+    // Movies normally have more cues/chunks. After 21s, reduce KV polling
+    // while keeping the 33s movie long-poll responsive.
+    return { pollMs: playerMoviePollLateMs(env), boundaryMs: 0, phase: 'movie-late' }
+  }
+
+  return { pollMs: playerMoviePollStepMs(env), boundaryMs: 0, phase: 'movie-sparse' }
+}
+
+function playerQueuePollPlan(env, job, now = Date.now(), mediaType = '') {
+  if (String(mediaType || '').toLowerCase() === 'movie') {
+    return playerMovieQueuePollPlan(env, job, now)
+  }
+
+  const state = String(job?.state || '')
+  const updatedAt = Number(job?.updatedAt || 0)
+  const fastMs = queueJoinPollMs(env)
+
+  if (state === 'ready') return { pollMs: fastMs, boundaryMs: 0, phase: 'fast' }
+  if (state === 'retrying' || state === 'failed') return { pollMs: playerQueuePollLateMs(env), boundaryMs: 0, phase: 'late' }
+
+  if ((state === 'queued' || state === 'running') && updatedAt > 0) {
+    const ageMs = Math.max(0, Number(now) - updatedAt)
+    const fastStartMs = playerQueuePollFastStartMs(env)
+    const lateStartMs = playerQueuePollLateStartMs(env)
+
+    if (ageMs < fastStartMs) {
+      return {
+        pollMs: playerQueuePollEarlyMs(env),
+        boundaryMs: Math.max(1, fastStartMs - ageMs),
+        phase: 'early'
+      }
+    }
+    if (ageMs < lateStartMs) {
+      return {
+        pollMs: fastMs,
+        boundaryMs: Math.max(1, lateStartMs - ageMs),
+        phase: 'fast'
+      }
+    }
+    return { pollMs: playerQueuePollLateMs(env), boundaryMs: 0, phase: 'late' }
+  }
+
+  // While still queued, avoid burning KV reads before the consumer has started.
+  return { pollMs: playerQueuePollEarlyMs(env), boundaryMs: 0, phase: 'early' }
+}
+
+function playerQueueWaitMaxMs(env, mediaType = '') {
+  if (String(mediaType || '').toLowerCase() === 'movie') {
+    return Math.max(2000, Math.min(34000, Number(env.PLAYER_MOVIE_QUEUE_WAIT_MAX_MS || 33000)))
+  }
+  return Math.max(2000, Math.min(30000, Number(env.PLAYER_QUEUE_WAIT_MAX_MS || 30000)))
+}
+
+function geminiChunkAbortRetryMs(env) {
+  return Math.max(0, Math.min(5000, Number(env.GEMINI_CHUNK_ABORT_RETRY_MS ?? 1000) || 0))
+}
+function movieGeminiHedgeEnabled(env) {
+  return !['0', 'false', 'off', 'no'].includes(String(env.GEMINI_MOVIE_HEDGE_ENABLED ?? 'true').toLowerCase())
+}
+function movieGeminiHedgeDelayMs(env) {
+  return Math.max(20000, Math.min(44000, Number(env.GEMINI_MOVIE_HEDGE_DELAY_MS || 35000)))
+}
+function movieAdaptiveTargetChunks(env) {
+  return Math.max(6, Math.min(16, Number(env.QUEUE_MOVIE_TARGET_CHUNKS || 10)))
+}
+function movieAdaptiveChunkItemsMin(env) {
+  return Math.max(120, Math.min(200, Number(env.QUEUE_MOVIE_CHUNK_ITEMS_MIN || 160)))
+}
+function movieAdaptiveChunkItemsMax(env) {
+  const minItems = movieAdaptiveChunkItemsMin(env)
+  return Math.max(minItems, Math.min(240, Number(env.QUEUE_MOVIE_CHUNK_ITEMS_MAX || 200)))
 }
 
 function playerQueueGraceMs(env) {
@@ -650,6 +791,69 @@ export class TranslationDeliveryRelay {
   }
 
   async fetch(request) {
+    const path = new URL(request.url).pathname
+    // Usage reports use a separate DO idFromName namespace, never a relay instance.
+    if (path === '/usage' && request.method === 'POST') {
+      let payload
+      try { payload = await request.json() } catch { return new Response(null, { status: 400 }) }
+      const saved = await storeMonitorReport(this.ctx.storage, payload)
+      if (saved && !(await this.ctx.storage.getAlarm())) {
+        await this.ctx.storage.setAlarm(Date.now() + 86400000)
+      }
+      return new Response(null, { status: saved ? 204 : 400 })
+    }
+    if (path === '/usage' && request.method === 'GET') {
+      return new Response(JSON.stringify(await readMonitorReports(this.ctx.storage)), {
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }
+      })
+    }
+    if (path === '/monitor' && request.method === 'GET') {
+      const reports = await readMonitorReports(this.ctx.storage)
+      const testState = await readMonitorTestState(this.ctx.storage, Date.now(), reports)
+      return new Response(JSON.stringify({ reports, testState }), {
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }
+      })
+    }
+    if (path === '/test/start' && request.method === 'POST') {
+      const result = await startMonitorTest(this.ctx.storage)
+      if (result.ok && !(await this.ctx.storage.getAlarm())) {
+        await this.ctx.storage.setAlarm(Date.now() + 86400000)
+      }
+      return new Response(JSON.stringify(result), {
+        status: result.ok ? 200 : 409,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }
+      })
+    }
+    if (path === '/test/end' && request.method === 'POST') {
+      const result = await endMonitorTest(this.ctx.storage)
+      return new Response(JSON.stringify(result), {
+        status: result.ok ? 200 : 409,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }
+      })
+    }
+    // This endpoint is reachable only from the Worker through the DO binding.
+    // Never expose a public proxy for arbitrary DO paths.
+    if (path === '/diagnostics/state' && request.method === 'GET') {
+      const state = await this.ctx.storage.get('diagnostics:state')
+      return new Response(JSON.stringify({
+        enabled: state?.enabled === true,
+        since: Number(state?.since) || 0
+      }), { headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } })
+    }
+    if (path === '/diagnostics/state' && request.method === 'POST') {
+      let payload
+      try { payload = await request.json() } catch { return new Response(null, { status: 400 }) }
+      if (payload?.enabled !== true && payload?.enabled !== false) return new Response(null, { status: 400 })
+      const previous = await this.ctx.storage.get('diagnostics:state')
+      const enabled = payload.enabled === true
+      const since = enabled ? (previous?.enabled ? Number(previous.since) || Date.now() : Date.now()) : 0
+      await this.ctx.storage.put('diagnostics:state', { enabled, since })
+      return new Response(JSON.stringify({ enabled, since }), {
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }
+      })
+    }
+    if (path === '/diagnostics/state') return new Response(null, { status: 405 })
+
     if (request.method === 'PUT') {
       const value = await request.text()
       if (!value.startsWith('WEBVTT') || value.length > 2 * 1024 * 1024) {
@@ -677,7 +881,12 @@ export class TranslationDeliveryRelay {
   }
 
   async alarm() {
-    await this.ctx.storage.deleteAll()
+    // Relay instances have no usage entries. They retain their existing cleanup.
+    await pruneMonitorReports(this.ctx.storage)
+    const hasTests = await pruneMonitorTestHistory(this.ctx.storage)
+    const remaining = await this.ctx.storage.list({ prefix: 'usage:', limit: 1 })
+    if (remaining.size || hasTests) await this.ctx.storage.setAlarm(Date.now() + 86400000)
+    else if ((await this.ctx.storage.get('diagnostics:state'))?.enabled !== true) await this.ctx.storage.deleteAll()
   }
 }
 
@@ -726,9 +935,16 @@ function normaliseRequestedQueueProfile(value) {
     : ''
 }
 
-function queueTranslationProfile(env, attempts = 1, requestedProfile = '') {
+function normaliseQueueRetryMode(value) {
+  const mode = String(value || '')
+  return mode === 'fast-transient' || mode === 'safe-fallback' ? mode : ''
+}
+
+function queueTranslationProfile(env, attempts = 1, requestedProfile = '', retryMode = '') {
   const attempt = Math.max(1, Number(attempts || 1))
   const requested = normaliseRequestedQueueProfile(requestedProfile)
+  const recovery = normaliseQueueRetryMode(retryMode)
+  if (attempt > 1 && recovery === 'fast-transient') return 'fast-transient-retry'
   if (attempt === 1 && requested === 'user-selected-stable') return 'user-selected-stable'
   if (queueFinalEnabled(env, attempts)) return 'quota-safe-final'
   if (queueParallelEnabled(env, attempts)) return 'parallel-3'
@@ -745,22 +961,29 @@ function queueFailureStage(error) {
   return 'unknown'
 }
 
-function queueTranslationOptions(env, attempts = 1, requestedProfile = '') {
+function queueTranslationOptions(env, attempts = 1, requestedProfile = '', retryMode = '') {
   const retryAttempt = Math.max(1, Number(attempts || 1))
   const requested = normaliseRequestedQueueProfile(requestedProfile)
+  const recovery = normaliseQueueRetryMode(retryMode)
+
+  // A first-attempt abort/timeout is commonly a transient Gemini stall rather than
+  // sustained overload. Retry once with the same normal profile before falling back.
+  if (retryAttempt > 1 && recovery === 'fast-transient') {
+    return queueTranslationOptions(env, 1, requestedProfile, '')
+  }
 
   if (retryAttempt === 1 && requested === 'user-selected-stable') {
     return {
       maxItems: Math.max(140, Math.min(200, Number(env.QUEUE_USER_SELECTED_CHUNK_ITEMS || 160))),
       maxChars: Math.max(16000, Math.min(24000, Number(env.QUEUE_USER_SELECTED_CHUNK_CHARS || 20000))),
-      concurrency: Math.max(1, Math.min(3, Number(env.QUEUE_USER_SELECTED_CONCURRENCY || 3)))
+      concurrency: Math.max(1, Math.min(5, Number(env.QUEUE_USER_SELECTED_CONCURRENCY || 5)))
     }
   }
   if (queueFinalEnabled(env, attempts)) {
     return {
       maxItems: Math.max(160, Math.min(220, Number(env.QUEUE_FINAL_CHUNK_ITEMS || 180))),
       maxChars: Math.max(20000, Math.min(30000, Number(env.QUEUE_FINAL_CHUNK_CHARS || 24000))),
-      concurrency: Math.max(1, Math.min(3, Number(env.QUEUE_FINAL_CONCURRENCY || 3)))
+      concurrency: Math.max(1, Math.min(5, Number(env.QUEUE_FINAL_CONCURRENCY || 3)))
     }
   }
 
@@ -823,6 +1046,8 @@ async function writeQueueJobState(env, cacheKey, value = {}) {
   }
   if (value.configId) clean.configId = String(value.configId).slice(0, 128)
   if (value.attempts !== undefined) clean.attempts = Math.max(0, Number(value.attempts || 0))
+  const retryMode = normaliseQueueRetryMode(value.retryMode)
+  if (retryMode) clean.retryMode = retryMode
 
   await kv.put(
     queueJobKey(cacheKey),
@@ -848,15 +1073,27 @@ async function waitForQueueCache(options = {}) {
   const nowFn = options.nowFn || Date.now
   const maxWaitMs = Math.max(0, Number(options.maxWaitMs ?? queueJoinMaxMs(env)))
   const pollMs = Math.max(1, Number(options.pollMs ?? queueJoinPollMs(env)))
+  const adaptivePlayerPolling = options.playerAdaptivePolling === true
+  const mediaType = String(options.mediaType || '').toLowerCase()
   const startedAt = nowFn()
   let polls = 0
   let job = options.initialJob || await readQueueJobState(env, cacheKey)
 
   while (queueJobActive(job)) {
-    const elapsed = Math.max(0, nowFn() - startedAt)
+    const now = nowFn()
+    const elapsed = Math.max(0, now - startedAt)
     if (elapsed >= maxWaitMs) break
 
-    const waitMs = Math.min(pollMs, Math.max(1, maxWaitMs - elapsed))
+    let nextPollMs = pollMs
+    if (adaptivePlayerPolling) {
+      const plan = playerQueuePollPlan(env, job, now, mediaType)
+      nextPollMs = Math.max(1, Number(plan.pollMs || pollMs))
+      if (Number(plan.boundaryMs || 0) > 0) {
+        nextPollMs = Math.min(nextPollMs, Math.max(1, Number(plan.boundaryMs)))
+      }
+    }
+
+    const waitMs = Math.min(nextPollMs, Math.max(1, maxWaitMs - elapsed))
     await sleepFn(waitMs)
     polls++
 
@@ -952,7 +1189,7 @@ async function enqueuePrefetchTranslation(options = {}) {
   const env = options.env || {}
   const configToken = String(options.configToken || '')
   const configId = String(options.configId || '')
-  const diagnosticFn = options.diagnosticFn || recordDiagnostic
+  const diagnosticFn = options.diagnosticFn || ((_kv, id, event) => recordConfiguredDiagnostic(env, id, event))
   const translationToken = parseAutoTranslationToken(autoUrl)
   const cacheKey = String(options.cacheKey || '')
   const requestedProfile = normaliseRequestedQueueProfile(options.queueProfile)
@@ -1036,16 +1273,18 @@ async function processQueueMessage(body, env, options = {}) {
   const configToken = String(payload.configToken || '')
   const translationToken = String(payload.translationToken || '')
   const configId = String(payload.configId || '')
+  env.__kvUsageTracker?.setConfigId(configId)
   const attempts = Math.max(1, Number(options.attempts || 1))
-  const diagnosticFn = options.diagnosticFn || recordDiagnostic
+  const diagnosticFn = options.diagnosticFn || ((_kv, id, event) => recordConfiguredDiagnostic(env, id, event))
   const getOrTranslateFn = options.getOrTranslateFn || cfGetOrTranslate
   const startedAt = nowMs()
   const epochNowFn = typeof options.epochNowFn === 'function' ? options.epochNowFn : Date.now
   const queuedAt = Number(payload.queuedAt || 0)
   const queueDelayMs = queuedAt > 0 ? Math.max(0, roundMs(epochNowFn() - queuedAt)) : 0
   const requestedProfile = normaliseRequestedQueueProfile(payload.profile)
-  const queueProfile = queueTranslationOptions(env, attempts, requestedProfile)
-  const queueProfileName = queueTranslationProfile(env, attempts, requestedProfile)
+  let retryMode = ''
+  let queueProfile = null
+  let queueProfileName = ''
 
   if (!secret) throw new Error('SmartSubs server secret is not configured')
   if (payload.v !== 1 || !configToken || !translationToken || !configId) {
@@ -1060,6 +1299,7 @@ async function processQueueMessage(body, env, options = {}) {
   try {
     userConfig = decodeUserConfigToken(configToken, { secret })
     const tokenData = decodeTranslationTokenData(translationToken, secret)
+    env.__kvUsageTracker?.setMedia(tokenData.media)
     const expectedCacheKey = translationCacheKey(tokenData, userConfig.model, env)
     const suppliedCacheKey = String(payload.cacheKey || '')
 
@@ -1068,10 +1308,18 @@ async function processQueueMessage(body, env, options = {}) {
     }
     cacheKey = expectedCacheKey
 
+    if (attempts > 1) {
+      const previousJob = await readQueueJobState(env, cacheKey)
+      retryMode = normaliseQueueRetryMode(previousJob?.retryMode)
+    }
+    queueProfile = queueTranslationOptions(env, attempts, requestedProfile, retryMode)
+    queueProfileName = queueTranslationProfile(env, attempts, requestedProfile, retryMode)
+
     await writeQueueJobState(env, cacheKey, {
       state: 'running',
       configId,
-      attempts
+      attempts,
+      retryMode
     }).catch(() => {})
 
     await diagnosticFn(env.SMARTSUBS_CACHE, configId, {
@@ -1079,7 +1327,13 @@ async function processQueueMessage(body, env, options = {}) {
       status: 'consumer',
       attempts,
       profile: queueProfileName,
+      retryMode: retryMode || undefined,
       queueDelayMs,
+      mediaType: tokenData.media?.type,
+      movieAdaptiveChunking: tokenData.media?.type === 'movie' && queueProfileName !== 'fallback-stable',
+      movieTargetChunks: movieAdaptiveTargetChunks(env),
+      movieChunkItemsMin: movieAdaptiveChunkItemsMin(env),
+      movieChunkItemsMax: movieAdaptiveChunkItemsMax(env),
       chunkItems: queueProfile.maxItems,
       chunkChars: queueProfile.maxChars,
       concurrency: queueProfile.concurrency
@@ -1094,9 +1348,20 @@ async function processQueueMessage(body, env, options = {}) {
       model: userConfig.model,
       apiKey: userConfig.apiKey,
       cacheVersion: cacheVersion(env),
-      translateOptions: queueProfile
+      translateOptions: queueProfile,
+      translateContext: {
+        mediaType: tokenData.media?.type,
+        movieAdaptiveChunking: tokenData.media?.type === 'movie' && queueProfileName !== 'fallback-stable',
+        movieTargetChunks: movieAdaptiveTargetChunks(env),
+        movieChunkItemsMin: movieAdaptiveChunkItemsMin(env),
+        movieChunkItemsMax: movieAdaptiveChunkItemsMax(env),
+        abortRetryDelayMs: geminiChunkAbortRetryMs(env),
+        movieHedgeEnabled: movieGeminiHedgeEnabled(env),
+        movieHedgeDelayMs: movieGeminiHedgeDelayMs(env)
+      }
     })
 
+    env.__kvUsageTracker?.setCacheResult(result.status)
     const deliveryRelayStored = await writeDeliveryRelay(env, cacheKey, result.vtt)
 
     await writeQueueJobState(env, cacheKey, {
@@ -1114,6 +1379,7 @@ async function processQueueMessage(body, env, options = {}) {
       status: 'ready',
       attempts,
       profile: queueProfileName,
+      retryMode: retryMode || undefined,
       totalMs,
       expected: repair.expected,
       received: repair.received,
@@ -1128,6 +1394,14 @@ async function processQueueMessage(body, env, options = {}) {
       transientRetries: repair.transientRetries,
       abortRetries: repair.abortRetries,
       retryWaitMs: repair.retryWaitMs,
+      hedgeStarts: repair.hedgeStarts,
+      hedgeReplicaWins: repair.hedgeReplicaWins,
+      hedgeCancels: repair.hedgeCancels,
+      mediaType: tokenData.media?.type,
+      movieAdaptiveChunking: tokenData.media?.type === 'movie' && queueProfileName !== 'fallback-stable',
+      movieTargetChunks: movieAdaptiveTargetChunks(env),
+      movieChunkItemsMin: movieAdaptiveChunkItemsMin(env),
+      movieChunkItemsMax: movieAdaptiveChunkItemsMax(env),
       chunkItems: repair.chunkItems,
       chunkChars: repair.chunkChars,
       concurrency: repair.concurrency,
@@ -1145,7 +1419,15 @@ async function processQueueMessage(body, env, options = {}) {
       sumChunkMs: repair.sumChunkMs,
       geminiCallMs: repair.geminiCallMs,
       geminiStatuses: repair.geminiStatuses,
-      geminiPromptChars: repair.geminiPromptChars
+      geminiPromptChars: repair.geminiPromptChars,
+      geminiFinishReasons: repair.geminiFinishReasons,
+      geminiInputTokens: repair.geminiInputTokens,
+      geminiOutputTokens: repair.geminiOutputTokens,
+      geminiTotalTokens: repair.geminiTotalTokens,
+      geminiInputTokensTotal: repair.geminiInputTokensTotal,
+      geminiOutputTokensTotal: repair.geminiOutputTokensTotal,
+      geminiTotalTokensTotal: repair.geminiTotalTokensTotal,
+      sdhRemoved: repair.sdhRemoved
     }).catch(() => {})
 
     logPerf({
@@ -1172,6 +1454,7 @@ async function processQueueMessage(body, env, options = {}) {
       status: 'consumer-failed',
       attempts,
       profile: queueProfileName,
+      retryMode: retryMode || undefined,
       queueDelayMs,
       failureStage: queueFailureStage(error),
       error: safeMessage(error, userConfig?.apiKey || ''),
@@ -1187,19 +1470,80 @@ async function processQueueMessage(body, env, options = {}) {
       avgChunkMs: perf.avgChunkMs,
       sumChunkMs: perf.sumChunkMs,
       abortRetries: perf.abortRetries,
+      hedgeStarts: perf.hedgeStarts,
+      hedgeReplicaWins: perf.hedgeReplicaWins,
+      hedgeCancels: perf.hedgeCancels,
       geminiCallMs: perf.geminiCallMs,
       geminiStatuses: perf.geminiStatuses,
-      geminiPromptChars: perf.geminiPromptChars
+      geminiPromptChars: perf.geminiPromptChars,
+      geminiFinishReasons: perf.geminiFinishReasons,
+      geminiInputTokens: perf.geminiInputTokens,
+      geminiOutputTokens: perf.geminiOutputTokens,
+      geminiTotalTokens: perf.geminiTotalTokens,
+      geminiInputTokensTotal: perf.geminiInputTokensTotal,
+      geminiOutputTokensTotal: perf.geminiOutputTokensTotal,
+      geminiTotalTokensTotal: perf.geminiTotalTokensTotal,
+      sdhRemoved: perf.sdhRemoved
     }).catch(() => {})
     throw error
   }
 }
+function queueRetryPolicy(error, attempts = 1) {
+  const attempt = Math.max(1, Number(attempts || 1))
+  const message = String(error?.message || error || '')
+  const failureStage = queueFailureStage(error)
+  const rateLimited = /Gemini HTTP 429/i.test(message)
+  const serverOverload = /Gemini HTTP (408|5\d\d)/i.test(message)
+  const transientAbort = failureStage === 'gemini' && !rateLimited && !serverOverload && /aborted|aborterror|timeout/i.test(message)
+
+  if (attempt === 1 && transientAbort) {
+    return {
+      delaySeconds: 2,
+      retryMode: 'fast-transient',
+      policy: 'fast-transient-retry'
+    }
+  }
+
+  if (rateLimited) {
+    return {
+      delaySeconds: attempt === 1 ? 30 : Math.min(60, attempt * 10),
+      retryMode: 'safe-fallback',
+      policy: 'rate-limit-safe-fallback'
+    }
+  }
+
+  if (serverOverload) {
+    return {
+      delaySeconds: attempt === 1 ? 10 : Math.min(60, attempt * 10),
+      retryMode: 'safe-fallback',
+      policy: 'server-safe-fallback'
+    }
+  }
+
+  if (attempt === 2) {
+    return {
+      delaySeconds: 10,
+      retryMode: 'safe-fallback',
+      policy: 'second-failure-safe-fallback'
+    }
+  }
+
+  return {
+    delaySeconds: Math.min(60, attempt * 10),
+    retryMode: 'safe-fallback',
+    policy: 'standard-safe-fallback'
+  }
+}
+
 async function handleQueue(batch, env, options = {}) {
   const processFn = options.processFn || processQueueMessage
 
   for (const message of batch?.messages || []) {
+    const tracker = options.trackUsage ? createKvUsageTracker({ phase: 'queue', attempt: message.attempts }) : null
+    const messageEnv = tracker ? trackedEnvironment(env, tracker) : env
+    tracker?.setConfigId(message?.body?.configId)
     try {
-      await processFn(message.body, env, {
+      await processFn(message.body, messageEnv, {
         attempts: message.attempts
       })
       if (typeof message.ack === 'function') message.ack()
@@ -1211,13 +1555,13 @@ async function handleQueue(batch, env, options = {}) {
 
       if (permanent) {
         if (validTranslationCacheKey(cacheKey)) {
-          await writeQueueJobState(env, cacheKey, {
+          await writeQueueJobState(messageEnv, cacheKey, {
             state: 'failed',
             configId,
             attempts: message.attempts
           }).catch(() => {})
         }
-        await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+        await recordConfiguredDiagnostic(messageEnv, configId, {
           event: 'queue-retry-stopped',
           status: 'permanent',
           attempts: message.attempts,
@@ -1227,25 +1571,32 @@ async function handleQueue(batch, env, options = {}) {
         if (typeof message.ack === 'function') message.ack()
       } else if (typeof message.retry === 'function') {
         const attempts = Math.max(1, Number(message.attempts || 1))
+        const retryPolicy = queueRetryPolicy(error, attempts)
+        const retryDelaySeconds = retryPolicy.delaySeconds
         if (validTranslationCacheKey(cacheKey)) {
-          await writeQueueJobState(env, cacheKey, {
+          await writeQueueJobState(messageEnv, cacheKey, {
             state: 'retrying',
             configId,
-            attempts
+            attempts,
+            retryMode: retryPolicy.retryMode
           }).catch(() => {})
         }
-        const retryDelaySeconds = Math.min(60, attempts * 10)
-        await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+        await recordConfiguredDiagnostic(messageEnv, configId, {
           event: 'queue-retry-scheduled',
           status: 'retrying',
           attempts,
           nextAttempt: attempts + 1,
           retryDelaySeconds,
+          retryMode: retryPolicy.retryMode,
+          retryPolicy: retryPolicy.policy,
           failureStage: queueFailureStage(error),
           reason: safeMessage(error, '')
         }).catch(() => {})
         message.retry({ delaySeconds: retryDelaySeconds })
       }
+    } finally {
+      tracker?.flush()
+      if (tracker) await publishKvUsage(env, tracker).catch(() => {})
     }
   }
 }
@@ -1265,6 +1616,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
   }
 
   const configId = tokenFingerprint(token)
+  env.__kvUsageTracker?.setConfigId(configId)
 
   if (request.method === 'GET' && suffix === '/manifest.json') {
     return json(createConfiguredManifest(), 200, { noStore: true })
@@ -1277,148 +1629,103 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
     })
   }
 
+  if (request.method === 'POST' && (suffix === '/kv-monitor/test/start' || suffix === '/kv-monitor/test/end')) {
+    const stub = monitorStub(env, configId)
+    if (!stub) return send(503, 'text/plain; charset=utf-8', 'KV Monitor is not available', { noStore: true })
+    // The configured token must already have passed verification above.
+    const action = suffix.endsWith('/start') ? 'start' : 'end'
+    try {
+      const response = await stub.fetch(`https://smartsubs-monitor.internal/test/${action}`, { method: 'POST' })
+      if (!response.ok) {
+        const result = await response.json().catch(() => ({}))
+        return send(response.status, 'text/plain; charset=utf-8', String(result.reason || 'Monitor test action failed'), { noStore: true })
+      }
+      return new Response(null, { status: 303, headers: {
+        location: new URL(request.url).pathname.replace(/\/test\/(start|end)$/, ''),
+        'cache-control': 'no-store', 'referrer-policy': 'no-referrer'
+      } })
+    } catch {
+      return send(503, 'text/plain; charset=utf-8', 'Monitor test is temporarily unavailable', { noStore: true })
+    }
+  }
+
+  if (request.method === 'GET' && suffix === '/kv-monitor') {
+    const stub = monitorStub(env, configId)
+    if (!stub) return send(503, 'text/plain; charset=utf-8', 'KV Monitor requires SMARTSUBS_DELIVERY Durable Object binding', { noStore: true })
+    try {
+      const response = await stub.fetch('https://smartsubs-monitor.internal/monitor')
+      if (!response.ok) throw new Error('Monitor not ready')
+      const { reports, testState } = await response.json()
+      return send(200, 'text/html; charset=utf-8', renderKvMonitor(reports, testState), {
+        noStore: true, csp: true,
+        headers: { 'referrer-policy': 'no-referrer', 'x-robots-tag': 'noindex, nofollow' }
+      })
+    } catch {
+      return send(503, 'text/plain; charset=utf-8', 'KV Monitor is temporarily unavailable', { noStore: true })
+    }
+  }
+
   if (request.method === 'GET' && suffix === '/diagnose') {
-    const events = await readDiagnostics(env.SMARTSUBS_CACHE, configId).catch(() => [])
+    const state = await diagnosticState(env, configId)
+    const events = state.enabled
+      ? (await readDiagnostics(env.SMARTSUBS_CACHE, configId).catch(() => [])).filter(item => Number(item.ts) >= state.since)
+      : []
     return send(200, 'text/html; charset=utf-8', renderConfiguredDiagnosePage(configId, events, {
-      subsourceConfigured: Boolean(userConfig.subsourceApiKey)
-    }), { noStore: true, csp: true })
+      ...state, ready: diagnosticAdminReady(env) && Boolean(monitorStub(env, configId))
+    }), { noStore: true, csp: true, headers: { 'x-robots-tag': 'noindex, nofollow' } })
   }
 
-  if (request.method === 'POST' && suffix === '/subsource-probe') {
-    const redirect = () => new Response(null, {
-      status: 303,
-      headers: {
-        location: `${configuredBase(request, token)}/diagnose`,
-        'cache-control': 'no-store'
-      }
-    })
-
-    if (!userConfig.subsourceApiKey) {
-      await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
-        event: 'subsource-probe',
-        subsourceConfigured: false,
-        subsourceStatus: 'not-configured'
-      }).catch(() => {})
-      return redirect()
-    }
-
-    const previous = await readDiagnostics(env.SMARTSUBS_CACHE, configId).catch(() => [])
-    const recentProbe = previous.find(item =>
-      item.event === 'subsource-probe' && Number(item.subsourceProbeVersion || 0) === PROBE_VERSION
-    )
-    if (recentProbe && Date.now() - Number(recentProbe.ts || 0) < 5 * 60 * 1000) {
-      await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
-        ...recentProbe,
-        event: 'subsource-probe-cache-hit',
-        ts: Date.now(),
-        cache: 'HIT',
-        subsourceProbeCacheAgeMs: Date.now() - Number(recentProbe.ts || 0)
-      }).catch(() => {})
-      return redirect()
-    }
-
+  if (request.method === 'POST' && suffix === '/diagnose/toggle') {
+    // A configured addon URL is shared with the player, and is NOT admin authentication.
+    // Turning ON requires the separate Cloudflare secret. OFF is deliberately public
+    // to anyone who can access this configured addon URL, as requested by the owner.
+    const adminKey = String(env.SMARTSUBS_DIAG_ADMIN_KEY || '')
+    if (!diagnosticAdminReady(env)) return send(503, 'text/plain; charset=utf-8', 'Diagnostic admin key is not configured', { noStore: true })
+    // Browser metadata (Origin / Sec-Fetch-Site) can vary in privacy browsers,
+    // embedded players and proxy deployments. It is not authentication.
+    // Authenticate every ON request using the separate server-side admin key below;
+    // never save the key in a cookie, GET parameter, or diagnostics log.
+    if (Number(request.headers.get('content-length') || 0) > 2048) return send(413, 'text/plain; charset=utf-8', 'Form too large', { noStore: true })
+    let form
     try {
-      const probe = await probeSubsourceApi(userConfig.subsourceApiKey)
-      await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
-        event: 'subsource-probe',
-        subsourceProbeVersion: PROBE_VERSION,
-        subsourceConfigured: true,
-        subsourceStatus: probe.status,
-        subsourceHttpStatus: probe.httpStatus,
-        subsourceLatencyMs: probe.latencyMs,
-        subsourceLimit: probe.limit,
-        subsourceRemaining: probe.remaining,
-        subsourceLimitMinute: probe.limitMinute,
-        subsourceRemainingMinute: probe.remainingMinute,
-        subsourceLimitHour: probe.limitHour,
-        subsourceRemainingHour: probe.remainingHour,
-        subsourceLimitDay: probe.limitDay,
-        subsourceRemainingDay: probe.remainingDay,
-        subsourceReset: probe.reset,
-        subsourceRateHeaderNames: probe.rateHeaderNames,
-        subsourceResponseRootType: probe.responseRootType,
-        subsourceResponseTopKeys: probe.responseTopKeys,
-        subsourceResponseItemKeys: probe.responseItemKeys
-      }).catch(() => {})
-    } catch (error) {
-      await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
-        event: 'subsource-probe',
-        subsourceProbeVersion: PROBE_VERSION,
-        subsourceConfigured: true,
-        subsourceStatus: 'probe-failed',
-        error: safeMessage(error, userConfig.apiKey, userConfig.subsourceApiKey)
-      }).catch(() => {})
+      if (!String(request.headers.get('content-type') || '').startsWith('application/x-www-form-urlencoded')) throw new Error('Unsupported form')
+      const text = await request.text()
+      if (text.length > 2048) throw new Error('Form too large')
+      form = new URLSearchParams(text)
+    } catch { return send(400, 'text/plain; charset=utf-8', 'Invalid form', { noStore: true }) }
+    const action = form.get('action')
+    if (!['on', 'off'].includes(action) ||
+        (action === 'on' && !validDiagnosticAdminKey(form.get('adminKey'), adminKey))) {
+      return send(403, 'text/plain; charset=utf-8', 'Invalid admin key or action', { noStore: true })
     }
-    return redirect()
-  }
-
-  const legacySubsourceDownloadMatch = request.method === 'GET' && suffix.match(/^\/subsource\/(\d+)\/(\d+)\.srt$/)
-  if (legacySubsourceDownloadMatch) {
-    return send(410, 'text/plain; charset=utf-8', 'Refresh the subtitle list to use the season-safe SubSource URL', {
-      noStore: true,
-      headers: { 'x-smartsubs-build': BUILD_ID }
-    })
-  }
-
-  const subsourceDownloadMatch = request.method === 'GET' && suffix.match(/^\/subsource\/(\d+)\/(\d+)\/(\d+)\.srt$/)
-  if (subsourceDownloadMatch) {
-    if (!userConfig.subsourceApiKey) {
-      return send(404, 'text/plain; charset=utf-8', 'SubSource is not configured', { noStore: true })
-    }
-    const subtitleId = Number(subsourceDownloadMatch[1])
-    const season = Number(subsourceDownloadMatch[2])
-    const episode = Number(subsourceDownloadMatch[3])
-    const cacheKey = `subsource:file:v2:${subtitleId}:${season}:${episode}`
+    const stub = monitorStub(env, configId)
+    if (!stub) return send(503, 'text/plain; charset=utf-8', 'Diagnostics switch requires SMARTSUBS_DELIVERY', { noStore: true })
     try {
-      let text = ''
-      let cache = 'MISS'
-      if (env.SMARTSUBS_CACHE && typeof env.SMARTSUBS_CACHE.get === 'function') {
-        text = String(await env.SMARTSUBS_CACHE.get(cacheKey) || '')
-      }
-      if (text) {
-        cache = 'HIT'
-      } else {
-        const archive = await downloadSubsourceArchive(subtitleId, userConfig.subsourceApiKey)
-        text = extractSubtitleArchive(archive, season, episode).text
-        if (env.SMARTSUBS_CACHE && typeof env.SMARTSUBS_CACHE.put === 'function') {
-          await env.SMARTSUBS_CACHE.put(cacheKey, text, { expirationTtl: 7 * 24 * 60 * 60 }).catch(() => {})
-        }
-      }
-      await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
-        event: 'subsource-download',
-        status: 'ready',
-        cache,
-        sourceBytes: new TextEncoder().encode(text).length
-      }).catch(() => {})
-      return send(200, 'application/x-subrip; charset=utf-8', text, {
-        cacheControl: 'private, max-age=86400, immutable',
-        headers: { 'x-smartsubs-cache': cache, 'x-smartsubs-build': BUILD_ID }
+      const response = await stub.fetch('https://smartsubs-monitor.internal/diagnostics/state', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled: action === 'on' })
       })
-    } catch (error) {
-      await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
-        event: 'subsource-download',
-        status: 'failed',
-        error: safeMessage(error, userConfig.subsourceApiKey)
-      }).catch(() => {})
-      return send(502, 'text/plain; charset=utf-8', 'SubSource subtitle is temporarily unavailable', {
-        noStore: true,
-        headers: { 'x-smartsubs-build': BUILD_ID }
-      })
-    }
+      if (!response.ok) throw new Error('State update failed')
+    } catch { return send(503, 'text/plain; charset=utf-8', 'Diagnostics switch unavailable. Try again.', { noStore: true }) }
+    return new Response(null, { status: 303, headers: {
+      location: new URL(request.url).pathname.replace(/\/toggle$/, ''),
+      'cache-control': 'no-store', 'referrer-policy': 'no-referrer'
+    } })
   }
 
   const translationMatch = request.method === 'GET' && suffix.match(/^\/translated\/([A-Za-z0-9_.-]+)\.vtt$/)
   if (translationMatch) {
     const startedAt = nowMs()
-    await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+    await recordConfiguredDiagnostic(env, configId, {
       event: 'translation-request',
-      status: 'player'
+      status: 'player',
+      ...translationRequestProbe(request)
     }).catch(() => {})
 
     try {
       if (!env.SMARTSUBS_CACHE) throw new Error('SMARTSUBS_CACHE KV binding is not configured')
 
       const tokenData = decodeTranslationTokenData(translationMatch[1], secret)
+      env.__kvUsageTracker?.setMedia(tokenData.media)
       const cache = getCache(env)
       const cacheKey = translationCacheKey(tokenData, userConfig.model, env)
       let joinWaitMs = 0
@@ -1440,7 +1747,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
       } else {
         const job = await readQueueJobState(env, cacheKey)
         if (queueJobActive(job)) {
-          await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+          await recordConfiguredDiagnostic(env, configId, {
             event: 'queue-join-start',
             status: job.state
           }).catch(() => {})
@@ -1450,8 +1757,10 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
             cache,
             cacheKey,
             initialJob: job,
-            maxWaitMs: playerQueueWaitMaxMs(env),
-            graceMs: playerQueueGraceMs(env)
+            maxWaitMs: playerQueueWaitMaxMs(env, tokenData.media?.type),
+            graceMs: playerQueueGraceMs(env),
+            playerAdaptivePolling: true,
+            mediaType: tokenData.media?.type
           })
 
           joinWaitMs = joined.waitMs
@@ -1467,7 +1776,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
               status: joined.cacheSource === 'DELIVERY_RELAY' ? 'DELIVERY_RELAY' : 'QUEUE_JOIN',
               translationStats: null
             }
-            await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+            await recordConfiguredDiagnostic(env, configId, {
               event: 'queue-join-hit',
               status: joined.jobStatus,
               waitMs: joinWaitMs,
@@ -1476,7 +1785,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
               graceHit: joinGraceHit
             }).catch(() => {})
             if (joinGraceHit) {
-              await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+              await recordConfiguredDiagnostic(env, configId, {
                 event: 'queue-grace-hit',
                 status: joined.jobStatus,
                 waitMs: joinWaitMs,
@@ -1484,7 +1793,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
               }).catch(() => {})
             }
           } else if (joined.outcome !== 'failed') {
-            await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+            await recordConfiguredDiagnostic(env, configId, {
               event: 'translation-pending',
               status: joined.jobStatus,
               waitMs: joinWaitMs,
@@ -1514,7 +1823,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
         })
 
         if (queued) {
-          await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+          await recordConfiguredDiagnostic(env, configId, {
             event: 'player-translation-queued',
             status: 'queued'
           }).catch(() => {})
@@ -1523,8 +1832,10 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
             env,
             cache,
             cacheKey,
-            maxWaitMs: playerQueueWaitMaxMs(env),
-            graceMs: playerQueueGraceMs(env)
+            maxWaitMs: playerQueueWaitMaxMs(env, tokenData.media?.type),
+            graceMs: playerQueueGraceMs(env),
+            playerAdaptivePolling: true,
+            mediaType: tokenData.media?.type
           })
 
           joinWaitMs = joined.waitMs
@@ -1537,7 +1848,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
 
           if (joined.vtt) {
             if (joinGraceHit) {
-              await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+              await recordConfiguredDiagnostic(env, configId, {
                 event: 'queue-grace-hit',
                 status: joined.jobStatus || 'queued',
                 waitMs: joinWaitMs,
@@ -1551,7 +1862,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
               translationStats: null
             }
           } else if (joined.outcome !== 'failed') {
-            await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+            await recordConfiguredDiagnostic(env, configId, {
               event: 'translation-pending',
               status: joined.jobStatus || 'queued',
               waitMs: joinWaitMs,
@@ -1577,6 +1888,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
           })
         }
       }
+      env.__kvUsageTracker?.setCacheResult(result.status)
       const totalMs = roundMs(nowMs() - startedAt)
       logPerf({
         milestone: 'M20R2',
@@ -1588,7 +1900,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
       })
 
       const repair = result.translationStats || {}
-      await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+      await recordConfiguredDiagnostic(env, configId, {
         event: 'translation-delivered',
         cache: result.status,
         totalMs,
@@ -1629,7 +1941,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
         message: safeMessage(error, userConfig.apiKey)
       }))
       const classified = classifyTranslationError(error)
-      await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+      await recordConfiguredDiagnostic(env, configId, {
         event: 'translation-failed',
         status: classified.code,
         error: safeMessage(error, userConfig.apiKey),
@@ -1658,7 +1970,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
         return rateLimitedResponse('subtitle')
       }
 
-      await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+      await recordConfiguredDiagnostic(env, configId, {
         event: 'subtitle-request',
         type: args.type,
         id: args.id
@@ -1670,10 +1982,8 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
         englishTrackLimit: 5,
         publicBaseUrl: configuredBase(request, token),
         tokenSecret: secret,
-        subsourceApiKey: userConfig.subsourceApiKey,
-        subsourceKv: env.SMARTSUBS_CACHE,
-        subsourceTimeoutMs: 2500,
-        onDiagnostic: event => recordDiagnostic(env.SMARTSUBS_CACHE, configId, event)
+        media: { type: args.type, id: args.id },
+        onDiagnostic: event => recordConfiguredDiagnostic(env, configId, event)
       })
 
       const autoUrl = result?.subtitles?.find(item =>
@@ -1681,7 +1991,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
       )?.url
 
       if (autoUrl && result?.autoPrefetch === false) {
-        await recordDiagnostic(env.SMARTSUBS_CACHE, configId, {
+        await recordConfiguredDiagnostic(env, configId, {
           event: 'auto-prefetch-skipped',
           status: 'quota-protected',
           reason: result.autoPrefetchReason || 'user-selection-required'
@@ -1744,8 +2054,6 @@ async function handleRequest(request, env, executionCtx = null) {
       rateLimitConfigured: Boolean(env.SMARTSUBS_SUBTITLE_LIMITER && env.SMARTSUBS_GENERATE_LIMITER),
       publicReady: publicReady(env),
       finalRelease: true,
-      subsourceDiscovery: true,
-      subsourceFusion: true,
       model: geminiModel(env),
       cache: cache.stats()
     }, 200, { noStore: true, headers: { 'x-smartsubs-build': BUILD_ID } })
@@ -1768,21 +2076,15 @@ async function handleRequest(request, env, executionCtx = null) {
 
   if (request.method === 'POST' && url.pathname === '/configure') {
     let apiKey = ''
-    let subsourceApiKey = ''
     try {
       const secret = serverSecret(env)
       if (!secret) throw new Error('Server secret is not configured')
       const form = await readConfigureForm(request)
       apiKey = String(form.geminiApiKey || '').trim()
-      subsourceApiKey = String(form.subsourceApiKey || '').trim()
       await validateGeminiApiKey(apiKey, { model: geminiModel(env) })
-      const subsourceValidation = subsourceApiKey
-        ? await validateSubsourceApiKey(subsourceApiKey)
-        : { configured: false, status: 'not-configured' }
       const token = createUserConfigToken(apiKey, {
         secret,
-        model: geminiModel(env),
-        subsourceApiKey
+        model: geminiModel(env)
       })
       const urls = buildConfiguredUrls(requestBase(request), token)
       logPerf({
@@ -1797,18 +2099,16 @@ async function handleRequest(request, env, executionCtx = null) {
         manifestUrl: urls.manifestUrl,
         diagnoseUrl: `${urls.configuredBaseUrl}/diagnose`,
         installUrl: urls.installUrl,
-        subsourceConfigured: subsourceValidation.configured,
-        subsourceStatus: subsourceValidation.status
       }), { noStore: true, csp: true })
     } catch (error) {
       console.error(JSON.stringify({
         tag: 'SMARTSUBS_CONFIG_ERROR',
-        message: safeMessage(error, apiKey, subsourceApiKey)
+        message: safeMessage(error, apiKey)
       }))
       return send(400, 'text/html; charset=utf-8', renderConfigurePage({
         secretReady: Boolean(serverSecret(env)),
         model: geminiModel(env),
-        error: safeMessage(error, apiKey, subsourceApiKey)
+        error: safeMessage(error, apiKey)
       }), { noStore: true, csp: true })
     }
   }
@@ -1842,19 +2142,31 @@ async function handleRequest(request, env, executionCtx = null) {
 
 export default {
   async fetch(request, env, executionCtx) {
+    const url = new URL(request.url)
+    const configured = url.pathname.match(/^\/c\/[^/]+(\/.*)$/)
+    const args = configured ? parseSubtitleArgs(configured[1]) : null
+    const phase = args ? 'subtitle-list' : configured?.[1].startsWith('/translated/') ? 'player-translation' : 'other'
+    const tracker = createKvUsageTracker({ phase, media: args && { type: args.type, id: args.id } })
+    const messageEnv = trackedEnvironment(env, tracker)
     try {
-      return await handleRequest(request, env, executionCtx)
+      return await handleRequest(request, messageEnv, executionCtx)
     } catch (error) {
       console.error(JSON.stringify({
         tag: 'SMARTSUBS_CF_FATAL',
         message: safeMessage(error, '')
       }))
       return send(500, 'text/plain; charset=utf-8', 'SmartSubs internal error', { noStore: true })
+    } finally {
+      tracker.flush()
+      // A monitor failure must never prevent subtitles from being delivered.
+      // waitUntil avoids delaying the player's subtitle request.
+      if (executionCtx?.waitUntil) executionCtx.waitUntil(publishKvUsage(env, tracker).catch(() => {}))
+      else await publishKvUsage(env, tracker).catch(() => {})
     }
   },
   async queue(batch, env) {
-    await handleQueue(batch, env)
+    await handleQueue(batch, env, { trackUsage: true })
   }
 }
 
-export { BUILD_ID, handleRequest, parseSubtitleArgs, safeMessage, classifyTranslationError, renderConfiguredDiagnosePage, prefetchTranslation, parseAutoTranslationToken, enqueuePrefetchTranslation, processQueueMessage, handleQueue, normaliseRequestedQueueProfile, queueTranslationProfile, queueTranslationOptions, translationCacheKey, readQueueJobState, writeQueueJobState, queueJobActive, waitForQueueCache, queueFailureStage, queueFinalEnabled, rateLimitAllowed, rateLimitedResponse, publicReady, shouldPrefetchAutoResult, playerQueueWaitMaxMs, playerQueueGraceMs, deliveryRelayTtlMs, readDeliveryRelay, writeDeliveryRelay, readReadyTranslation, translationPreparingResponse }
+export { BUILD_ID, handleRequest, parseSubtitleArgs, safeMessage, translationRequestProbe, classifyTranslationError, renderConfiguredDiagnosePage, prefetchTranslation, parseAutoTranslationToken, enqueuePrefetchTranslation, processQueueMessage, handleQueue, normaliseRequestedQueueProfile, queueTranslationProfile, queueTranslationOptions, translationCacheKey, readQueueJobState, writeQueueJobState, queueJobActive, waitForQueueCache, queueFailureStage, queueRetryPolicy, normaliseQueueRetryMode, queueFinalEnabled, rateLimitAllowed, rateLimitedResponse, publicReady, shouldPrefetchAutoResult, playerQueueWaitMaxMs, playerQueueGraceMs, playerQueuePollEarlyMs, playerQueuePollFastStartMs, playerQueuePollLateStartMs, playerQueuePollLateMs, playerMoviePollStepMs, playerMoviePollFastStartMs, playerMoviePollLateMs, playerMovieQueuePollPlan, playerQueuePollPlan, movieAdaptiveTargetChunks, movieAdaptiveChunkItemsMin, movieAdaptiveChunkItemsMax, deliveryRelayTtlMs, readDeliveryRelay, writeDeliveryRelay, readReadyTranslation, translationPreparingResponse }

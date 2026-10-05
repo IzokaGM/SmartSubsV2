@@ -1,6 +1,6 @@
-# SmartSubs recreation starting point
+# SmartSubsV2 recreation starting point
 
-This is the clean source package for the recreated SmartSubs `final-stable-m20r3` line.
+This is the clean source package for the recreated SmartSubsV2 `final-stable-m20r3` line.
 
 ## Deliberate safety change
 
@@ -16,13 +16,13 @@ It only checks syntax and runs the recovered regression tests. It does not:
 - commit or push changes
 - run background jobs
 
-SmartSubs runtime work belongs in Cloudflare, not GitHub Actions.
+SmartSubsV2 runtime work belongs in Cloudflare, not GitHub Actions.
 
 ## Recovered runtime architecture
 
-Stremio -> SmartSubs Cloudflare Worker -> OpenSubtitles v3 -> existing Malay or ranked English -> Gemini BYOK -> Malay WebVTT -> Cloudflare KV
+Stremio -> SmartSubsV2 Cloudflare Worker -> OpenSubtitles v3 -> existing Malay or ranked English -> Gemini BYOK -> Malay WebVTT -> Cloudflare KV
 
-The final recovered line can also use Cloudflare Queue for background pretranslation and Queue Join.
+The completed parity line also uses Cloudflare Queue for background pretranslation, Queue Join, a final grace check, and a Delivery Relay for reliable player delivery. It returns ranked native Malay, Malay Auto when appropriate, and built-in English tracks.
 
 ## Stage 1 validation
 
@@ -33,19 +33,20 @@ npm run check
 npm test
 ```
 
-Expected recovered regression result: 67 tests passed, 0 failed.
+Expected parity regression result: 120 tests passed, 0 failed.
 
 ## Stage 2
 
-After this source is uploaded to a fresh GitHub repository, configure the Cloudflare runtime bindings and secret. Do not put Gemini user keys in GitHub Secrets. SmartSubs is BYOK and stores a configured key inside an encrypted addon configuration token.
+After this source is uploaded to a fresh GitHub repository, configure the Cloudflare runtime bindings and secret. Do not put Gemini user keys in GitHub Secrets. SmartSubsV2 is BYOK and stores a configured key inside an encrypted addon configuration token.
 
 Required Cloudflare runtime pieces for the final recovered profile:
 
 - `SMARTSUBS_SECRET` secret
 - `SMARTSUBS_CACHE` KV binding
 - `SMARTSUBS_TRANSLATION_QUEUE` Queue producer binding
-- queue `smartsubs-translation`
+- queue `smartsubsv2-translation`
 - `SMARTSUBS_SUBTITLE_LIMITER` rate limiter
 - `SMARTSUBS_GENERATE_LIMITER` rate limiter
+- `SMARTSUBS_DELIVERY` Durable Object binding
 
 The account-specific IDs in `wrangler.jsonc` must be replaced or configured in Cloudflare before live deployment.

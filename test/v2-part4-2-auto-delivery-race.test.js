@@ -4,18 +4,18 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 
-test('Part 4.2 deployed player grace is 600ms while main wait stays 9000ms', async () => {
+test('Part 4.2 deployed player grace is 600ms while main wait is 30000ms', async () => {
   const {
     playerQueueWaitMaxMs,
     playerQueueGraceMs
   } = await import('../src/cloudflare-worker.mjs')
   const config = JSON.parse(fs.readFileSync('wrangler.jsonc', 'utf8'))
 
-  assert.equal(config.vars.PLAYER_QUEUE_WAIT_MAX_MS, '9000')
+  assert.equal(config.vars.PLAYER_QUEUE_WAIT_MAX_MS, '30000')
   assert.equal(config.vars.PLAYER_QUEUE_GRACE_MS, '600')
-  assert.equal(playerQueueWaitMaxMs(config.vars), 9000)
+  assert.equal(playerQueueWaitMaxMs(config.vars), 30000)
   assert.equal(playerQueueGraceMs(config.vars), 600)
-  assert.ok(playerQueueWaitMaxMs(config.vars) + playerQueueGraceMs(config.vars) < 10000)
+  assert.equal(playerQueueWaitMaxMs(config.vars) + playerQueueGraceMs(config.vars), 30600)
 })
 
 test('Part 4.2 grace check catches cache that becomes ready just after main wait', async () => {
@@ -116,7 +116,7 @@ test('Part 4.2 both player Queue wait paths use the grace window', () => {
 test('Part 4.2 does not change stable translation concurrency', () => {
   const config = JSON.parse(fs.readFileSync('wrangler.jsonc', 'utf8'))
 
-  assert.equal(config.vars.QUEUE_USER_SELECTED_CONCURRENCY, '3')
-  assert.equal(config.vars.QUEUE_FINAL_CONCURRENCY, '3')
+  assert.equal(config.vars.QUEUE_USER_SELECTED_CONCURRENCY, '5')
+  assert.equal(config.vars.QUEUE_FINAL_CONCURRENCY, '5')
 })
 

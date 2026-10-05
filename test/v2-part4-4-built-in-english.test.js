@@ -14,7 +14,7 @@ function responseFor(subtitles) {
   })
 }
 
-test('Part 4.4 exposes up to five ranked and deduplicated English tracks', () => {
+test('Part 4.4 exposes up to five upstream-order and deduplicated English tracks', () => {
   const upstream = [
     { id: 'wrong', lang: 'eng', url: 'https://example.test/Show.720p.HDTV-WRONG.srt' },
     { id: 'best', lang: 'eng', url: 'https://example.test/Show.1080p.WEB-DL.x265-GROUP.srt' },
@@ -30,7 +30,7 @@ test('Part 4.4 exposes up to five ranked and deduplicated English tracks', () =>
   })
 
   assert.equal(tracks.length, 5)
-  assert.equal(tracks[0].id, 'smartsubs-eng-best')
+  assert.equal(tracks[0].id, 'smartsubs-eng-wrong')
   assert.deepEqual(new Set(tracks.map(item => item.url)).size, 5)
   assert.deepEqual(new Set(tracks.map(item => item.lang)), new Set(['eng']))
 })
@@ -42,7 +42,7 @@ test('Part 4.4 returns Malay Auto first and ranked English alternatives after it
     extra: {}
   }, {
     apiKey: 'test-key',
-    publicBaseUrl: 'https://smartsubsv2.example/c/test',
+    publicBaseUrl: 'https://smartsubs.example/c/test',
     tokenSecret: 'test-secret',
     includeEnglishTracks: true,
     fetchImpl: responseFor([
@@ -53,7 +53,7 @@ test('Part 4.4 returns Malay Auto first and ranked English alternatives after it
 
   assert.equal(result.subtitles.length, 3)
   assert.equal(result.subtitles[0].lang, 'msa')
-  assert.match(result.subtitles[0].id, /^smartsubs-auto-/)
+  assert.match(result.subtitles[0].id, /^gemini-ai-/)
   assert.deepEqual(result.subtitles.slice(1).map(item => item.lang), ['eng', 'eng'])
   assert.deepEqual(result.subtitles.slice(1).map(item => item.id), [
     'smartsubs-eng-eng-one',
@@ -69,7 +69,7 @@ test('Part 4.4 keeps weak-native quota protection and adds English after Malay c
     extra: { filename: 'Ted Lasso Season 1 (2020) S01E05-onetouchtv' }
   }, {
     apiKey: 'test-key',
-    publicBaseUrl: 'https://smartsubsv2.example/c/test',
+    publicBaseUrl: 'https://smartsubs.example/c/test',
     tokenSecret: 'test-secret',
     includeEnglishTracks: true,
     fetchImpl: responseFor([
@@ -81,7 +81,7 @@ test('Part 4.4 keeps weak-native quota protection and adds English after Malay c
   assert.deepEqual(result.subtitles.map(item => item.lang), ['msa', 'msa', 'eng'])
   assert.equal(result.subtitles[2].id, 'smartsubs-eng-english-weak')
   assert.equal(result.autoPrefetch, false)
-  assert.equal(result.autoPrefetchReason, 'weak-native-wait-for-user-selection')
+  assert.equal(result.autoPrefetchReason, 'native-malay-user-selection')
 })
 
 test('Part 4.4 can still return English when Malay Auto is unavailable', async () => {

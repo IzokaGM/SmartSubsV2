@@ -8,9 +8,9 @@ const { deriveVerdict } = require('../src/diagnostics')
 test('Part 3.1 uses a short bounded player Queue wait', async () => {
   const { playerQueueWaitMaxMs } = await import('../src/cloudflare-worker.mjs')
 
-  assert.equal(playerQueueWaitMaxMs({}), 5000)
+  assert.equal(playerQueueWaitMaxMs({}), 30000)
   assert.equal(playerQueueWaitMaxMs({ PLAYER_QUEUE_WAIT_MAX_MS: 100 }), 2000)
-  assert.equal(playerQueueWaitMaxMs({ PLAYER_QUEUE_WAIT_MAX_MS: 60000 }), 10000)
+  assert.equal(playerQueueWaitMaxMs({ PLAYER_QUEUE_WAIT_MAX_MS: 60000 }), 30000)
 })
 
 test('Part 3.1 returns a retryable preparing response instead of hanging', async () => {
@@ -46,7 +46,7 @@ test('Part 3.1 existing Queue joins also use the short player wait', () => {
 
   assert.match(
     source,
-    /initialJob: job,\s*maxWaitMs: playerQueueWaitMaxMs\(env\)/
+    /initialJob: job,\s*maxWaitMs: playerQueueWaitMaxMs\(env, tokenData\.media\?\.type\)/
   )
 })
 

@@ -217,7 +217,7 @@ test('M20 Wrangler final config is quota-safe and public-ready', () => {
 
   assert.equal(config.vars.QUEUE_FINAL_CHUNK_ITEMS, '160')
   assert.equal(config.vars.QUEUE_FINAL_CHUNK_CHARS, '20000')
-  assert.equal(config.vars.QUEUE_FINAL_CONCURRENCY, '3')
+  assert.equal(config.vars.QUEUE_FINAL_CONCURRENCY, '5')
 
   assert.equal(config.vars.QUEUE_PARALLEL_CHUNK_ITEMS, '160')
   assert.equal(config.vars.QUEUE_PARALLEL_CHUNK_CHARS, '20000')

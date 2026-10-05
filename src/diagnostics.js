@@ -23,33 +23,33 @@ function sanitiseEvent(event = {}) {
     'englishConfidence', 'englishConfidenceReason', 'englishScoreUplift',
     'sourceFilenameProvided', 'sourceVideoHashProvided', 'sourceVideoSizeProvided',
     'sourceFilename', 'requestExtraKeys', 'englishCandidateCount', 'englishSelectedId',
-    'englishSelectedScore', 'englishSelectionStable', 'englishTop',
+    'englishSelectedScore', 'englishSelectionStable', 'englishTop', 'englishSourceIds',
     'expected', 'received', 'missing', 'retryRecovered', 'fallbackCount', 'final',
     'semanticRetriesUsed', 'chunks', 'geminiCalls', 'rateLimits', 'transientRetries',
-    'retryWaitMs', 'chunkItems', 'chunkChars', 'concurrency', 'attempts', 'waitMs', 'polls', 'joinStatus', 'reason', 'profile', 'delivery',
+    'retryWaitMs', 'chunkItems', 'chunkChars', 'concurrency', 'attempts', 'waitMs', 'polls', 'joinStatus', 'reason', 'profile', 'retryMode', 'retryPolicy', 'delivery',
     'queueDelayMs', 'sourceFetchMs', 'parseMs', 'sourceBytes', 'cueCount', 'pipelineMs',
     'translationWallMs', 'chunkTimeline', 'maxChunkMs', 'avgChunkMs', 'sumChunkMs',
-    'geminiCallMs', 'geminiStatuses', 'geminiPromptChars', 'failureStage',
+    'geminiCallMs', 'geminiStatuses', 'geminiPromptChars',
+    'geminiFinishReasons', 'geminiInputTokens', 'geminiOutputTokens', 'geminiTotalTokens',
+    'geminiInputTokensTotal', 'geminiOutputTokensTotal', 'geminiTotalTokensTotal',
+    'sdhRemoved', 'failureStage',
     'retryDelaySeconds', 'nextAttempt', 'abortRetries',
-    'subsourceConfigured', 'subsourceStatus', 'subsourceHttpStatus', 'subsourceLatencyMs',
-    'subsourceLimit', 'subsourceRemaining', 'subsourceRateHeaderNames',
-    'subsourceLimitMinute', 'subsourceRemainingMinute', 'subsourceLimitHour',
-    'subsourceRemainingHour', 'subsourceLimitDay', 'subsourceRemainingDay',
-    'subsourceReset', 'subsourceResponseRootType', 'subsourceResponseTopKeys',
-    'subsourceResponseItemKeys', 'subsourceProbeCacheAgeMs', 'subsourceProbeVersion',
-    'openSubtitlesCount', 'openSubtitlesStatus', 'subsourceEligible', 'subsourceEligibilityReason',
-    'subsourceTriggered', 'subsourceCandidateCount',
-    'subsourceCache', 'subsourceAcceptedCount', 'subsourceRejectedCount', 'fallback'
+    'hedgeStarts', 'hedgeReplicaWins', 'hedgeCancels',
+    'mediaType', 'movieAdaptiveChunking', 'movieTargetChunks',
+    'movieChunkItemsMin', 'movieChunkItemsMax'
   ]
+  const fullGeminiArrays = new Set([
+    'geminiCallMs', 'geminiStatuses', 'geminiPromptChars',
+    'geminiFinishReasons', 'geminiInputTokens', 'geminiOutputTokens', 'geminiTotalTokens'
+  ])
   for (const key of allowed) {
     const value = event[key]
     if (value === undefined) continue
     if (typeof value === 'boolean' || typeof value === 'number') output[key] = value
     else if (Array.isArray(value)) {
-      const limit = key.startsWith('subsource') ? 24 : 8
-      output[key] = value.slice(0, limit).map(item => safeText(item, 32))
-    }
-    else output[key] = safeText(value)
+      const items = fullGeminiArrays.has(key) ? value : value.slice(0, 8)
+      output[key] = items.map(item => safeText(item, 32))
+    } else output[key] = safeText(value)
   }
   return output
 }

@@ -16,9 +16,11 @@ function sign(payloadB64, secret) {
   return crypto.createHmac('sha256', key(secret)).update(payloadB64).digest('base64url')
 }
 
-function createTranslationToken(url, secret, sourceId = '') {
+function createTranslationToken(url, secret, sourceId = '', media = null) {
   if (!url) throw new Error('Subtitle URL is required')
-  const payload = b64url(JSON.stringify({ v: 1, u: String(url), i: String(sourceId || '') }))
+  const info = media && ['movie', 'series'].includes(media.type) && /^[\w:.-]{1,128}$/.test(String(media.id || ''))
+    ? { t: media.type, i: String(media.id) } : null
+  const payload = b64url(JSON.stringify({ v: 1, u: String(url), i: String(sourceId || ''), ...(info ? { m: info } : {}) }))
   return `${payload}.${sign(payload, secret)}`
 }
 
@@ -35,7 +37,9 @@ function decodeTranslationTokenData(token, secret) {
   if (!value || value.v !== 1 || typeof value.u !== 'string' || !/^https?:\/\//i.test(value.u)) {
     throw new Error('Invalid translation token')
   }
-  return { url: value.u, sourceId: String(value.i || ''), cacheId: String(value.i || value.u) }
+  const media = value.m && ['movie', 'series'].includes(value.m.t) && /^[\w:.-]{1,128}$/.test(String(value.m.i || ''))
+    ? { type: value.m.t, id: String(value.m.i) } : null
+  return { url: value.u, sourceId: String(value.i || ''), cacheId: String(value.i || value.u), media }
 }
 
 function decodeTranslationToken(token, secret) {

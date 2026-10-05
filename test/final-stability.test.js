@@ -127,7 +127,7 @@ test('FINAL R2 keeps public hardening and Queue serialization', () => {
 
   assert.equal(config.vars.QUEUE_FINAL_CHUNK_ITEMS, '160')
   assert.equal(config.vars.QUEUE_FINAL_CHUNK_CHARS, '20000')
-  assert.equal(config.vars.QUEUE_FINAL_CONCURRENCY, '3')
+  assert.equal(config.vars.QUEUE_FINAL_CONCURRENCY, '5')
   assert.equal(config.queues.consumers[0].max_concurrency, 1)
   assert.equal(config.ratelimits[0].name, 'SMARTSUBS_SUBTITLE_LIMITER')
   assert.equal(config.ratelimits[1].name, 'SMARTSUBS_GENERATE_LIMITER')
