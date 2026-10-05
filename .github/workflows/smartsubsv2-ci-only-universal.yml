@@ -1,6 +1,5 @@
 name: SmartSubsV2 CI
 
-# Only run after universal unzip passes, or via the Run workflow button.
 on:
   workflow_dispatch:
   workflow_run:
@@ -28,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Checkout updated main (not the original ZIP upload commit)
+      - name: Checkout updated main
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'workflow_run' && 'main' || github.ref }}
@@ -49,13 +48,18 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '24'
-          package-manager-cache: false
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
 
       - name: Verify repository
         run: |
           test -f package.json
           test -f src/cloudflare-worker.mjs
           test -f wrangler.jsonc
+          test ! -f src/subsource.js
+          test ! -f src/subsource-archive.js
 
       - name: Check syntax
         run: npm run check

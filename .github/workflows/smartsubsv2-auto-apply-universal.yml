@@ -1,6 +1,5 @@
 name: SmartSubsV2 - Auto Apply ZIP
 
-# SmartSubsV2 CI is configured to follow this exact workflow name.
 on:
   push:
     branches: [main]
@@ -24,14 +23,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: true
+          fetch-depth: 0
 
-      - name: Validate and extract all patch ZIPs in repo root
+      - name: Validate and stage patch ZIPs
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import json
           import stat
+          import subprocess
           from pathlib import Path, PurePosixPath
           from zipfile import ZipFile, BadZipFile
 
@@ -40,20 +41,36 @@ jobs:
           if not archives:
               raise SystemExit('No root-level patch ZIP found. Upload a .zip to repository root first.')
 
-          # Reject unsafe paths and oversized or ambiguous archives before writing any file.
           targets = {}
+          archive_entries = {}
+          full_snapshot = False
           total_size = 0
           total_files = 0
-          for archive_path in archives:
+
+          def normalized_entries(archive_path):
               try:
                   archive = ZipFile(archive_path)
-                  bad_member = archive.testzip()  # Check CRCs before replacing any repository files.
+                  bad_member = archive.testzip()
                   if bad_member is not None:
                       raise SystemExit(f'ZIP CRC error in {archive_path.name}: {bad_member}')
               except BadZipFile as exc:
                   raise SystemExit(f'Invalid ZIP {archive_path.name}: {exc}')
+
               with archive:
-                  for item in archive.infolist():
+                  files = [i for i in archive.infolist() if not i.is_dir()]
+                  raw_names = [i.filename for i in files]
+                  strip_prefix = None
+                  split_names = [n.rstrip('/').split('/') for n in raw_names]
+                  if split_names and all(len(parts) > 1 for parts in split_names):
+                      first = split_names[0][0]
+                      if all(parts[0] == first for parts in split_names):
+                          package_at_prefix = f'{first}/package.json' in raw_names
+                          marker_at_prefix = f'{first}/.smartsubsv2-full-snapshot' in raw_names
+                          if package_at_prefix or marker_at_prefix:
+                              strip_prefix = first
+
+                  result = []
+                  for item in files:
                       name = item.filename
                       raw = name.rstrip('/')
                       parts = raw.split('/')
@@ -62,61 +79,110 @@ jobs:
                               or any(ord(c) < 32 for c in name)
                               or ':' in parts[0]):
                           raise SystemExit(f'Unsafe entry in {archive_path.name}: {name!r}')
+
+                      if strip_prefix:
+                          parts = parts[1:]
+                          if not parts:
+                              continue
                       rel = PurePosixPath(*parts)
+
                       if (parts[0] in ('.git', '.github')
                               or any(p == '.git' for p in parts)
                               or any(p.startswith('.env') for p in parts)
-                              or name.lower().endswith('.zip')):
-                          raise SystemExit(f'Protected path in {archive_path.name}: {name}')
+                              or str(rel).lower().endswith('.zip')):
+                          raise SystemExit(f'Protected path in {archive_path.name}: {rel}')
+
                       mode = item.external_attr >> 16
                       if stat.S_ISLNK(mode) or (mode and stat.S_IFMT(mode) not in (0, stat.S_IFREG, stat.S_IFDIR)):
-                          raise SystemExit(f'Unsupported special file: {name}')
+                          raise SystemExit(f'Unsupported special file: {rel}')
                       if item.flag_bits & 1:
-                          raise SystemExit(f'Encrypted entry not supported: {name}')
-                      if item.is_dir():
-                          continue
+                          raise SystemExit(f'Encrypted entry not supported: {rel}')
                       if item.file_size > 10 * 1024 * 1024:
-                          raise SystemExit(f'Patch file too large: {name}')
-                      total_files += 1
-                      total_size += item.file_size
-                      if total_files > 500 or total_size > 50 * 1024 * 1024:
-                          raise SystemExit('Patch limit exceeded (500 files / 50 MiB extracted)')
-                      key = str(rel).casefold()
-                      if key in targets:
-                          raise SystemExit(f'Overlapping ZIP entries: {targets[key][1]} and {name}')
-                      dest = root.joinpath(*rel.parts)
-                      if dest.is_symlink() or any(p.is_symlink() for p in dest.parents if p != root.parent):
-                          raise SystemExit(f'Refusing symlink destination: {name}')
-                      if dest.exists() and not dest.is_file():
-                          raise SystemExit(f'Cannot replace non-file path: {name}')
-                      targets[key] = (archive_path.name, str(rel))
+                          raise SystemExit(f'Patch file too large: {rel}')
+                      result.append((item, rel))
+                  return result, strip_prefix
+
+          for archive_path in archives:
+              entries, strip_prefix = normalized_entries(archive_path)
+              archive_entries[archive_path.name] = entries
+              if strip_prefix:
+                  print(f'Normalizing top-level folder {strip_prefix}/ from {archive_path.name}')
+
+              for item, rel in entries:
+                  if str(rel) == '.smartsubsv2-full-snapshot':
+                      full_snapshot = True
+                      continue
+
+                  total_files += 1
+                  total_size += item.file_size
+                  if total_files > 500 or total_size > 50 * 1024 * 1024:
+                      raise SystemExit('Patch limit exceeded (500 files / 50 MiB extracted)')
+
+                  key = str(rel).casefold()
+                  if key in targets:
+                      raise SystemExit(f'Overlapping ZIP entries: {targets[key][1]} and {rel}')
+
+                  dest = root.joinpath(*rel.parts)
+                  if dest.is_symlink() or any(p.is_symlink() for p in dest.parents if p != root.parent):
+                      raise SystemExit(f'Refusing symlink destination: {rel}')
+                  if dest.exists() and not dest.is_file():
+                      raise SystemExit(f'Cannot replace non-file path: {rel}')
+                  targets[key] = (archive_path.name, str(rel))
 
           if not targets:
               raise SystemExit('No files found inside patch ZIP(s).')
+          if full_snapshot and len(archives) != 1:
+              raise SystemExit('A full-snapshot ZIP must be applied by itself.')
 
-          # Extract after validation; a test failure leaves the GitHub repo unchanged.
+          deleted = []
+          if full_snapshot:
+              desired = {record[1] for record in targets.values()}
+              tracked_raw = subprocess.check_output(['git', 'ls-files', '-z'])
+              tracked = [p.decode() for p in tracked_raw.split(b'\0') if p]
+              zip_names = {p.name for p in archives}
+              for path_str in tracked:
+                  path = PurePosixPath(path_str)
+                  if not path.parts:
+                      continue
+                  if path.parts[0] in ('.git', '.github'):
+                      continue
+                  if path_str in zip_names:
+                      continue
+                  if path_str not in desired:
+                      target = root.joinpath(*path.parts)
+                      if target.is_file() or target.is_symlink():
+                          target.unlink()
+                          deleted.append(path_str)
+                          print(f'Removed stale file: {path_str}')
+              print(f'Full snapshot mode: {len(deleted)} stale tracked file(s) removed before testing.')
+
           for archive_path in archives:
               with ZipFile(archive_path) as archive:
-                  for item in archive.infolist():
-                      if item.is_dir():
+                  for item, rel in archive_entries[archive_path.name]:
+                      if str(rel) == '.smartsubsv2-full-snapshot':
                           continue
-                      target = root.joinpath(*PurePosixPath(item.filename).parts)
+                      target = root.joinpath(*rel.parts)
                       target.parent.mkdir(parents=True, exist_ok=True)
                       target.write_bytes(archive.read(item))
-                      print(f'Applied {archive_path.name}: {item.filename}')
+                      print(f'Applied {archive_path.name}: {rel}')
 
           Path('.smartsubsv2-applied-paths.json').write_text(json.dumps({
               'files': [record[1] for record in targets.values()],
+              'deleted': deleted,
               'zips': [p.name for p in archives],
+              'fullSnapshot': full_snapshot,
           }), encoding='utf-8')
-          print(f'Ready for tests: {len(targets)} files from {len(archives)} ZIP(s).')
+          print(f'Ready for tests: {len(targets)} files from {len(archives)} ZIP(s); fullSnapshot={full_snapshot}.')
           PY
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '24'
-          package-manager-cache: false
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
 
       - name: Check syntax
         run: npm run check
@@ -124,7 +190,7 @@ jobs:
       - name: Run regression tests
         run: npm test
 
-      - name: Commit extracted files and delete ZIPs only after successful tests
+      - name: Commit tested files and remove ZIPs
         shell: bash
         run: |
           set -euo pipefail
@@ -133,11 +199,23 @@ jobs:
           import subprocess
           from pathlib import Path
 
-          manifest = json.loads(Path('.smartsubsv2-applied-paths.json').read_text(encoding='utf-8'))
+          manifest_path = Path('.smartsubsv2-applied-paths.json')
+          manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+
           subprocess.run(['git', 'config', 'user.name', 'github-actions[bot]'], check=True)
           subprocess.run(['git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'], check=True)
-          subprocess.run(['git', 'add', '--', *manifest['files']], check=True)
-          subprocess.run(['git', 'rm', '--', *manifest['zips']], check=True)
-          subprocess.run(['git', 'commit', '-m', 'Apply SmartSubsV2 patch ZIP(s) after passing checks'], check=True)
-          subprocess.run(['git', 'push', 'origin', 'HEAD:main'], check=True)
+
+          for zip_name in manifest['zips']:
+              p = Path(zip_name)
+              if p.exists():
+                  p.unlink()
+          manifest_path.unlink(missing_ok=True)
+
+          subprocess.run(['git', 'add', '-A'], check=True)
+          if subprocess.run(['git', 'diff', '--cached', '--quiet']).returncode == 0:
+              print('No repository changes to commit.')
+          else:
+              mode = 'full snapshot' if manifest.get('fullSnapshot') else 'patch'
+              subprocess.run(['git', 'commit', '-m', f'Apply SmartSubsV2 {mode} after passing checks'], check=True)
+              subprocess.run(['git', 'push', 'origin', 'HEAD:main'], check=True)
           PY
