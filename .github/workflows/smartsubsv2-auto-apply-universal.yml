@@ -1,0 +1,143 @@
+name: SmartSubsV2 - Auto Apply ZIP
+
+# SmartSubsV2 CI is configured to follow this exact workflow name.
+on:
+  push:
+    branches: [main]
+    paths:
+      - '*.zip'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smartsubsv2-universal-zip-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  apply-test-and-cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Validate and extract all patch ZIPs in repo root
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import stat
+          from pathlib import Path, PurePosixPath
+          from zipfile import ZipFile, BadZipFile
+
+          root = Path.cwd()
+          archives = sorted(p for p in root.glob('*.zip') if p.is_file())
+          if not archives:
+              raise SystemExit('No root-level patch ZIP found. Upload a .zip to repository root first.')
+
+          # Reject unsafe paths and oversized or ambiguous archives before writing any file.
+          targets = {}
+          total_size = 0
+          total_files = 0
+          for archive_path in archives:
+              try:
+                  archive = ZipFile(archive_path)
+                  bad_member = archive.testzip()  # Check CRCs before replacing any repository files.
+                  if bad_member is not None:
+                      raise SystemExit(f'ZIP CRC error in {archive_path.name}: {bad_member}')
+              except BadZipFile as exc:
+                  raise SystemExit(f'Invalid ZIP {archive_path.name}: {exc}')
+              with archive:
+                  for item in archive.infolist():
+                      name = item.filename
+                      raw = name.rstrip('/')
+                      parts = raw.split('/')
+                      if (not raw or name.startswith('/') or '\\' in name
+                              or any(p in ('', '.', '..') for p in parts)
+                              or any(ord(c) < 32 for c in name)
+                              or ':' in parts[0]):
+                          raise SystemExit(f'Unsafe entry in {archive_path.name}: {name!r}')
+                      rel = PurePosixPath(*parts)
+                      if (parts[0] in ('.git', '.github')
+                              or any(p == '.git' for p in parts)
+                              or any(p.startswith('.env') for p in parts)
+                              or name.lower().endswith('.zip')):
+                          raise SystemExit(f'Protected path in {archive_path.name}: {name}')
+                      mode = item.external_attr >> 16
+                      if stat.S_ISLNK(mode) or (mode and stat.S_IFMT(mode) not in (0, stat.S_IFREG, stat.S_IFDIR)):
+                          raise SystemExit(f'Unsupported special file: {name}')
+                      if item.flag_bits & 1:
+                          raise SystemExit(f'Encrypted entry not supported: {name}')
+                      if item.is_dir():
+                          continue
+                      if item.file_size > 10 * 1024 * 1024:
+                          raise SystemExit(f'Patch file too large: {name}')
+                      total_files += 1
+                      total_size += item.file_size
+                      if total_files > 500 or total_size > 50 * 1024 * 1024:
+                          raise SystemExit('Patch limit exceeded (500 files / 50 MiB extracted)')
+                      key = str(rel).casefold()
+                      if key in targets:
+                          raise SystemExit(f'Overlapping ZIP entries: {targets[key][1]} and {name}')
+                      dest = root.joinpath(*rel.parts)
+                      if dest.is_symlink() or any(p.is_symlink() for p in dest.parents if p != root.parent):
+                          raise SystemExit(f'Refusing symlink destination: {name}')
+                      if dest.exists() and not dest.is_file():
+                          raise SystemExit(f'Cannot replace non-file path: {name}')
+                      targets[key] = (archive_path.name, str(rel))
+
+          if not targets:
+              raise SystemExit('No files found inside patch ZIP(s).')
+
+          # Extract after validation; a test failure leaves the GitHub repo unchanged.
+          for archive_path in archives:
+              with ZipFile(archive_path) as archive:
+                  for item in archive.infolist():
+                      if item.is_dir():
+                          continue
+                      target = root.joinpath(*PurePosixPath(item.filename).parts)
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      target.write_bytes(archive.read(item))
+                      print(f'Applied {archive_path.name}: {item.filename}')
+
+          Path('.smartsubsv2-applied-paths.json').write_text(json.dumps({
+              'files': [record[1] for record in targets.values()],
+              'zips': [p.name for p in archives],
+          }), encoding='utf-8')
+          print(f'Ready for tests: {len(targets)} files from {len(archives)} ZIP(s).')
+          PY
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Check syntax
+        run: npm run check
+
+      - name: Run regression tests
+        run: npm test
+
+      - name: Commit extracted files and delete ZIPs only after successful tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          manifest = json.loads(Path('.smartsubsv2-applied-paths.json').read_text(encoding='utf-8'))
+          subprocess.run(['git', 'config', 'user.name', 'github-actions[bot]'], check=True)
+          subprocess.run(['git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'], check=True)
+          subprocess.run(['git', 'add', '--', *manifest['files']], check=True)
+          subprocess.run(['git', 'rm', '--', *manifest['zips']], check=True)
+          subprocess.run(['git', 'commit', '-m', 'Apply SmartSubsV2 patch ZIP(s) after passing checks'], check=True)
+          subprocess.run(['git', 'push', 'origin', 'HEAD:main'], check=True)
+          PY

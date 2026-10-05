@@ -1,0 +1,64 @@
+name: SmartSubsV2 CI
+
+# Only run after universal unzip passes, or via the Run workflow button.
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows:
+      - SmartSubsV2 - Auto Apply ZIP
+    types:
+      - completed
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smartsubsv2-ci-${{ github.event_name == 'workflow_run' && 'main' || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout updated main (not the original ZIP upload commit)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && 'main' || github.ref }}
+
+      - name: Verify patch ZIPs were removed
+        if: github.event_name == 'workflow_run'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          patches=(./*.zip)
+          if (( ${#patches[@]} > 0 )); then
+            printf 'Unprocessed ZIP still in repository root: %s\n' "${patches[@]}" >&2
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Verify repository
+        run: |
+          test -f package.json
+          test -f src/cloudflare-worker.mjs
+          test -f wrangler.jsonc
+
+      - name: Check syntax
+        run: npm run check
+
+      - name: Run regression tests
+        run: npm test
