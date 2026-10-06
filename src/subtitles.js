@@ -65,10 +65,8 @@ function buildAutoSubtitles(englishSubtitles, options = {}) {
     .filter(Boolean)
 }
 
-function buildEnglishTracks(upstream, _extra = {}, limit = 5) {
-  const maxTracks = Math.max(1, Math.min(5, Number(limit) || 5))
+function buildEnglishTracks(upstream) {
   return dedupeSubtitles(getEnglishSubtitles(upstream))
-    .slice(0, maxTracks)
     .map((subtitle, index) => ({
       id: `smartsubs-eng-${diagnosticSubtitleId(subtitle, index)}`,
       url: String(subtitle.url),
@@ -91,7 +89,7 @@ async function handleSubtitles(args, options = {}) {
     const upstreamStartedAt = nowMs()
     const upstream = await fetchOpenSubtitles(args, options)
     const upstreamMs = roundMs(nowMs() - upstreamStartedAt)
-    const malay = dedupeSubtitles(getMalaySubtitles(upstream)).slice(0, 5).map(toNativeMalay)
+    const malay = dedupeSubtitles(getMalaySubtitles(upstream)).map(toNativeMalay)
     const englishCandidates = dedupeSubtitles(getEnglishSubtitles(upstream))
     const english = englishCandidates[0] || null
     const apiKey = options.apiKey || ''
@@ -100,7 +98,7 @@ async function handleSubtitles(args, options = {}) {
     // Translation starts only when the player requests the selected /translated/*.vtt URL.
     const aiTracks = apiKey ? buildAutoSubtitles(englishCandidates, options) : []
     const englishTracks = options.includeEnglishTracks
-      ? buildEnglishTracks(upstream, args.extra || {}, options.englishTrackLimit) : []
+      ? buildEnglishTracks(upstream) : []
 
     // Automatic prefetch is deliberately disabled in V2. With several AI candidates,
     // background translation would multiply Gemini usage before the user picks a source.

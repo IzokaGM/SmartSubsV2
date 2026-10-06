@@ -19,7 +19,7 @@ const { buildConfiguredUrls, validateGeminiApiKey, renderConfigurePage, escapeHt
 const { nowMs, roundMs, logPerf } = perfModule
 const { recordDiagnostic, readDiagnostics, deriveVerdict } = diagnosticsModule
 
-const BUILD_ID = 'v2-multicandidate-ondemand-1'
+const BUILD_ID = 'v2-multicandidate-ondemand-2'
 const caches = new WeakMap()
 // Per-request memoization only. No cross-request stale state when the owner switches OFF.
 const diagnosticStateByEnv = new WeakMap()
@@ -1981,7 +1981,6 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
         apiKey: userConfig.apiKey,
         model: userConfig.model,
         includeEnglishTracks: true,
-        englishTrackLimit: 5,
         publicBaseUrl: configuredBase(request, token),
         tokenSecret: secret,
         media: { type: args.type, id: args.id },

@@ -25,7 +25,6 @@ test('V2 exposes every eligible English candidate as a separate on-demand Malay 
     publicBaseUrl: 'https://smartsubsv2.example/c/test',
     tokenSecret: 'test-secret',
     includeEnglishTracks: true,
-    englishTrackLimit: 5,
     fetchImpl: async () => {
       upstreamFetches++
       return {
@@ -46,7 +45,7 @@ test('V2 exposes every eligible English candidate as a separate on-demand Malay 
 
   assert.equal(upstreamFetches, 1)
   assert.equal(ai.length, 7)
-  assert.equal(rawEnglish.length, 5) // Existing raw-English fallback stays capped; AI candidates are not.
+  assert.equal(rawEnglish.length, 7) // Raw English is direct and no longer artificially capped.
   assert.deepEqual(ai.map(item => item.id), english.map(item => `gemini-ai-${item.id}`))
   assert.equal(new Set(ai.map(item => item.url)).size, 7)
   assert.equal(result.autoPrefetch, false)
@@ -59,6 +58,7 @@ test('V2 exposes every eligible English candidate as a separate on-demand Malay 
   const event = events.find(item => item.event === 'subtitle-result')
   assert.equal(event.aiCandidateCount, 7)
   assert.equal(event.englishCandidateCount, 7)
+  assert.equal(event.englishTrackCount, 7)
   assert.equal(event.englishSelectedId, '')
 })
 
@@ -74,4 +74,33 @@ test('V2 subtitle-list route never enqueues background translation', async () =>
   assert.ok(start >= 0 && end > start)
   assert.doesNotMatch(subtitleListTail, /enqueuePrefetchTranslation\s*\(/)
   assert.match(subtitleListTail, /auto-prefetch-skipped/)
+})
+
+test('V2 exposes every deduplicated Native Malay candidate without a five-track cap', async () => {
+  const malay = Array.from({ length: 7 }, (_, index) => ({
+    id: `malay-${index + 1}`,
+    lang: index % 2 ? 'ms' : 'msa',
+    url: `https://example.test/malay-${index + 1}.srt`
+  }))
+  const events = []
+  const result = await handleSubtitles({ type: 'movie', id: 'tt7654321', extra: {} }, {
+    includeEnglishTracks: true,
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ subtitles: [
+        ...malay,
+        { id: 'malay-copy', lang: malay[0].lang, url: malay[0].url }
+      ] })
+    }),
+    onDiagnostic: async event => events.push(event)
+  })
+
+  assert.equal(result.subtitles.length, 7)
+  assert.deepEqual(result.subtitles.map(item => item.url), malay.map(item => item.url))
+  assert.equal(new Set(result.subtitles.map(item => item.url)).size, 7)
+
+  const event = events.find(item => item.event === 'subtitle-result')
+  assert.equal(event.malayCount, 7)
+  assert.equal(event.subtitleCount, 7)
 })
