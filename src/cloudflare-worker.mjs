@@ -17,12 +17,70 @@ const { decodeTranslationTokenData } = tokenModule
 const { createUserConfigToken, decodeUserConfigToken, tokenFingerprint } = userConfigModule
 const { buildConfiguredUrls, validateGeminiApiKey, renderConfigurePage, escapeHtml } = configureModule
 const { nowMs, roundMs, logPerf } = perfModule
-const { recordDiagnostic, readDiagnostics, deriveVerdict } = diagnosticsModule
+const { recordDiagnostic, readDiagnostics, deriveVerdict, sanitiseEvent } = diagnosticsModule
 
-const BUILD_ID = 'v2-multicandidate-ondemand-5'
+const BUILD_ID = 'v2-multicandidate-ondemand-6'
 const caches = new WeakMap()
 // Per-request memoization only. No cross-request stale state when the owner switches OFF.
 const diagnosticStateByEnv = new WeakMap()
+
+const DIAG_EXPORT_SCRIPT = `(() => {
+  const dataEl = document.getElementById('diagnose-export-data')
+  if (!dataEl) return
+  let payload
+  try { payload = JSON.parse(dataEl.value || dataEl.textContent || '{}') } catch { return }
+  const safePart = value => String(value || 'diagnose')
+    .replace(/[^a-z0-9._-]+/gi, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'diagnose'
+  const stamp = () => new Date().toISOString().replace(/[:.]/g, '-')
+  const download = (content, type, extension) => {
+    const blob = new Blob([content], { type })
+    const href = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = href
+    link.download = 'SmartSubsV2-' + safePart((payload.overview && payload.overview.latestMedia) || 'diagnose') + '-' + stamp() + '.' + extension
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    setTimeout(() => URL.revokeObjectURL(href), 1000)
+  }
+  const eventText = item => {
+    const time = item.ts ? new Date(Number(item.ts)).toISOString() : ''
+    const details = Object.entries(item)
+      .filter(([key]) => !['ts', 'event'].includes(key))
+      .map(([key, value]) => key + '=' + (Array.isArray(value) ? value.join(',') : value))
+    return time + ' ' + (item.event || 'event') + (details.length ? '\\n  ' + details.join('\\n  ') : '')
+  }
+  document.getElementById('save-log-json')?.addEventListener('click', () => {
+    const output = { ...payload, exportedAt: new Date().toISOString() }
+    download(JSON.stringify(output, null, 2), 'application/json;charset=utf-8', 'json')
+  })
+  document.getElementById('save-log-txt')?.addEventListener('click', () => {
+    const overview = payload.overview || {}
+    const events = Array.isArray(payload.events) ? payload.events : []
+    const delivery = overview.deliveryMs == null ? '—' : String(overview.deliveryMs) + ' ms' + (overview.deliveryCache ? ' (' + overview.deliveryCache + ')' : '')
+    const cold = overview.coldTranslationMs == null ? '—' : String(overview.coldTranslationMs) + ' ms'
+    const lines = [
+      'SmartSubsV2 Diagnose Log',
+      'Exported: ' + new Date().toISOString(),
+      'Build: ' + (payload.build || ''),
+      'Verdict: ' + (payload.verdict || ''),
+      'Latest media: ' + (overview.latestMedia || '—'),
+      'Malay AI: ' + (overview.malayAi || '—'),
+      'Tracks returned: ' + (overview.tracksReturned == null ? '—' : overview.tracksReturned),
+      'English source: ' + (overview.englishSource || '—'),
+      'Delivery: ' + delivery,
+      'Cold translation: ' + cold,
+      'Native Malay: ' + (overview.nativeMalay ? 'available' : 'not recorded'),
+      '',
+      'Technical events (' + events.length + ')',
+      ...events.map(eventText)
+    ]
+    download(lines.join('\\n\\n'), 'text/plain;charset=utf-8', 'txt')
+  })
+})()`
+const DIAG_EXPORT_SCRIPT_HASH = createHash('sha256').update(DIAG_EXPORT_SCRIPT, 'utf8').digest('base64')
 
 async function diagnosticState(env, configId) {
   if (!env || !diagnosticAdminReady(env) || !/^[a-f0-9]{16}$/.test(String(configId || ''))) return { enabled: false, since: 0 }
@@ -85,9 +143,10 @@ function responseHeaders(contentType, status = 200, options = {}) {
     'cache-control': options.cacheControl || (options.noStore ? 'no-store' : status === 200 ? 'public, max-age=300' : 'no-store')
   })
   if (options.csp) {
+    const scriptPolicy = options.scriptHash ? `; script-src 'sha256-${options.scriptHash}'` : ''
     headers.set(
       'content-security-policy',
-      "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+      `default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'${scriptPolicy}`
     )
   }
   for (const [key, value] of Object.entries(options.headers || {})) {
@@ -587,11 +646,31 @@ input{display:block;width:100%;max-width:430px;min-height:44px;margin:10px 0;pad
     ? 'A recent failure was recorded. See the failure details and recent events below.' : ''
 
   const rawEvents = sorted.map(renderTechnicalEvent).join('') || '<p class="muted">No request events recorded in the last 24 hours.</p>'
+  const exportPayload = {
+    format: 'smartsubsv2-diagnose-log-v1',
+    build: BUILD_ID,
+    verdict,
+    pageGeneratedAt: new Date().toISOString(),
+    overview: {
+      latestMedia: compactMediaLabel(lastSubtitle),
+      malayAi: compactMalayAutoStatus(lastSubtitle),
+      tracksReturned: Number(lastSubtitle?.subtitleCount || 0),
+      englishSource: selectedId === 'Not available' ? '' : selectedId,
+      deliveryMs: deliveryTime === undefined ? null : Number(deliveryTime),
+      deliveryCache: deliveryForRequest?.cache || '',
+      coldTranslationMs: coldTime === undefined ? null : Number(coldTime),
+      nativeMalay: hasNativeMalay
+    },
+    // Export exactly the already-loaded diagnostic events. Re-sanitise before
+    // embedding so an accidental direct caller can never export secrets/URLs.
+    events: sorted.map(item => sanitiseEvent(item))
+  }
+  const exportData = escapeHtml(JSON.stringify(exportPayload))
 
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SmartSubsV2 Diagnose</title>
 <style>
-:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101116;color:#f4f4f5;font-family:system-ui,-apple-system,sans-serif}.wrap{max-width:920px;margin:auto;padding:18px 12px 40px}.card{background:#181a21;border:1px solid #30333d;border-radius:16px;padding:16px;margin-bottom:12px}h1{font-size:24px;margin:0 0 8px}.diagnose-heading{text-align:center;margin-bottom:20px}.diagnose-heading h1{margin:0 0 6px}.diagnose-heading .muted{font-variant-numeric:tabular-nums}h2{font-size:17px;margin:0 0 12px}.muted{color:#aeb1bb;font-size:13px}.status{display:flex;gap:10px;align-items:flex-start}.pill{display:inline-flex;align-items:center;border-radius:999px;padding:5px 10px;font-weight:800;font-size:12px;letter-spacing:.02em}.good{background:#123b29;color:#a7f3d0}.warn{background:#493812;color:#fde68a}.bad{background:#4a1d24;color:#fecaca}.neutral{background:#30333d;color:#e5e7eb}.status-copy{flex:1}.status-title{font-size:20px;font-weight:800;margin-bottom:4px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric{background:#111319;border:1px solid #2b2e37;border-radius:12px;padding:12px}.metric .label{color:#aeb1bb;font-size:12px}.metric .value{font-size:18px;font-weight:800;margin-top:3px;word-break:break-word}.metric .sub{color:#aeb1bb;font-size:12px;margin-top:4px;word-break:break-word}.meta-row{display:grid;grid-template-columns:90px 42px 1fr;gap:8px;padding:8px 0;border-bottom:1px solid #30333d;align-items:start}.meta-row:last-child{border-bottom:0}.meta-row .yes{color:#a7f3d0}.meta-row .no{color:#fca5a5}.meta-row small{color:#c7c9d1;word-break:break-word}.guide{font-size:15px;line-height:1.5}.event-card{border-top:1px solid #30333d;padding:14px 0}.event-card:first-child{border-top:0}.event-top{display:flex;gap:10px;justify-content:space-between;align-items:center;margin-bottom:8px}.event-top time{font-size:12px;color:#aeb1bb}.event-badge{display:inline-flex;align-items:center;border-radius:999px;padding:4px 8px;font-size:10px;font-weight:900;letter-spacing:.06em}.event-title{font-size:15px;font-weight:800;margin-bottom:2px;text-transform:none}.event-machine{display:block;color:#8f93a1;font-size:10px;margin-bottom:5px}.event-summary{font-size:13px;color:#d7d8dd;line-height:1.45;word-break:break-word}.event-metrics{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.event-metrics span{background:#111319;border:1px solid #292c34;border-radius:7px;padding:4px 7px;font-size:11px;word-break:break-word}.event-metrics b{color:#aeb1bb;font-weight:600;margin-right:3px}.event-raw{margin-top:8px}.event-raw>summary{font-size:11px;color:#aeb1bb;font-weight:700;padding:3px 0}.event-detail{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}.event-detail span{background:#0f1116;border-radius:7px;padding:4px 6px;font-size:11px;word-break:break-word}.event-detail b{color:#aeb1bb;font-weight:600}details summary{cursor:pointer;font-weight:800;padding:4px 0}code{color:#c9ffdc}input{display:block;width:100%;max-width:430px;min-height:44px;margin:10px 0;padding:10px;background:#101116;color:#fff;border:1px solid #59606b;border-radius:8px}button{min-height:44px;padding:10px 18px;border:0;border-radius:9px;background:#3879d7;color:#fff;font-weight:bold}button:disabled{opacity:.5}.bad-text{color:#fecaca}.diag-control-row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.diag-control-row h2{margin:0}.diag-off-btn{background:#30333d;border:1px solid #59606b;font-size:12px;min-height:36px;padding:6px 12px;white-space:nowrap}@media(max-width:640px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.media-metric{grid-column:1/-1}.meta-row{grid-template-columns:82px 38px 1fr}.event-top{align-items:flex-start;flex-direction:column;gap:5px}}
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101116;color:#f4f4f5;font-family:system-ui,-apple-system,sans-serif}.wrap{max-width:920px;margin:auto;padding:18px 12px 40px}.card{background:#181a21;border:1px solid #30333d;border-radius:16px;padding:16px;margin-bottom:12px}h1{font-size:24px;margin:0 0 8px}.diagnose-heading{text-align:center;margin-bottom:20px}.diagnose-heading h1{margin:0 0 6px}.diagnose-heading .muted{font-variant-numeric:tabular-nums}h2{font-size:17px;margin:0 0 12px}.muted{color:#aeb1bb;font-size:13px}.status{display:flex;gap:10px;align-items:flex-start}.pill{display:inline-flex;align-items:center;border-radius:999px;padding:5px 10px;font-weight:800;font-size:12px;letter-spacing:.02em}.good{background:#123b29;color:#a7f3d0}.warn{background:#493812;color:#fde68a}.bad{background:#4a1d24;color:#fecaca}.neutral{background:#30333d;color:#e5e7eb}.status-copy{flex:1}.status-title{font-size:20px;font-weight:800;margin-bottom:4px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric{background:#111319;border:1px solid #2b2e37;border-radius:12px;padding:12px}.metric .label{color:#aeb1bb;font-size:12px}.metric .value{font-size:18px;font-weight:800;margin-top:3px;word-break:break-word}.metric .sub{color:#aeb1bb;font-size:12px;margin-top:4px;word-break:break-word}.meta-row{display:grid;grid-template-columns:90px 42px 1fr;gap:8px;padding:8px 0;border-bottom:1px solid #30333d;align-items:start}.meta-row:last-child{border-bottom:0}.meta-row .yes{color:#a7f3d0}.meta-row .no{color:#fca5a5}.meta-row small{color:#c7c9d1;word-break:break-word}.guide{font-size:15px;line-height:1.5}.event-card{border-top:1px solid #30333d;padding:14px 0}.event-card:first-child{border-top:0}.event-top{display:flex;gap:10px;justify-content:space-between;align-items:center;margin-bottom:8px}.event-top time{font-size:12px;color:#aeb1bb}.event-badge{display:inline-flex;align-items:center;border-radius:999px;padding:4px 8px;font-size:10px;font-weight:900;letter-spacing:.06em}.event-title{font-size:15px;font-weight:800;margin-bottom:2px;text-transform:none}.event-machine{display:block;color:#8f93a1;font-size:10px;margin-bottom:5px}.event-summary{font-size:13px;color:#d7d8dd;line-height:1.45;word-break:break-word}.event-metrics{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.event-metrics span{background:#111319;border:1px solid #292c34;border-radius:7px;padding:4px 7px;font-size:11px;word-break:break-word}.event-metrics b{color:#aeb1bb;font-weight:600;margin-right:3px}.event-raw{margin-top:8px}.event-raw>summary{font-size:11px;color:#aeb1bb;font-weight:700;padding:3px 0}.event-detail{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}.event-detail span{background:#0f1116;border-radius:7px;padding:4px 6px;font-size:11px;word-break:break-word}.event-detail b{color:#aeb1bb;font-weight:600}details summary{cursor:pointer;font-weight:800;padding:4px 0}code{color:#c9ffdc}input{display:block;width:100%;max-width:430px;min-height:44px;margin:10px 0;padding:10px;background:#101116;color:#fff;border:1px solid #59606b;border-radius:8px}button{min-height:44px;padding:10px 18px;border:0;border-radius:9px;background:#3879d7;color:#fff;font-weight:bold}button:disabled{opacity:.5}.bad-text{color:#fecaca}.diag-control-row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.diag-control-row h2{margin:0}.diag-off-btn{background:#30333d;border:1px solid #59606b;font-size:12px;min-height:36px;padding:6px 12px;white-space:nowrap}.event-toolbar{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 6px}.secondary-btn{background:#262a33;border:1px solid #4b5160;min-height:36px;padding:7px 11px;font-size:12px}.export-note{margin-top:0}@media(max-width:640px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.media-metric{grid-column:1/-1}.meta-row{grid-template-columns:82px 38px 1fr}.event-top{align-items:flex-start;flex-direction:column;gap:5px}}
 </style></head>
 <body><main class="wrap">
 <section class="card"><header class="diagnose-heading"><h1>SmartSubsV2 Diagnose</h1><div class="muted">${escapeHtml(formatMalaysiaTime(Date.now()))}</div></header><div class="status"><span class="pill ${status.tone}">${escapeHtml(status.tone === 'good' ? 'OK' : status.tone === 'bad' ? 'ERROR' : status.tone === 'warn' ? 'WAIT' : 'INFO')}</span><div class="status-copy"><div class="status-title">${escapeHtml(status.title)}</div><div class="muted">${escapeHtml(status.explanation)}</div></div></div><p class="muted">Latest subtitle request: ${escapeHtml(lastSubtitle ? formatMalaysiaTime(lastSubtitle.ts) : 'Not recorded')}</p></section>
@@ -612,7 +691,7 @@ ${guidance ? `<section class="card"><h2>Note</h2><div class="guide">${escapeHtml
 ${activeFailure ? `<section class="card"><h2>Latest failure</h2><div class="metric"><div class="label">${escapeHtml(activeFailure.event)}</div><div class="value">${escapeHtml(activeFailure.failureStage || activeFailure.status || 'Unknown stage')}</div><div class="sub">${escapeHtml(activeFailure.error || activeFailure.reason || '')}</div></div></section>` : ''}
 
 
-<section class="card"><details><summary>Technical events (${sorted.length})</summary><p class="muted">Build ${BUILD_ID} | Verdict <code>${escapeHtml(verdict)}</code> | Events retained for up to 24 hours (MYT).</p>${rawEvents}</details></section>
+<section class="card"><details><summary>Technical events (${sorted.length})</summary><div class="event-toolbar"><button id="save-log-json" class="secondary-btn" type="button">Save Log (.json)</button><button id="save-log-txt" class="secondary-btn" type="button">Save Summary (.txt)</button></div><p class="muted">Build ${BUILD_ID} | Verdict <code>${escapeHtml(verdict)}</code> | Events retained for up to 24 hours (MYT).</p><p class="muted export-note">Downloads use the events already loaded on this page. No additional KV read or write.</p>${rawEvents}</details><textarea id="diagnose-export-data" hidden>${exportData}</textarea><script>${DIAG_EXPORT_SCRIPT}</script></section>
 </main></body></html>`
 }
 async function prefetchTranslation(options = {}) {
@@ -1816,7 +1895,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
       : []
     return send(200, 'text/html; charset=utf-8', renderConfiguredDiagnosePage(configId, events, {
       ...state, ready: diagnosticAdminReady(env) && Boolean(monitorStub(env, configId))
-    }), { noStore: true, csp: true, headers: { 'x-robots-tag': 'noindex, nofollow' } })
+    }), { noStore: true, csp: true, scriptHash: DIAG_EXPORT_SCRIPT_HASH, headers: { 'x-robots-tag': 'noindex, nofollow' } })
   }
 
   if (request.method === 'POST' && suffix === '/diagnose/toggle') {
