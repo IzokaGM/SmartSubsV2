@@ -19,7 +19,7 @@ const { buildConfiguredUrls, validateGeminiApiKey, renderConfigurePage, escapeHt
 const { nowMs, roundMs, logPerf } = perfModule
 const { recordDiagnostic, readDiagnostics, deriveVerdict } = diagnosticsModule
 
-const BUILD_ID = 'final-stable-m20r3'
+const BUILD_ID = 'v2-multicandidate-ondemand-1'
 const caches = new WeakMap()
 // Per-request memoization only. No cross-request stale state when the owner switches OFF.
 const diagnosticStateByEnv = new WeakMap()
@@ -1600,8 +1600,10 @@ async function handleQueue(batch, env, options = {}) {
     }
   }
 }
-function shouldPrefetchAutoResult(result, autoUrl) {
-  return Boolean(autoUrl) && result?.autoPrefetch !== false
+function shouldPrefetchAutoResult(_result, _autoUrl) {
+  // V2 multi-candidate mode is strictly on-demand. Subtitle discovery must never
+  // enqueue Gemini work before the player requests a specific translated track.
+  return false
 }
 
 async function configuredRequest(request, env, token, suffix, executionCtx = null) {
@@ -1986,36 +1988,14 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
         onDiagnostic: event => recordConfiguredDiagnostic(env, configId, event)
       })
 
-      const autoUrl = result?.subtitles?.find(item =>
-        item && item.lang === 'msa' && typeof item.url === 'string' && item.url.includes('/translated/')
-      )?.url
-
-      if (autoUrl && result?.autoPrefetch === false) {
+      const aiCandidateCount = Number(result?.aiCandidateCount || 0)
+      if (aiCandidateCount > 0) {
         await recordConfiguredDiagnostic(env, configId, {
           event: 'auto-prefetch-skipped',
-          status: 'quota-protected',
-          reason: result.autoPrefetchReason || 'user-selection-required'
+          status: 'on-demand',
+          reason: result.autoPrefetchReason || 'on-demand-candidate-selection',
+          aiCandidateCount
         }).catch(() => {})
-      }
-
-      if (shouldPrefetchAutoResult(result, autoUrl)) {
-        const translationToken = parseAutoTranslationToken(autoUrl)
-        let autoCacheKey = ''
-
-        if (translationToken) {
-          try {
-            const tokenData = decodeTranslationTokenData(translationToken, secret)
-            autoCacheKey = translationCacheKey(tokenData, userConfig.model, env)
-          } catch {}
-        }
-
-        await enqueuePrefetchTranslation({
-          autoUrl,
-          env,
-          configToken: token,
-          configId,
-          cacheKey: autoCacheKey
-        })
       }
 
       return json(result, 200, { headers: { 'x-smartsubs-build': BUILD_ID } })

@@ -15,7 +15,7 @@ const responseFor = subtitles => async () => ({
   json: async () => ({ subtitles })
 })
 
-test('Direct English selection uses first eligible OpenSubtitles source regardless of release metadata', async () => {
+test('Subtitle discovery exposes every eligible OpenSubtitles source without selecting one', async () => {
   const upstream = [
     { id:'first', lang:'eng', url:'https://example.test/BluRay.srt' },
     { id:'second', lang:'eng', url:'https://example.test/WEB-DL.srt' }
@@ -26,10 +26,13 @@ test('Direct English selection uses first eligible OpenSubtitles source regardle
     fetchImpl:responseFor(upstream),onDiagnostic: async event=>events.push(event)
   })
   const event=events.find(item=>item.event==='subtitle-result')
-  assert.equal(result.subtitles.length,1)
-  assert.equal(event.englishSelectedId,'first')
+  assert.equal(result.subtitles.length,2)
+  assert.deepEqual(result.subtitles.map(item=>item.id), ['gemini-ai-first','gemini-ai-second'])
+  assert.equal(event.englishSelectedId,'')
   assert.deepEqual(event.englishSourceIds,['first','second'])
   assert.equal(event.englishCandidateCount,2)
+  assert.equal(event.aiCandidateCount,2)
+  assert.equal(result.autoPrefetch,false)
   assert.equal('englishSelectedScore' in event,false)
   assert.equal('englishConfidence' in event,false)
 })

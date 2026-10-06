@@ -93,19 +93,21 @@ test('Native Malay keeps original OpenSubtitles order without scoring, even with
   assert.equal('malaySelectedScore' in event,false)
 })
 
-test('Malay AI uses first eligible English source regardless of filename matching', async () => {
+test('Malay AI exposes all eligible English sources for on-demand selection', async () => {
   const upstream=[{id:'english-first',lang:'eng',url:'https://example.test/Show.BluRay.srt'},
     {id:'english-second',lang:'eng',url:'https://example.test/Show.WEB-DL.srt'}]
   const events=[]
   const result=await handleSubtitles({type:'series',id:'tt11198330:1:1',extra:{filename:'Show.WEB-DL.mkv'}},
     {apiKey:'key',publicBaseUrl:'https://smartsubs.example/c/test',tokenSecret:'test-secret',
       fetchImpl:responseFor(upstream),onDiagnostic:async e=>events.push(e)})
-  assert.equal(result.subtitles.length,1)
+  assert.equal(result.subtitles.length,2)
+  assert.deepEqual(result.subtitles.map(item=>item.id), ['gemini-ai-english-first','gemini-ai-english-second'])
   const event=events.find(e=>e.event==='subtitle-result')
-  assert.equal(event.result,'auto-malay-ready')
-  assert.equal(event.englishSelectedId,'english-first')
+  assert.equal(event.result,'on-demand-ai-ready')
+  assert.equal(event.englishSelectedId,'')
   assert.deepEqual(event.englishSourceIds,['english-first','english-second'])
-  assert.equal(result.autoPrefetch,true)
+  assert.equal(event.aiCandidateCount,2)
+  assert.equal(result.autoPrefetch,false)
 })
 
 test('Part 2 diagnostic sanitizer preserves native Malay ranking evidence', () => {

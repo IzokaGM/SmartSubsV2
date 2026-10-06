@@ -50,7 +50,7 @@ test('Part 3 recognises strong native release evidence', () => {
   assert.ok(ranked[0].confidence.scoreUplift >= 700)
 })
 
-test('Native Malay does not suppress Malay AI; prefetch retains existing native policy', async () => {
+test('Native Malay does not suppress on-demand Malay AI', async () => {
   for (const [nativeId, url] of [['native-weak','https://example.test/native.srt'],
       ['native-strong','https://example.test/Show.S01E01.1080p.WEB-DL.x265-GROUP.srt']]) {
     const events=[]
@@ -69,12 +69,13 @@ test('Native Malay does not suppress Malay AI; prefetch retains existing native 
   }
 })
 
-test('No native Malay retains automatic prefetch', async () => {
+test('No native Malay also keeps automatic prefetch disabled', async () => {
   const result=await handleSubtitles({type:'movie',id:'tt1375666',extra:{}},
     {apiKey:'test-key',publicBaseUrl:'https://smartsubs.example/c/test',tokenSecret:'test-secret',
      fetchImpl:responseFor([{id:'english',lang:'eng',url:'https://example.test/english.srt'}])})
   assert.equal(result.subtitles.length,1)
-  assert.equal(result.autoPrefetch,true)
+  assert.equal(result.autoPrefetch,false)
+  assert.equal(result.autoPrefetchReason,'on-demand-candidate-selection')
 })
 
 test('Part 3 Diagnose preserves native decision and quota fields', () => {
@@ -114,7 +115,7 @@ test('Part 3 dual fallback gets a dedicated Diagnose verdict', () => {
   )
 })
 
-test('Part 3 Worker prefetch policy protects Gemini until Auto is selected', async () => {
+test('V2 Worker disables automatic prefetch for every candidate list', async () => {
   const { shouldPrefetchAutoResult } = await import('../src/cloudflare-worker.mjs')
 
   assert.equal(
@@ -130,6 +131,6 @@ test('Part 3 Worker prefetch policy protects Gemini until Auto is selected', asy
       { autoPrefetch: true },
       'https://smartsubs.example/c/test/translated/token.vtt'
     ),
-    true
+    false
   )
 })

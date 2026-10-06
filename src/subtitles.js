@@ -59,6 +59,12 @@ function buildAutoSubtitle(englishSubtitle, options = {}) {
   }
 }
 
+function buildAutoSubtitles(englishSubtitles, options = {}) {
+  return dedupeSubtitles(englishSubtitles)
+    .map(subtitle => buildAutoSubtitle(subtitle, options))
+    .filter(Boolean)
+}
+
 function buildEnglishTracks(upstream, _extra = {}, limit = 5) {
   const maxTracks = Math.max(1, Math.min(5, Number(limit) || 5))
   return dedupeSubtitles(getEnglishSubtitles(upstream))
@@ -89,25 +95,30 @@ async function handleSubtitles(args, options = {}) {
     const englishCandidates = dedupeSubtitles(getEnglishSubtitles(upstream))
     const english = englishCandidates[0] || null
     const apiKey = options.apiKey || ''
-    const ai = english && apiKey ? buildAutoSubtitle(english, options) : null
+    // V2 multi-candidate mode: every eligible English source gets its own Malay AI
+    // translation URL. Creating these signed URLs does not fetch or translate anything.
+    // Translation starts only when the player requests the selected /translated/*.vtt URL.
+    const aiTracks = apiKey ? buildAutoSubtitles(englishCandidates, options) : []
     const englishTracks = options.includeEnglishTracks
       ? buildEnglishTracks(upstream, args.extra || {}, options.englishTrackLimit) : []
 
-    // Malay AI is offered independently of the presence of native Malay subtitles.
-    // Preserve existing prefetch policy: on with no native Malay, off with native Malay.
-    const autoPrefetch = Boolean(ai) && malay.length === 0
-    const autoPrefetchReason = !ai ? 'ai-unavailable'
-      : malay.length ? 'native-malay-user-selection' : 'no-native-malay-aggressive-prefetch'
-    const subtitles = [...malay, ...(ai ? [ai] : []), ...englishTracks]
+    // Automatic prefetch is deliberately disabled in V2. With several AI candidates,
+    // background translation would multiply Gemini usage before the user picks a source.
+    const autoPrefetch = false
+    const autoPrefetchReason = aiTracks.length ? 'on-demand-candidate-selection' : 'ai-unavailable'
+    const subtitles = [...malay, ...aiTracks, ...englishTracks]
     const resultName = malay.length
-      ? (ai ? 'native-malay-with-auto-fallback' : 'native-malay')
-      : ai ? 'auto-malay-ready' : english ? 'byok-not-configured' : 'no-english'
-    const selectionDiagnostic = englishSelectionDiagnostics(upstream, english)
+      ? (aiTracks.length ? 'native-malay-with-on-demand-ai' : 'native-malay')
+      : aiTracks.length ? 'on-demand-ai-ready' : english ? 'byok-not-configured' : 'no-english'
+    // No English source is selected during subtitle discovery anymore. Selection happens
+    // later, when the player requests one candidate's translated URL.
+    const selectionDiagnostic = englishSelectionDiagnostics(upstream, null)
     const info = {
       requestId, type: args.type, id: args.id, upstreamMs,
       upstreamCount: upstream.length, malayCount: malay.length,
       englishFound: Boolean(english), ...selectionDiagnostic,
-      byokConfigured: Boolean(apiKey), autoReady: Boolean(ai),
+      byokConfigured: Boolean(apiKey), autoReady: aiTracks.length > 0,
+      aiCandidateCount: aiTracks.length,
       autoPrefetch, autoPrefetchReason,
       englishTrackCount: englishTracks.length, subtitleCount: subtitles.length,
       languages: subtitles.map(item => item.lang), result: resultName
@@ -115,7 +126,7 @@ async function handleSubtitles(args, options = {}) {
     logPerf({ ...info, milestone: 'SMARTSUBS-SIMPLE', totalMs: roundMs(nowMs() - startedAt) })
     await emitDiagnostic(options, { event: 'subtitle-result', ...info })
     return { subtitles, autoPrefetch, autoPrefetchReason,
-      cacheMaxAge: ai || malay.length ? 120 : 60, staleRevalidate: 60, staleError: 600 }
+      cacheMaxAge: aiTracks.length || malay.length ? 120 : 60, staleRevalidate: 60, staleError: 600 }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     logPerf({ requestId, milestone: 'SMARTSUBS-SIMPLE', type: args.type, id: args.id, error: message })
@@ -125,5 +136,5 @@ async function handleSubtitles(args, options = {}) {
   }
 }
 
-module.exports = { dedupeSubtitles, buildAutoSubtitle, buildEnglishTracks,
+module.exports = { dedupeSubtitles, buildAutoSubtitle, buildAutoSubtitles, buildEnglishTracks,
   handleSubtitles, englishSelectionDiagnostics }

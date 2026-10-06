@@ -35,7 +35,7 @@ test('Part 4.4 exposes up to five upstream-order and deduplicated English tracks
   assert.deepEqual(new Set(tracks.map(item => item.lang)), new Set(['eng']))
 })
 
-test('Part 4.4 returns Malay Auto first and ranked English alternatives after it', async () => {
+test('Part 4.4 returns one on-demand Malay AI track per English source plus raw English fallbacks', async () => {
   const result = await handleSubtitles({
     type: 'series',
     id: 'tt10986410:1:5',
@@ -51,15 +51,16 @@ test('Part 4.4 returns Malay Auto first and ranked English alternatives after it
     ])
   })
 
-  assert.equal(result.subtitles.length, 3)
-  assert.equal(result.subtitles[0].lang, 'msa')
-  assert.match(result.subtitles[0].id, /^gemini-ai-/)
-  assert.deepEqual(result.subtitles.slice(1).map(item => item.lang), ['eng', 'eng'])
-  assert.deepEqual(result.subtitles.slice(1).map(item => item.id), [
+  assert.equal(result.subtitles.length, 4)
+  assert.deepEqual(result.subtitles.slice(0, 2).map(item => item.lang), ['msa', 'msa'])
+  assert.deepEqual(result.subtitles.slice(0, 2).map(item => item.id), ['gemini-ai-eng-one', 'gemini-ai-eng-two'])
+  assert.deepEqual(result.subtitles.slice(2).map(item => item.lang), ['eng', 'eng'])
+  assert.deepEqual(result.subtitles.slice(2).map(item => item.id), [
     'smartsubs-eng-eng-one',
     'smartsubs-eng-eng-two'
   ])
-  assert.equal(result.autoPrefetch, true)
+  assert.equal(result.autoPrefetch, false)
+  assert.equal(result.autoPrefetchReason, 'on-demand-candidate-selection')
 })
 
 test('Part 4.4 keeps weak-native quota protection and adds English after Malay choices', async () => {
@@ -81,7 +82,7 @@ test('Part 4.4 keeps weak-native quota protection and adds English after Malay c
   assert.deepEqual(result.subtitles.map(item => item.lang), ['msa', 'msa', 'eng'])
   assert.equal(result.subtitles[2].id, 'smartsubs-eng-english-weak')
   assert.equal(result.autoPrefetch, false)
-  assert.equal(result.autoPrefetchReason, 'native-malay-user-selection')
+  assert.equal(result.autoPrefetchReason, 'on-demand-candidate-selection')
 })
 
 test('Part 4.4 can still return English when Malay Auto is unavailable', async () => {

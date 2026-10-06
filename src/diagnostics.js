@@ -19,7 +19,7 @@ function sanitiseEvent(event = {}) {
     'malayCandidateCount', 'malaySelectedId', 'malaySelectedScore', 'malayTop',
     'nativeConfidence', 'nativeConfidenceReason', 'nativeScoreUplift', 'nativeDecision',
     'autoFallbackOffered', 'autoPrefetch', 'autoPrefetchReason', 'geminiPrefetchAvoided',
-    'englishFound', 'englishTrackCount', 'byokConfigured', 'autoReady', 'languages', 'totalMs',
+    'englishFound', 'englishTrackCount', 'aiCandidateCount', 'byokConfigured', 'autoReady', 'languages', 'totalMs',
     'englishConfidence', 'englishConfidenceReason', 'englishScoreUplift',
     'sourceFilenameProvided', 'sourceVideoHashProvided', 'sourceVideoSizeProvided',
     'sourceFilename', 'requestExtraKeys', 'englishCandidateCount', 'englishSelectedId',
