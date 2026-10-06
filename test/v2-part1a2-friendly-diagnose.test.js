@@ -3,7 +3,7 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 
-test('Compact diagnose keeps relevant status and moves source details behind disclosure', async () => {
+test('Compact diagnose keeps relevant status without a source-details disclosure', async () => {
   const { renderConfiguredDiagnosePage } = await import('../src/cloudflare-worker.mjs')
 
   const ts = Date.UTC(2026, 7, 21, 4, 42, 47)
@@ -47,9 +47,7 @@ test('Compact diagnose keeps relevant status and moves source details behind dis
   assert.match(html, /12:42:47/)
   assert.match(html, /English source/)
   assert.match(html, /9214195/)
-  assert.match(html, /Source details/)
-  assert.match(html, /Source timing is not verified/)
-  assert.match(html, /<summary>Source details<\/summary>/)
+  assert.doesNotMatch(html, /Source details|Source timing is not verified/)
   assert.match(html, /<div class=\"label\">Delivery<\/div>/)
   assert.match(html, /<div class="sub">HIT<\/div>/)
   assert.match(html, /411 ms/)
@@ -79,7 +77,7 @@ test('V2 friendly diagnose rates video hash as strong sync evidence', async () =
     englishTop: ['1:hash-match:40000', '2:other:10000']
   }])
 
-  assert.match(html, /Source timing is not verified/)
+  assert.doesNotMatch(html, /Source details|Source timing is not verified/)
   assert.doesNotMatch(html, /<h2>Note<\/h2>/)
 })
 
