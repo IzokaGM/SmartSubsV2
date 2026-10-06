@@ -67,10 +67,10 @@ test('sanitised diagnostics preserves upstream source list and does not add scor
 test('Compact Diagnose keeps the selected English source in Overview without a source-details panel', async () => {
   const { renderConfiguredDiagnosePage } = await import('../src/cloudflare-worker.mjs')
   const html = renderConfiguredDiagnosePage('private', [{ event: 'subtitle-result', ts: Date.now(),
-    id: args.id, type: args.type, autoReady: true, subtitleCount: 3,
+    id: args.id, type: args.type, autoReady: true, subtitleCount: 4, englishTrackCount: 2, aiCandidateCount: 2,
     englishSelectedId: 'en-1', englishSourceIds: ['en-1', 'en-2'], englishCandidateCount: 2 }])
-  assert.match(html, /<div class="label">Malay AI<\/div><div class="value">Ready<\/div>/)
-  assert.match(html, /<div class="label">English source<\/div><div class="value">en-1<\/div>/)
+  assert.match(html, /<div class="label">Available<\/div><div class="value">4 tracks<\/div><div class="sub">2 AI · 2 English<\/div>/)
+  assert.match(html, /<div class="label">English source<\/div><div class="value">en-1<\/div><div class="sub">OpenSubtitles<\/div>/)
   assert.doesNotMatch(html, /Source details|#1<\/span><strong>en-1<\/strong>/)
   assert.doesNotMatch(html, /<h2>Sync confidence<\/h2>|selected score|Source &amp; sync details/)
 })

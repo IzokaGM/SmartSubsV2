@@ -19,7 +19,7 @@ const { buildConfiguredUrls, validateGeminiApiKey, renderConfigurePage, escapeHt
 const { nowMs, roundMs, logPerf } = perfModule
 const { recordDiagnostic, readDiagnostics, deriveVerdict, sanitiseEvent } = diagnosticsModule
 
-const BUILD_ID = 'v2-multicandidate-ondemand-6'
+const BUILD_ID = 'v2-multicandidate-ondemand-8'
 const caches = new WeakMap()
 // Per-request memoization only. No cross-request stale state when the owner switches OFF.
 const diagnosticStateByEnv = new WeakMap()
@@ -45,12 +45,15 @@ const DIAG_EXPORT_SCRIPT = `(() => {
     link.remove()
     setTimeout(() => URL.revokeObjectURL(href), 1000)
   }
-  const eventText = item => {
+  const summaryText = item => {
     const time = item.ts ? new Date(Number(item.ts)).toISOString() : ''
-    const details = Object.entries(item)
-      .filter(([key]) => !['ts', 'event'].includes(key))
-      .map(([key, value]) => key + '=' + (Array.isArray(value) ? value.join(',') : value))
-    return time + ' ' + (item.event || 'event') + (details.length ? '\\n  ' + details.join('\\n  ') : '')
+    const heading = [item.category, item.title].filter(Boolean).join(' · ')
+    const metrics = Array.isArray(item.metrics)
+      ? item.metrics.map(metric => metric.label + '=' + metric.value).join(' · ')
+      : ''
+    return [time + (heading ? ' ' + heading : ''), item.summary || '', metrics]
+      .filter(Boolean)
+      .join('\\n  ')
   }
   document.getElementById('save-log-json')?.addEventListener('click', () => {
     const output = { ...payload, exportedAt: new Date().toISOString() }
@@ -59,23 +62,20 @@ const DIAG_EXPORT_SCRIPT = `(() => {
   document.getElementById('save-log-txt')?.addEventListener('click', () => {
     const overview = payload.overview || {}
     const events = Array.isArray(payload.events) ? payload.events : []
-    const delivery = overview.deliveryMs == null ? '—' : String(overview.deliveryMs) + ' ms' + (overview.deliveryCache ? ' (' + overview.deliveryCache + ')' : '')
-    const cold = overview.coldTranslationMs == null ? '—' : String(overview.coldTranslationMs) + ' ms'
+    const summaries = Array.isArray(payload.summaries) ? payload.summaries : []
     const lines = [
       'SmartSubsV2 Diagnose Log',
       'Exported: ' + new Date().toISOString(),
       'Build: ' + (payload.build || ''),
       'Verdict: ' + (payload.verdict || ''),
       'Latest media: ' + (overview.latestMedia || '—'),
-      'Malay AI: ' + (overview.malayAi || '—'),
-      'Tracks returned: ' + (overview.tracksReturned == null ? '—' : overview.tracksReturned),
+      'Available: ' + (overview.tracksReturned == null ? '—' : overview.tracksReturned + ' tracks') + (overview.availableSummary ? ' · ' + overview.availableSummary : ''),
       'English source: ' + (overview.englishSource || '—'),
-      'Delivery: ' + delivery,
-      'Cold translation: ' + cold,
-      'Native Malay: ' + (overview.nativeMalay ? 'available' : 'not recorded'),
+      'Translation: ' + (overview.translationStatus || '—') + (overview.translationSummary ? ' · ' + overview.translationSummary : ''),
+      'Delivery: ' + (overview.deliveryStatus || '—') + (overview.deliverySummary ? ' · ' + overview.deliverySummary : ''),
       '',
       'Technical events (' + events.length + ')',
-      ...events.map(eventText)
+      ...summaries.map(summaryText)
     ]
     download(lines.join('\\n\\n'), 'text/plain;charset=utf-8', 'txt')
   })
@@ -121,14 +121,8 @@ function validDiagnosticAdminKey(submitted, stored) {
 }
 
 function diagnosticControlHtml(state = { enabled: false }, ready = false, error = '') {
-  const enabled = state.enabled === true
-  const heading = enabled ? 'ON' : 'OFF'
-  // When ON, keep the control compact and allow a one-tap OFF without re-entering the key.
-  // Turning ON still requires the configured server-side admin key.
-  if (enabled) {
-    return `<section class="card"><div class="diag-control-row"><h2>Diagnostics: <span class="pill good">${heading}</span></h2><form method="POST" action="diagnose/toggle" autocomplete="off"><button class="diag-off-btn" type="submit" name="action" value="off">Turn OFF</button></form></div><p class="muted">Diagnostic events are being recorded to Workers KV.</p>${error ? `<p class="bad-text">${escapeHtml(error)}</p>` : ''}</section>`
-  }
-  return `<section class="card"><h2>Diagnostics: <span class="pill neutral">${heading}</span></h2><p class="muted">Diagnostic recording is OFF. Translation, Queue and cache still work normally.</p><form method="POST" action="diagnose/toggle" autocomplete="off"><label for="diag-admin">Admin key</label><input id="diag-admin" name="adminKey" type="password" minlength="6" maxlength="256" required autocomplete="off" placeholder="Admin key (not Gemini API key)" ${ready ? '' : 'disabled'}><div><button type="submit" name="action" value="on" ${ready ? '' : 'disabled'}>Turn ON</button></div></form>${!ready ? '<p class="muted">Set secret SMARTSUBS_DIAG_ADMIN_KEY (6+ characters) and ensure SMARTSUBS_DELIVERY is available.</p>' : ''}${error ? `<p class="bad-text">${escapeHtml(error)}</p>` : ''}</section>`
+  if (state.enabled === true) return ''
+  return `<section class="card diag-setup"><form method="POST" action="diagnose/toggle" autocomplete="off"><label for="diag-admin">Admin key to turn Diagnostics ON</label><div class="diag-on-row"><input id="diag-admin" name="adminKey" type="password" minlength="6" maxlength="256" required autocomplete="off" placeholder="Admin key (not Gemini API key)" ${ready ? '' : 'disabled'}><button type="submit" name="action" value="on" ${ready ? '' : 'disabled'}>Turn ON</button></div></form>${!ready ? '<p class="muted">Set secret SMARTSUBS_DIAG_ADMIN_KEY (6+ characters) and ensure SMARTSUBS_DELIVERY is available.</p>' : ''}${error ? `<p class="bad-text">${escapeHtml(error)}</p>` : ''}</section>`
 }
 
 function responseHeaders(contentType, status = 200, options = {}) {
@@ -562,14 +556,18 @@ function eventPresentation(item = {}) {
 
 function renderTechnicalEvent(item = {}) {
   const view = eventPresentation(item)
+  const metrics = view.metrics
+    .map(metric => `<span><b>${escapeHtml(metric.label)}</b> ${escapeHtml(metric.value)}</span>`)
+    .join('')
+  return `<article class="event-card"><div class="event-top"><span class="event-badge ${escapeHtml(view.tone)}">${escapeHtml(view.category)}</span><time>${escapeHtml(formatMalaysiaTime(item.ts))}</time></div><div class="event-title">${escapeHtml(view.title)}</div>${view.summary ? `<div class="event-summary">${escapeHtml(view.summary)}</div>` : ''}${metrics ? `<div class="event-metrics">${metrics}</div>` : ''}</article>`
+}
+
+function renderRawTechnicalEvent(item = {}) {
   const detail = Object.entries(item)
     .filter(([key]) => !['ts', 'event'].includes(key))
     .map(([key, value]) => `<span><b>${escapeHtml(key)}</b>=${escapeHtml(Array.isArray(value) ? value.join(',') : value)}</span>`)
     .join('') || '<span>No details</span>'
-  const metrics = view.metrics
-    .map(metric => `<span><b>${escapeHtml(metric.label)}</b> ${escapeHtml(metric.value)}</span>`)
-    .join('')
-  return `<article class="event-card"><div class="event-top"><span class="event-badge ${escapeHtml(view.tone)}">${escapeHtml(view.category)}</span><time>${escapeHtml(formatMalaysiaTime(item.ts))}</time></div><div class="event-title">${escapeHtml(view.title)}</div><code class="event-machine">${escapeHtml(item.event || '')}</code>${view.summary ? `<div class="event-summary">${escapeHtml(view.summary)}</div>` : ''}${metrics ? `<div class="event-metrics">${metrics}</div>` : ''}<details class="event-raw"><summary>Raw details</summary><div class="event-detail">${detail}</div></details></article>`
+  return `<article class="raw-event-card"><div class="raw-event-top"><code>${escapeHtml(item.event || 'event')}</code><time>${escapeHtml(formatMalaysiaTime(item.ts))}</time></div><div class="event-detail">${detail}</div></article>`
 }
 
 function verdictPresentation(verdict) {
@@ -593,7 +591,7 @@ function verdictPresentation(verdict) {
     PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION: ['Malay AI ready', 'good', 'Background translation completed and is waiting for player selection.'],
     PREFETCH_FAILED_WAITING_FOR_PLAYER_SELECTION: ['Prefetch failed', 'bad', 'Background translation failed.'],
     PREFETCH_TRANSLATING: ['Prefetch translating', 'warn', 'Malay AI is translating in the background.'],
-    SUBTITLE_RETURNED_WAITING_FOR_PLAYER_SELECTION: ['Malay AI offered', 'good', 'SmartSubs returned a Malay AI track to the player.'],
+    SUBTITLE_RETURNED_WAITING_FOR_PLAYER_SELECTION: ['Ready for selection', 'good', 'Malay AI candidates are available. Translation starts only after the player selects one.'],
     SUBTITLE_RETURNED: ['Subtitle returned', 'good', 'SmartSubs returned a subtitle track.']
   }
   const item = map[verdict] || [verdict, 'neutral', 'See the recent events for more detail.']
@@ -604,9 +602,8 @@ function renderConfiguredDiagnosePage(configId, events, control = { enabled: tru
   const controls = diagnosticControlHtml(control, control.ready, control.error)
   if (control.enabled === false) {
     return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>SmartSubsV2 Diagnose</title><style>
-:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101116;color:#f4f4f5;font-family:system-ui,-apple-system,sans-serif}.wrap{max-width:920px;margin:auto;padding:18px 12px 40px}.card{background:#181a21;border:1px solid #30333d;border-radius:16px;padding:16px;margin-bottom:12px}h1{font-size:24px;margin:0 0 8px}.diagnose-heading{text-align:center;margin-bottom:20px}.diagnose-heading h1{margin:0 0 6px}.diagnose-heading .muted{font-variant-numeric:tabular-nums}h2{font-size:17px;margin:0 0 12px}.muted{color:#aeb1bb;font-size:13px}.status{display:flex;gap:10px;align-items:flex-start}.pill{display:inline-flex;align-items:center;border-radius:999px;padding:5px 10px;font-weight:800;font-size:12px;letter-spacing:.02em}.good{background:#123b29;color:#a7f3d0}.warn{background:#493812;color:#fde68a}.bad{background:#4a1d24;color:#fecaca}.neutral{background:#30333d;color:#e5e7eb}.status-copy{flex:1}.status-title{font-size:20px;font-weight:800;margin-bottom:4px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric{background:#111319;border:1px solid #2b2e37;border-radius:12px;padding:12px}.metric .label{color:#aeb1bb;font-size:12px}.metric .value{font-size:18px;font-weight:800;margin-top:3px;word-break:break-word}.metric .sub{color:#aeb1bb;font-size:12px;margin-top:4px;word-break:break-word}.meta-row{display:grid;grid-template-columns:90px 42px 1fr;gap:8px;padding:8px 0;border-bottom:1px solid #30333d;align-items:start}.meta-row:last-child{border-bottom:0}.meta-row .yes{color:#a7f3d0}.meta-row .no{color:#fca5a5}.meta-row small{color:#c7c9d1;word-break:break-word}.guide{font-size:15px;line-height:1.5}.event-card{border-top:1px solid #30333d;padding:14px 0}.event-card:first-child{border-top:0}.event-top{display:flex;gap:10px;justify-content:space-between;align-items:center;margin-bottom:8px}.event-top time{font-size:12px;color:#aeb1bb}.event-badge{display:inline-flex;align-items:center;border-radius:999px;padding:4px 8px;font-size:10px;font-weight:900;letter-spacing:.06em}.event-title{font-size:15px;font-weight:800;margin-bottom:2px;text-transform:none}.event-machine{display:block;color:#8f93a1;font-size:10px;margin-bottom:5px}.event-summary{font-size:13px;color:#d7d8dd;line-height:1.45;word-break:break-word}.event-metrics{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.event-metrics span{background:#111319;border:1px solid #292c34;border-radius:7px;padding:4px 7px;font-size:11px;word-break:break-word}.event-metrics b{color:#aeb1bb;font-weight:600;margin-right:3px}.event-raw{margin-top:8px}.event-raw>summary{font-size:11px;color:#aeb1bb;font-weight:700;padding:3px 0}.event-detail{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}.event-detail span{background:#0f1116;border-radius:7px;padding:4px 6px;font-size:11px;word-break:break-word}.event-detail b{color:#aeb1bb;font-weight:600}details summary{cursor:pointer;font-weight:800;padding:4px 0}code{color:#c9ffdc}@media(max-width:640px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.media-metric{grid-column:1/-1}.meta-row{grid-template-columns:82px 38px 1fr}.event-top{align-items:flex-start;flex-direction:column;gap:5px}}
-input{display:block;width:100%;max-width:430px;min-height:44px;margin:10px 0;padding:10px;background:#101116;color:#fff;border:1px solid #59606b;border-radius:8px}button{min-height:44px;padding:10px 18px;border:0;border-radius:9px;background:#3879d7;color:#fff;font-weight:bold}button:disabled{opacity:.5}.bad-text{color:#fecaca}.diag-control-row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.diag-control-row h2{margin:0}.diag-off-btn{background:#30333d;border:1px solid #59606b;font-size:12px;min-height:36px;padding:6px 12px;white-space:nowrap}
-</style></head><body><main class="wrap"><section class="card"><header class="diagnose-heading"><h1>SmartSubsV2 Diagnose</h1><div class="muted">${escapeHtml(formatMalaysiaTime(Date.now()))}</div></header><div class="status"><span class="pill neutral">OFF</span><div class="status-copy"><div class="status-title">Diagnostics recording is off</div><div class="muted">Translation, Queue and cache still work normally.</div></div></div></section>${controls}<p class="muted">Old events remain in KV until their existing 24-hour expiry. No diagnostic history is read while OFF.</p></main></body></html>`
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101116;color:#f4f4f5;font-family:system-ui,-apple-system,sans-serif}.wrap{max-width:920px;margin:auto;padding:18px 12px 40px}.card{background:#181a21;border:1px solid #30333d;border-radius:16px;padding:16px;margin-bottom:12px}.hero-card{padding:20px 16px 16px}h1{font-size:24px;margin:0}.diagnose-heading{text-align:center}.diagnose-heading h1{margin:0 0 6px}.diagnose-heading .muted{font-variant-numeric:tabular-nums}.muted{color:#aeb1bb;font-size:13px}.hero-state{text-align:center;margin:18px auto 14px;max-width:620px}.hero-state-title{font-size:20px;font-weight:800;margin-bottom:4px}.hero-diagnostics{display:flex;align-items:center;justify-content:center;gap:10px;border-top:1px solid #30333d;padding-top:14px;margin-top:14px;font-size:18px}.diag-status-toggle{cursor:pointer;display:inline-flex;align-items:center;justify-content:center;border-radius:999px;min-width:62px;min-height:40px;padding:7px 14px;font-weight:900;font-size:15px;text-decoration:none;border:0}.diag-status-toggle.neutral{background:#30333d;color:#e5e7eb}.diag-setup label{display:block;font-weight:700;margin-bottom:8px}.diag-on-row{display:flex;gap:8px;align-items:center}.diag-on-row input{flex:1;min-width:0;min-height:44px;padding:10px;background:#101116;color:#fff;border:1px solid #59606b;border-radius:8px}.diag-on-row button{min-height:44px;padding:10px 18px;border:0;border-radius:9px;background:#3879d7;color:#fff;font-weight:bold}.diag-on-row button:disabled,.diag-on-row input:disabled{opacity:.5}.bad-text{color:#fecaca}@media(max-width:640px){.diag-on-row{align-items:stretch;flex-direction:column}.diag-on-row button{width:100%}}
+</style></head><body><main class="wrap"><section class="card hero-card"><header class="diagnose-heading"><h1>SmartSubsV2 Diagnose</h1><div class="muted">${escapeHtml(formatMalaysiaTime(Date.now()))}</div></header><div class="hero-state"><div class="hero-state-title">Diagnostics recording is off</div><div class="muted">Translation, Queue and cache still work normally.</div></div><div class="hero-diagnostics"><span>Diagnostics:</span><a class="diag-status-toggle neutral" href="#diag-admin">OFF</a></div></section>${controls}<p class="muted">Old events remain in KV until their existing 24-hour expiry. No diagnostic history is read while OFF.</p></main></body></html>`
   }
   const sorted = [...events].sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0))
   const verdict = deriveVerdict(sorted)
@@ -641,11 +638,41 @@ input{display:block;width:100%;max-width:430px;min-height:44px;margin:10px 0;pad
   const coldTime = coldForRequest?.totalMs
   const hasNativeMalay = Number(lastSubtitle?.malayCount || 0) > 0
   const activeFailure = lastFailure && (!lastDelivery || Number(lastFailure.ts || 0) > Number(lastDelivery.ts || 0)) ? lastFailure : null
+  const aiTracks = Number(lastSubtitle?.aiCandidateCount ?? lastSubtitle?.englishTrackCount ?? lastSubtitle?.englishCandidateCount ?? 0)
+  const englishTracks = Number(lastSubtitle?.englishTrackCount ?? lastSubtitle?.englishCandidateCount ?? 0)
+  const nativeMalayTracks = Number(lastSubtitle?.malayCount || 0)
+  const reportedTracks = Number(lastSubtitle?.subtitleCount || 0)
+  const totalTracks = reportedTracks > 0 ? reportedTracks : (aiTracks + englishTracks + nativeMalayTracks)
+  const sourceSelected = selectedId !== 'Not available'
+  const coldTokens = Number(coldForRequest?.geminiTotalTokensTotal || 0)
+  const availableParts = [`${aiTracks} AI`, `${englishTracks} English`]
+  if (nativeMalayTracks > 0) availableParts.push(`${nativeMalayTracks} Native Malay`)
+  const availableSummary = availableParts.join(' · ')
+  let translationValue = 'Waiting'
+  let translationSub = lastSubtitle ? (aiTracks > 0 ? 'Select an AI track' : 'No AI candidate available') : 'No subtitle request'
+  if (coldForRequest) {
+    translationValue = 'Ready'
+    translationSub = `${formatDuration(coldTime)}${coldTokens > 0 ? ` · ${coldTokens.toLocaleString('en-US')} tokens` : ''}`
+  } else if (deliveryForRequest?.cache === 'HIT') {
+    translationValue = 'Cached'
+    translationSub = 'No Gemini call'
+  } else if (sourceSelected) {
+    translationValue = 'Preparing'
+    translationSub = 'Selected source is being prepared'
+  }
+  const deliveryValue = deliveryForRequest ? String(deliveryForRequest.cache || 'Delivered') : '—'
+  const deliverySub = deliveryForRequest ? `${formatDuration(deliveryTime)} · Delivered` : 'Not started'
+  const waitingForSelection = Boolean(lastSubtitle && aiTracks > 0 && !sourceSelected && !activeFailure)
+  const heroTitle = waitingForSelection ? 'Ready for selection' : status.title
+  const heroExplanation = waitingForSelection
+    ? `${aiTracks} AI Malay · ${englishTracks} English${nativeMalayTracks > 0 ? ` · ${nativeMalayTracks} Native Malay` : ''} tracks available. Translation starts only after an AI track is selected.`
+    : status.explanation
 
   const guidance = activeFailure
     ? 'A recent failure was recorded. See the failure details and recent events below.' : ''
 
-  const rawEvents = sorted.map(renderTechnicalEvent).join('') || '<p class="muted">No request events recorded in the last 24 hours.</p>'
+  const summaryEvents = sorted.map(renderTechnicalEvent).join('') || '<p class="muted">No request events recorded since the last clear.</p>'
+  const rawEvents = sorted.map(renderRawTechnicalEvent).join('') || '<p class="muted">No raw events recorded since the last clear.</p>'
   const exportPayload = {
     format: 'smartsubsv2-diagnose-log-v1',
     build: BUILD_ID,
@@ -654,13 +681,32 @@ input{display:block;width:100%;max-width:430px;min-height:44px;margin:10px 0;pad
     overview: {
       latestMedia: compactMediaLabel(lastSubtitle),
       malayAi: compactMalayAutoStatus(lastSubtitle),
-      tracksReturned: Number(lastSubtitle?.subtitleCount || 0),
+      tracksReturned: totalTracks,
+      aiTracks,
+      englishTracks,
+      nativeMalayTracks,
+      availableSummary,
       englishSource: selectedId === 'Not available' ? '' : selectedId,
+      translationStatus: translationValue,
+      translationSummary: translationSub,
+      deliveryStatus: deliveryValue,
+      deliverySummary: deliverySub,
       deliveryMs: deliveryTime === undefined ? null : Number(deliveryTime),
       deliveryCache: deliveryForRequest?.cache || '',
       coldTranslationMs: coldTime === undefined ? null : Number(coldTime),
       nativeMalay: hasNativeMalay
     },
+    // Summary download mirrors the Summary tab using already-loaded events.
+    summaries: sorted.map(item => {
+      const view = eventPresentation(item)
+      return {
+        ts: Number(item.ts || 0),
+        category: view.category,
+        title: view.title,
+        summary: view.summary,
+        metrics: view.metrics
+      }
+    }),
     // Export exactly the already-loaded diagnostic events. Re-sanitise before
     // embedding so an accidental direct caller can never export secrets/URLs.
     events: sorted.map(item => sanitiseEvent(item))
@@ -670,28 +716,24 @@ input{display:block;width:100%;max-width:430px;min-height:44px;margin:10px 0;pad
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SmartSubsV2 Diagnose</title>
 <style>
-:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101116;color:#f4f4f5;font-family:system-ui,-apple-system,sans-serif}.wrap{max-width:920px;margin:auto;padding:18px 12px 40px}.card{background:#181a21;border:1px solid #30333d;border-radius:16px;padding:16px;margin-bottom:12px}h1{font-size:24px;margin:0 0 8px}.diagnose-heading{text-align:center;margin-bottom:20px}.diagnose-heading h1{margin:0 0 6px}.diagnose-heading .muted{font-variant-numeric:tabular-nums}h2{font-size:17px;margin:0 0 12px}.muted{color:#aeb1bb;font-size:13px}.status{display:flex;gap:10px;align-items:flex-start}.pill{display:inline-flex;align-items:center;border-radius:999px;padding:5px 10px;font-weight:800;font-size:12px;letter-spacing:.02em}.good{background:#123b29;color:#a7f3d0}.warn{background:#493812;color:#fde68a}.bad{background:#4a1d24;color:#fecaca}.neutral{background:#30333d;color:#e5e7eb}.status-copy{flex:1}.status-title{font-size:20px;font-weight:800;margin-bottom:4px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric{background:#111319;border:1px solid #2b2e37;border-radius:12px;padding:12px}.metric .label{color:#aeb1bb;font-size:12px}.metric .value{font-size:18px;font-weight:800;margin-top:3px;word-break:break-word}.metric .sub{color:#aeb1bb;font-size:12px;margin-top:4px;word-break:break-word}.meta-row{display:grid;grid-template-columns:90px 42px 1fr;gap:8px;padding:8px 0;border-bottom:1px solid #30333d;align-items:start}.meta-row:last-child{border-bottom:0}.meta-row .yes{color:#a7f3d0}.meta-row .no{color:#fca5a5}.meta-row small{color:#c7c9d1;word-break:break-word}.guide{font-size:15px;line-height:1.5}.event-card{border-top:1px solid #30333d;padding:14px 0}.event-card:first-child{border-top:0}.event-top{display:flex;gap:10px;justify-content:space-between;align-items:center;margin-bottom:8px}.event-top time{font-size:12px;color:#aeb1bb}.event-badge{display:inline-flex;align-items:center;border-radius:999px;padding:4px 8px;font-size:10px;font-weight:900;letter-spacing:.06em}.event-title{font-size:15px;font-weight:800;margin-bottom:2px;text-transform:none}.event-machine{display:block;color:#8f93a1;font-size:10px;margin-bottom:5px}.event-summary{font-size:13px;color:#d7d8dd;line-height:1.45;word-break:break-word}.event-metrics{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.event-metrics span{background:#111319;border:1px solid #292c34;border-radius:7px;padding:4px 7px;font-size:11px;word-break:break-word}.event-metrics b{color:#aeb1bb;font-weight:600;margin-right:3px}.event-raw{margin-top:8px}.event-raw>summary{font-size:11px;color:#aeb1bb;font-weight:700;padding:3px 0}.event-detail{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}.event-detail span{background:#0f1116;border-radius:7px;padding:4px 6px;font-size:11px;word-break:break-word}.event-detail b{color:#aeb1bb;font-weight:600}details summary{cursor:pointer;font-weight:800;padding:4px 0}code{color:#c9ffdc}input{display:block;width:100%;max-width:430px;min-height:44px;margin:10px 0;padding:10px;background:#101116;color:#fff;border:1px solid #59606b;border-radius:8px}button{min-height:44px;padding:10px 18px;border:0;border-radius:9px;background:#3879d7;color:#fff;font-weight:bold}button:disabled{opacity:.5}.bad-text{color:#fecaca}.diag-control-row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.diag-control-row h2{margin:0}.diag-off-btn{background:#30333d;border:1px solid #59606b;font-size:12px;min-height:36px;padding:6px 12px;white-space:nowrap}.event-toolbar{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 6px}.secondary-btn{background:#262a33;border:1px solid #4b5160;min-height:36px;padding:7px 11px;font-size:12px}.export-note{margin-top:0}@media(max-width:640px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.media-metric{grid-column:1/-1}.meta-row{grid-template-columns:82px 38px 1fr}.event-top{align-items:flex-start;flex-direction:column;gap:5px}}
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101116;color:#f4f4f5;font-family:system-ui,-apple-system,sans-serif}.wrap{max-width:920px;margin:auto;padding:18px 12px 40px}.card{background:#181a21;border:1px solid #30333d;border-radius:16px;padding:16px;margin-bottom:12px}.hero-card{padding:20px 16px 16px}h1{font-size:24px;margin:0}h2{font-size:17px;margin:0}.diagnose-heading{text-align:center}.diagnose-heading h1{margin:0 0 6px}.diagnose-heading .muted{font-variant-numeric:tabular-nums}.muted{color:#aeb1bb;font-size:13px}.hero-state{text-align:center;margin:18px auto 8px;max-width:680px}.hero-state-title{font-size:21px;font-weight:850;margin-bottom:5px}.hero-state-copy{color:#c7c9d1;font-size:14px;line-height:1.45}.hero-meta{text-align:center;margin:10px 0 0}.hero-diagnostics{display:flex;align-items:center;justify-content:center;gap:10px;border-top:1px solid #30333d;padding-top:14px;margin-top:14px;font-size:18px}.hero-diagnostics form{margin:0}.diag-status-toggle{cursor:pointer;display:inline-flex;align-items:center;justify-content:center;border-radius:999px;min-width:62px;min-height:40px;padding:7px 14px;font-weight:900;font-size:15px;border:0}.diag-status-toggle.good{background:#123b29;color:#a7f3d0}.diag-status-toggle.neutral{background:#30333d;color:#e5e7eb}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:12px}.metric{background:#111319;border:1px solid #2b2e37;border-radius:12px;padding:12px}.metric .label{color:#aeb1bb;font-size:12px}.metric .value{font-size:18px;font-weight:800;margin-top:3px;word-break:break-word}.metric .sub{color:#aeb1bb;font-size:12px;margin-top:4px;word-break:break-word}.media-metric{grid-column:1/-1}.guide{font-size:15px;line-height:1.5}.technical-heading{display:flex;align-items:center;justify-content:space-between;gap:10px}.event-count{display:inline-flex;align-items:center;justify-content:center;min-width:26px;height:24px;padding:0 8px;margin-left:5px;border-radius:999px;background:#30333d;color:#e5e7eb;font-size:11px;vertical-align:middle}.event-card{border-top:1px solid #30333d;padding:14px 0}.event-card:first-child{border-top:0}.event-top{display:flex;gap:10px;justify-content:space-between;align-items:center;margin-bottom:8px}.event-top time{font-size:12px;color:#aeb1bb}.event-badge{display:inline-flex;align-items:center;border-radius:999px;padding:4px 8px;font-size:10px;font-weight:900;letter-spacing:.06em}.good{background:#123b29;color:#a7f3d0}.warn{background:#493812;color:#fde68a}.bad{background:#4a1d24;color:#fecaca}.neutral{background:#30333d;color:#e5e7eb}.event-title{font-size:15px;font-weight:800;margin-bottom:2px}.event-summary{font-size:13px;color:#d7d8dd;line-height:1.45;word-break:break-word}.event-metrics{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.event-metrics span{background:#111319;border:1px solid #292c34;border-radius:7px;padding:4px 7px;font-size:11px;word-break:break-word}.event-metrics b{color:#aeb1bb;font-weight:600;margin-right:3px}.event-detail{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}.event-detail span{background:#0f1116;border-radius:7px;padding:4px 6px;font-size:11px;word-break:break-word}.event-detail b{color:#aeb1bb;font-weight:600}code{color:#c9ffdc}.event-tabs{margin-top:10px}.event-tab-input{position:absolute;opacity:0;pointer-events:none}.event-tab-labels{display:flex;gap:8px;border-bottom:1px solid #30333d;margin-bottom:4px}.event-tab-label{display:inline-flex;align-items:center;justify-content:center;min-height:38px;padding:7px 14px;color:#aeb1bb;font-size:12px;font-weight:800;cursor:pointer;border-bottom:2px solid transparent}.event-tab-panel{display:none}.event-tab-input#events-summary:checked~.event-tab-labels label[for=events-summary],.event-tab-input#events-raw:checked~.event-tab-labels label[for=events-raw]{color:#fff;border-bottom-color:#6aa3ff}.event-tab-input#events-summary:checked~.summary-panel,.event-tab-input#events-raw:checked~.raw-panel{display:block}.event-toolbar{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 6px}.secondary-btn{background:#262a33;border:1px solid #4b5160;min-height:36px;padding:7px 11px;font-size:12px;color:#fff;font-weight:800;border-radius:9px}.raw-event-card{border-top:1px solid #30333d;padding:14px 0}.raw-event-card:first-child{border-top:0}.raw-event-top{display:flex;gap:10px;justify-content:space-between;align-items:flex-start;margin-bottom:8px}.raw-event-top code{font-size:12px}.raw-event-top time{font-size:12px;color:#aeb1bb}.clear-menu{display:inline-block}.clear-menu>summary{list-style:none;cursor:pointer}.clear-menu>summary::-webkit-details-marker{display:none}.danger-btn{background:#3a2528;border-color:#714249;color:#fecaca}.clear-confirm{margin-top:8px;padding:10px;border:1px solid #4b5160;border-radius:10px;background:#111319;max-width:360px}.clear-confirm p{margin:0 0 8px}.clear-confirm button{background:#7f1d1d;min-height:36px;padding:7px 11px;font-size:12px;color:#fff;border:0;border-radius:9px;font-weight:800}.technical-meta{margin:7px 0 0}.bad-text{color:#fecaca}@media(max-width:640px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.event-top{align-items:flex-start;flex-direction:column;gap:5px}.hero-state{margin-top:15px}.card{padding:14px}.hero-card{padding:18px 14px 14px}}
 </style></head>
 <body><main class="wrap">
-<section class="card"><header class="diagnose-heading"><h1>SmartSubsV2 Diagnose</h1><div class="muted">${escapeHtml(formatMalaysiaTime(Date.now()))}</div></header><div class="status"><span class="pill ${status.tone}">${escapeHtml(status.tone === 'good' ? 'OK' : status.tone === 'bad' ? 'ERROR' : status.tone === 'warn' ? 'WAIT' : 'INFO')}</span><div class="status-copy"><div class="status-title">${escapeHtml(status.title)}</div><div class="muted">${escapeHtml(status.explanation)}</div></div></div><p class="muted">Latest subtitle request: ${escapeHtml(lastSubtitle ? formatMalaysiaTime(lastSubtitle.ts) : 'Not recorded')}</p></section>
-
-${controls}
+<section class="card hero-card"><header class="diagnose-heading"><h1>SmartSubsV2 Diagnose</h1><div class="muted">${escapeHtml(formatMalaysiaTime(Date.now()))}</div></header><div class="hero-state ${escapeHtml(status.tone)}"><div class="hero-state-title">${escapeHtml(heroTitle)}</div><div class="hero-state-copy">${escapeHtml(heroExplanation)}</div></div><p class="muted hero-meta">Latest subtitle request: ${escapeHtml(lastSubtitle ? formatMalaysiaTime(lastSubtitle.ts) : 'Not recorded')}</p><div class="hero-diagnostics"><span>Diagnostics:</span><form method="POST" action="diagnose/toggle" autocomplete="off"><button class="diag-status-toggle good" type="submit" name="action" value="off" aria-label="Turn Diagnostics off">ON</button></form></div>${control.error ? `<p class="bad-text">${escapeHtml(control.error)}</p>` : ''}</section>
 
 <section class="card"><h2>Overview</h2><div class="grid">
 <div class="metric media-metric"><div class="label">Latest media</div><div class="value">${escapeHtml(compactMediaLabel(lastSubtitle))}</div></div>
-<div class="metric"><div class="label">Malay AI</div><div class="value">${escapeHtml(compactMalayAutoStatus(lastSubtitle))}</div><div class="sub">${escapeHtml(lastSubtitle ? `${lastSubtitle.subtitleCount || 0} tracks returned` : 'No subtitle request')}</div></div>
-<div class="metric"><div class="label">English source</div><div class="value">${escapeHtml(selectedId === 'Not available' ? '—' : selectedId)}</div></div>
-<div class="metric"><div class="label">Delivery</div><div class="value">${deliveryTime === undefined ? '—' : formatDuration(deliveryTime)}</div><div class="sub">${escapeHtml(deliveryForRequest?.cache || 'Not recorded')}</div></div>
-<div class="metric"><div class="label">Cold translation</div><div class="value">${coldTime === undefined ? '—' : formatDuration(coldTime)}</div><div class="sub">${coldTime === undefined ? 'Not recorded for this request' : 'Latest request'}</div></div>
-${hasNativeMalay ? `<div class="metric"><div class="label">Native Malay</div><div class="value">Available</div></div>` : ''}
+<div class="metric"><div class="label">Available</div><div class="value">${escapeHtml(lastSubtitle ? `${totalTracks} tracks` : '—')}</div><div class="sub">${escapeHtml(lastSubtitle ? availableSummary : 'No subtitle request')}</div></div>
+<div class="metric"><div class="label">English source</div><div class="value">${escapeHtml(sourceSelected ? selectedId : '—')}</div><div class="sub">${escapeHtml(sourceSelected ? 'OpenSubtitles' : 'Not selected')}</div></div>
+<div class="metric"><div class="label">Translation</div><div class="value">${escapeHtml(translationValue)}</div><div class="sub">${escapeHtml(translationSub)}</div></div>
+<div class="metric"><div class="label">Delivery</div><div class="value">${escapeHtml(deliveryValue)}</div><div class="sub">${escapeHtml(deliverySub)}</div></div>
 </div></section>
 
 ${guidance ? `<section class="card"><h2>Note</h2><div class="guide">${escapeHtml(guidance)}</div></section>` : ''}
 
 ${activeFailure ? `<section class="card"><h2>Latest failure</h2><div class="metric"><div class="label">${escapeHtml(activeFailure.event)}</div><div class="value">${escapeHtml(activeFailure.failureStage || activeFailure.status || 'Unknown stage')}</div><div class="sub">${escapeHtml(activeFailure.error || activeFailure.reason || '')}</div></div></section>` : ''}
 
-
-<section class="card"><details><summary>Technical events (${sorted.length})</summary><div class="event-toolbar"><button id="save-log-json" class="secondary-btn" type="button">Save Log (.json)</button><button id="save-log-txt" class="secondary-btn" type="button">Save Summary (.txt)</button></div><p class="muted">Build ${BUILD_ID} | Verdict <code>${escapeHtml(verdict)}</code> | Events retained for up to 24 hours (MYT).</p><p class="muted export-note">Downloads use the events already loaded on this page. No additional KV read or write.</p>${rawEvents}</details><textarea id="diagnose-export-data" hidden>${exportData}</textarea><script>${DIAG_EXPORT_SCRIPT}</script></section>
+<section class="card"><div class="technical-heading"><h2>Technical Events <span class="event-count">${sorted.length}</span></h2></div><div class="event-tabs"><input class="event-tab-input" type="radio" name="event-tab" id="events-summary" checked><input class="event-tab-input" type="radio" name="event-tab" id="events-raw"><div class="event-tab-labels"><label class="event-tab-label" for="events-summary">Summary</label><label class="event-tab-label" for="events-raw">Raw</label></div><div class="event-toolbar"><button id="save-log-json" class="secondary-btn" type="button">Save Log (.json)</button><button id="save-log-txt" class="secondary-btn" type="button">Save Summary (.txt)</button><details class="clear-menu"><summary class="secondary-btn danger-btn">Clear Log</summary><div class="clear-confirm"><p class="muted">Clear the current Diagnose timeline? Diagnostics stays ON. Older KV events are not deleted; they expire normally and are hidden by a new cutoff.</p><form method="POST" action="diagnose/clear"><button type="submit">Confirm clear</button></form></div></details></div><p class="muted technical-meta">Build ${BUILD_ID} · Verdict <code>${escapeHtml(verdict)}</code> · 24-hour history (MYT)</p><div class="event-tab-panel summary-panel">${summaryEvents}</div><div class="event-tab-panel raw-panel">${rawEvents}</div></div><textarea id="diagnose-export-data" hidden>${exportData}</textarea><script>${DIAG_EXPORT_SCRIPT}</script></section>
 </main></body></html>`
 }
 async function prefetchTranslation(options = {}) {
@@ -1057,7 +1099,8 @@ export class TranslationDeliveryRelay {
       if (payload?.enabled !== true && payload?.enabled !== false) return new Response(null, { status: 400 })
       const previous = await this.ctx.storage.get('diagnostics:state')
       const enabled = payload.enabled === true
-      const since = enabled ? (previous?.enabled ? Number(previous.since) || Date.now() : Date.now()) : 0
+      const reset = payload.reset === true
+      const since = enabled ? (reset || !previous?.enabled ? Date.now() : Number(previous.since) || Date.now()) : 0
       await this.ctx.storage.put('diagnostics:state', { enabled, since })
       return new Response(JSON.stringify({ enabled, since }), {
         headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }
@@ -1896,6 +1939,23 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
     return send(200, 'text/html; charset=utf-8', renderConfiguredDiagnosePage(configId, events, {
       ...state, ready: diagnosticAdminReady(env) && Boolean(monitorStub(env, configId))
     }), { noStore: true, csp: true, scriptHash: DIAG_EXPORT_SCRIPT_HASH, headers: { 'x-robots-tag': 'noindex, nofollow' } })
+  }
+
+  if (request.method === 'POST' && suffix === '/diagnose/clear') {
+    const state = await diagnosticState(env, configId)
+    if (!state.enabled) return send(409, 'text/plain; charset=utf-8', 'Diagnostics is not enabled', { noStore: true })
+    const stub = monitorStub(env, configId)
+    if (!stub) return send(503, 'text/plain; charset=utf-8', 'Diagnostics switch requires SMARTSUBS_DELIVERY', { noStore: true })
+    try {
+      const response = await stub.fetch('https://smartsubs-monitor.internal/diagnostics/state', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled: true, reset: true })
+      })
+      if (!response.ok) throw new Error('Timeline reset failed')
+    } catch { return send(503, 'text/plain; charset=utf-8', 'Unable to clear Diagnose timeline. Try again.', { noStore: true }) }
+    return new Response(null, { status: 303, headers: {
+      location: new URL(request.url).pathname.replace(/\/clear$/, ''),
+      'cache-control': 'no-store', 'referrer-policy': 'no-referrer'
+    } })
   }
 
   if (request.method === 'POST' && suffix === '/diagnose/toggle') {

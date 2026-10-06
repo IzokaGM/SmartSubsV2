@@ -6,7 +6,7 @@ const { sanitiseEvent } = require('../src/diagnostics')
 
 const when = (hour, minute = 0, second = 0) => Date.UTC(2026, 9, 6, hour, minute, second)
 
-test('Technical events render compact summaries with expandable raw details', async () => {
+test('Technical events separate compact Summary and full Raw tabs', async () => {
   const { renderConfiguredDiagnosePage } = await import('../src/cloudflare-worker.mjs')
   const html = renderConfiguredDiagnosePage('config', [
     {
@@ -31,9 +31,18 @@ test('Technical events render compact summaries with expandable raw details', as
   assert.match(html, /Source 4374548 · Cache HIT · 677 ms/)
   assert.match(html, /<div class="event-title">Subtitle discovery<\/div>/)
   assert.match(html, /14 tracks · 7 AI Malay · 7 English/)
-  assert.match(html, /<details class="event-raw"><summary>Raw details<\/summary>/)
-  assert.match(html, /<b>englishSourceIds<\/b>=4374548,3340583/)
-  assert.match(html, /<div class="label">English source<\/div><div class="value">4374548<\/div>/)
+  assert.match(html, /id="events-summary" checked/)
+  assert.match(html, /id="events-raw"/)
+  assert.match(html, /for="events-summary">Summary<\/label>/)
+  assert.match(html, /for="events-raw">Raw<\/label>/)
+  assert.doesNotMatch(html, /Raw details/)
+  const summaryPanel = html.match(/<div class="event-tab-panel summary-panel">([\s\S]*?)<\/div><div class="event-tab-panel raw-panel">/)?.[1] || ''
+  const rawPanel = html.match(/<div class="event-tab-panel raw-panel">([\s\S]*?)<\/div><\/div><textarea/)?.[1] || ''
+  assert.doesNotMatch(summaryPanel, /englishSourceIds/)
+  assert.match(rawPanel, /<b>englishSourceIds<\/b>=4374548,3340583/)
+  assert.match(html, /<div class="label">English source<\/div><div class="value">4374548<\/div><div class="sub">OpenSubtitles<\/div>/)
+  assert.match(html, /<h2>Technical Events <span class="event-count">3<\/span><\/h2>/)
+  assert.doesNotMatch(html, /<details><summary>Technical events/)
 })
 
 test('Diagnostic sanitizer keeps selected source ID in the existing event record', () => {
