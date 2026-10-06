@@ -43,6 +43,13 @@ test('Technical events separate compact Summary and full Raw tabs', async () => 
   assert.match(html, /<div class="label">English source<\/div><div class="value">4374548<\/div><div class="sub">OpenSubtitles<\/div>/)
   assert.match(html, /<h2>Technical Events <span class="event-count">3<\/span><\/h2>/)
   assert.doesNotMatch(html, /<details><summary>Technical events/)
+  assert.match(html, /<div class="event-toolbar">[\s\S]*?<div class="event-tab-labels">/)
+  assert.match(html, />Save Log<\/button>/)
+  assert.match(html, />Save Summary<\/button>/)
+  assert.match(html, /<summary class="secondary-btn danger-btn">Clear<\/summary>/)
+  assert.match(html, /Build ondemand-9 · Malay subtitle delivered · 24h history/)
+  assert.match(rawPanel, /Build v2-multicandidate-ondemand-9 · Verdict <code>TRANSLATION_DELIVERED<\/code> · 24-hour history \(MYT\)/)
+  assert.match(html, /<b>Selected<\/b> No source selected/)
 })
 
 test('Diagnostic sanitizer keeps selected source ID in the existing event record', () => {

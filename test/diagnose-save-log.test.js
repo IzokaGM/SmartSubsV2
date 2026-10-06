@@ -37,16 +37,16 @@ test('Diagnose exports already-loaded events as client-side JSON/TXT without ano
     }
   ])
 
-  assert.match(html, /id="save-log-json"[^>]*>Save Log \(\.json\)<\/button>/)
-  assert.match(html, /id="save-log-txt"[^>]*>Save Summary \(\.txt\)<\/button>/)
-  assert.match(html, />Clear Log<\/summary>/)
+  assert.match(html, /id="save-log-json"[^>]*>Save Log<\/button>/)
+  assert.match(html, /id="save-log-txt"[^>]*>Save Summary<\/button>/)
+  assert.match(html, />Clear<\/summary>/)
   assert.match(html, /action="diagnose\/clear"/)
 
   const dataMatch = html.match(/<textarea id="diagnose-export-data" hidden>([\s\S]*?)<\/textarea>/)
   assert.ok(dataMatch, 'embedded export payload must exist')
   const payload = JSON.parse(decodeHtml(dataMatch[1]))
   assert.equal(payload.format, 'smartsubsv2-diagnose-log-v1')
-  assert.equal(payload.build, 'v2-multicandidate-ondemand-8')
+  assert.equal(payload.build, 'v2-multicandidate-ondemand-9')
   assert.equal(payload.overview.latestMedia, 'S1E2 · tt1196946:1:2')
   assert.equal(payload.overview.englishSource, '4374548')
   assert.equal(payload.overview.translationStatus, 'Cached')

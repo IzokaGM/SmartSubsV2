@@ -18,6 +18,8 @@ test('Optimized Overview keeps media plus 2x2 lifecycle metrics with readable va
   ])
   assert.match(html, /class="diagnose-heading"><h1>SmartSubsV2 Diagnose<\/h1><div class="muted">\d{2}\/\d{2}\/\d{4}, \d{1,2}:\d{2}:\d{2} [ap]m MYT<\/div>/)
   assert.match(html, /Latest subtitle request: 24\/09\/2026, 9:26:40 pm MYT/)
+  assert.match(html, /class="hero-state tone-good"/)
+  assert.doesNotMatch(html, /class="hero-state good"/)
   assert.doesNotMatch(html, /MYT\s*\|\s*MYT/)
   assert.match(html, /class="metric media-metric"[^>]*><div class="label">Latest media<\/div><div class="value">S2E23 · tt1196946:2:23<\/div>/)
   assert.match(html, /<div class="label">Available<\/div><div class="value">6 tracks<\/div><div class="sub">3 AI · 3 English<\/div>/)
