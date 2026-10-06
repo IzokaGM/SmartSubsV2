@@ -14,7 +14,7 @@ function sanitiseEvent(event = {}) {
     event: safeText(event.event, 48)
   }
   const allowed = [
-    'type', 'id', 'result', 'error', 'cache', 'status',
+    'type', 'id', 'result', 'error', 'cache', 'status', 'sourceId',
     'upstreamCount', 'malayCount', 'subtitleCount',
     'malayCandidateCount', 'malaySelectedId', 'malaySelectedScore', 'malayTop',
     'nativeConfidence', 'nativeConfidenceReason', 'nativeScoreUplift', 'nativeDecision',

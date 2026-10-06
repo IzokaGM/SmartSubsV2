@@ -19,7 +19,7 @@ const { buildConfiguredUrls, validateGeminiApiKey, renderConfigurePage, escapeHt
 const { nowMs, roundMs, logPerf } = perfModule
 const { recordDiagnostic, readDiagnostics, deriveVerdict } = diagnosticsModule
 
-const BUILD_ID = 'v2-multicandidate-ondemand-4'
+const BUILD_ID = 'v2-multicandidate-ondemand-5'
 const caches = new WeakMap()
 // Per-request memoization only. No cross-request stale state when the owner switches OFF.
 const diagnosticStateByEnv = new WeakMap()
@@ -378,6 +378,141 @@ function formatDuration(value) {
   return `${(ms / 1000).toFixed(ms < 10000 ? 2 : 1)} s`
 }
 
+function compactMetric(label, value) {
+  if (value === undefined || value === null || value === '') return null
+  return { label: String(label), value: String(value) }
+}
+
+function eventPresentation(item = {}) {
+  const event = String(item.event || '')
+  const sourceId = String(item.sourceId || '')
+  const metrics = []
+  let category = 'EVENT'
+  let tone = 'neutral'
+  let title = event || 'Technical event'
+  let summary = ''
+
+  const add = (label, value) => {
+    const metric = compactMetric(label, value)
+    if (metric) metrics.push(metric)
+  }
+
+  if (event === 'subtitle-request') {
+    category = 'DISCOVERY'
+    title = 'Subtitle request'
+    summary = item.id ? compactMediaLabel(item) : 'Player requested subtitle tracks'
+  } else if (event === 'subtitle-result') {
+    category = 'DISCOVERY'
+    tone = item.result === 'error' ? 'bad' : 'good'
+    title = 'Subtitle discovery'
+    const total = Number(item.subtitleCount || 0)
+    const ai = Number(item.aiCandidateCount ?? item.englishTrackCount ?? item.englishCandidateCount ?? 0)
+    const english = Number(item.englishTrackCount ?? item.englishCandidateCount ?? 0)
+    const nativeMalay = Number(item.malayCount || 0)
+    const parts = [`${total} tracks`, `${ai} AI Malay`, `${english} English`]
+    if (nativeMalay > 0) parts.push(`${nativeMalay} Native Malay`)
+    summary = parts.join(' · ')
+    add('Prefetch', item.autoPrefetch === false ? 'OFF' : item.autoPrefetch === true ? 'ON' : undefined)
+    add('Selected', item.englishSelectedId || '—')
+    add('Upstream', item.upstreamCount)
+  } else if (event === 'translation-request') {
+    category = 'TRANSLATE'
+    title = 'AI translation requested'
+    summary = sourceId ? `OpenSubtitles source ${sourceId}` : 'Player requested Malay AI'
+    add('Mode', item.status)
+  } else if (event === 'player-translation-queued' || event === 'queue-enqueued') {
+    category = 'QUEUE'
+    title = 'AI translation queued'
+    summary = sourceId ? `OpenSubtitles source ${sourceId}` : 'Translation job sent to Queue'
+    add('Profile', item.profile)
+    add('Status', item.status)
+  } else if (event === 'queue-deduped') {
+    category = 'QUEUE'
+    title = 'Existing Queue job reused'
+    summary = sourceId ? `OpenSubtitles source ${sourceId}` : 'Duplicate translation job avoided'
+    add('Status', item.status)
+  } else if (event === 'queue-translation-start') {
+    category = 'TRANSLATE'
+    title = 'AI translation started'
+    summary = sourceId ? `OpenSubtitles source ${sourceId}` : 'Queue consumer started translation'
+    add('Profile', item.profile)
+    add('Concurrency', item.concurrency)
+    add('Queue delay', item.queueDelayMs === undefined ? undefined : formatDuration(item.queueDelayMs))
+  } else if (event === 'queue-translation-complete' || event === 'prefetch-complete') {
+    category = 'TRANSLATE'
+    tone = 'good'
+    title = 'AI translation ready'
+    const parts = []
+    if (sourceId) parts.push(`Source ${sourceId}`)
+    if (item.cache) parts.push(`Cache ${item.cache}`)
+    if (item.totalMs !== undefined) parts.push(formatDuration(item.totalMs))
+    summary = parts.join(' · ') || 'Translation completed'
+    add('Gemini calls', item.geminiCalls)
+    add('Tokens', item.geminiTotalTokensTotal)
+    add('Chunks', item.chunks)
+    if (Number(item.missing || 0) > 0 || Number(item.retryRecovered || 0) > 0) {
+      add('Cue recovery', `${Number(item.missing || 0)} missing · ${Number(item.retryRecovered || 0)} recovered`)
+    }
+  } else if (event === 'translation-delivered' || event === 'queue-join-hit') {
+    category = 'DELIVERY'
+    tone = 'good'
+    title = event === 'translation-delivered' ? 'Translation delivered' : 'Queued translation joined'
+    const parts = []
+    if (sourceId) parts.push(`Source ${sourceId}`)
+    if (item.cache) parts.push(`Cache ${item.cache}`)
+    if (item.totalMs !== undefined) parts.push(formatDuration(item.totalMs))
+    if (item.waitMs !== undefined && Number(item.waitMs) > 0) parts.push(`wait ${formatDuration(item.waitMs)}`)
+    summary = parts.join(' · ') || 'Malay subtitle returned to player'
+    add('Join', item.joinStatus)
+    add('Polls', item.polls)
+  } else if (event === 'translation-pending' || event === 'queue-join-start') {
+    category = 'QUEUE'
+    tone = 'warn'
+    title = event === 'translation-pending' ? 'Translation still preparing' : 'Waiting for Queue result'
+    summary = sourceId ? `OpenSubtitles source ${sourceId}` : 'Player is waiting for the selected translation'
+    add('Status', item.status)
+    add('Wait', item.waitMs === undefined ? undefined : formatDuration(item.waitMs))
+    add('Polls', item.polls)
+  } else if (event.includes('failed') || item.error) {
+    category = 'ERROR'
+    tone = 'bad'
+    title = event === 'translation-failed' ? 'Translation failed'
+      : event === 'queue-translation-failed' ? 'Queue translation failed'
+        : event === 'queue-enqueue-failed' ? 'Queue enqueue failed'
+          : 'Technical failure'
+    summary = item.error || item.reason || item.failureStage || item.status || 'Failure recorded'
+    add('Source', sourceId || undefined)
+    add('Stage', item.failureStage)
+    add('Time', item.totalMs === undefined ? undefined : formatDuration(item.totalMs))
+  } else if (event.startsWith('queue-')) {
+    category = 'QUEUE'
+    title = event.replaceAll('-', ' ')
+    summary = sourceId ? `OpenSubtitles source ${sourceId}` : (item.status || 'Queue activity')
+    add('Wait', item.waitMs === undefined ? undefined : formatDuration(item.waitMs))
+  } else if (event.startsWith('prefetch-')) {
+    category = 'PREFETCH'
+    title = event.replaceAll('-', ' ')
+    summary = sourceId ? `OpenSubtitles source ${sourceId}` : (item.status || 'Legacy prefetch activity')
+  } else {
+    title = event ? event.replaceAll('-', ' ') : 'Technical event'
+    summary = sourceId ? `OpenSubtitles source ${sourceId}` : (item.status || item.result || '')
+  }
+
+  return { category, tone, title, summary, metrics: metrics.slice(0, 6) }
+}
+
+function renderTechnicalEvent(item = {}) {
+  const view = eventPresentation(item)
+  const detail = Object.entries(item)
+    .filter(([key]) => !['ts', 'event'].includes(key))
+    .map(([key, value]) => `<span><b>${escapeHtml(key)}</b>=${escapeHtml(Array.isArray(value) ? value.join(',') : value)}</span>`)
+    .join('') || '<span>No details</span>'
+  const metrics = view.metrics
+    .map(metric => `<span><b>${escapeHtml(metric.label)}</b> ${escapeHtml(metric.value)}</span>`)
+    .join('')
+  return `<article class="event-card"><div class="event-top"><span class="event-badge ${escapeHtml(view.tone)}">${escapeHtml(view.category)}</span><time>${escapeHtml(formatMalaysiaTime(item.ts))}</time></div><div class="event-title">${escapeHtml(view.title)}</div><code class="event-machine">${escapeHtml(item.event || '')}</code>${view.summary ? `<div class="event-summary">${escapeHtml(view.summary)}</div>` : ''}${metrics ? `<div class="event-metrics">${metrics}</div>` : ''}<details class="event-raw"><summary>Raw details</summary><div class="event-detail">${detail}</div></details></article>`
+}
+
 function verdictPresentation(verdict) {
   const map = {
     NO_SUBTITLE_REQUEST_SEEN: ['Waiting for subtitle request', 'neutral', 'The player has not requested this configured SmartSubs addon yet.'],
@@ -410,7 +545,7 @@ function renderConfiguredDiagnosePage(configId, events, control = { enabled: tru
   const controls = diagnosticControlHtml(control, control.ready, control.error)
   if (control.enabled === false) {
     return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>SmartSubsV2 Diagnose</title><style>
-:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101116;color:#f4f4f5;font-family:system-ui,-apple-system,sans-serif}.wrap{max-width:920px;margin:auto;padding:18px 12px 40px}.card{background:#181a21;border:1px solid #30333d;border-radius:16px;padding:16px;margin-bottom:12px}h1{font-size:24px;margin:0 0 8px}.diagnose-heading{text-align:center;margin-bottom:20px}.diagnose-heading h1{margin:0 0 6px}.diagnose-heading .muted{font-variant-numeric:tabular-nums}h2{font-size:17px;margin:0 0 12px}.muted{color:#aeb1bb;font-size:13px}.status{display:flex;gap:10px;align-items:flex-start}.pill{display:inline-flex;align-items:center;border-radius:999px;padding:5px 10px;font-weight:800;font-size:12px;letter-spacing:.02em}.good{background:#123b29;color:#a7f3d0}.warn{background:#493812;color:#fde68a}.bad{background:#4a1d24;color:#fecaca}.neutral{background:#30333d;color:#e5e7eb}.status-copy{flex:1}.status-title{font-size:20px;font-weight:800;margin-bottom:4px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric{background:#111319;border:1px solid #2b2e37;border-radius:12px;padding:12px}.metric .label{color:#aeb1bb;font-size:12px}.metric .value{font-size:18px;font-weight:800;margin-top:3px;word-break:break-word}.metric .sub{color:#aeb1bb;font-size:12px;margin-top:4px;word-break:break-word}.meta-row{display:grid;grid-template-columns:90px 42px 1fr;gap:8px;padding:8px 0;border-bottom:1px solid #30333d;align-items:start}.meta-row:last-child{border-bottom:0}.meta-row .yes{color:#a7f3d0}.meta-row .no{color:#fca5a5}.meta-row small{color:#c7c9d1;word-break:break-word}.guide{font-size:15px;line-height:1.5}.event-card{border-top:1px solid #30333d;padding:12px 0}.event-card:first-child{border-top:0}.event-head{display:flex;gap:10px;justify-content:space-between;align-items:center;margin-bottom:7px}.event-head time{font-size:12px;color:#aeb1bb}.event-head code{font-size:12px;color:#c9ffdc}.event-detail{display:flex;flex-wrap:wrap;gap:6px}.event-detail span{background:#111319;border-radius:7px;padding:4px 6px;font-size:11px;word-break:break-word}.event-detail b{color:#aeb1bb;font-weight:600}details summary{cursor:pointer;font-weight:800;padding:4px 0}code{color:#c9ffdc}@media(max-width:640px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.media-metric{grid-column:1/-1}.meta-row{grid-template-columns:82px 38px 1fr}.event-head{align-items:flex-start;flex-direction:column;gap:4px}}
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101116;color:#f4f4f5;font-family:system-ui,-apple-system,sans-serif}.wrap{max-width:920px;margin:auto;padding:18px 12px 40px}.card{background:#181a21;border:1px solid #30333d;border-radius:16px;padding:16px;margin-bottom:12px}h1{font-size:24px;margin:0 0 8px}.diagnose-heading{text-align:center;margin-bottom:20px}.diagnose-heading h1{margin:0 0 6px}.diagnose-heading .muted{font-variant-numeric:tabular-nums}h2{font-size:17px;margin:0 0 12px}.muted{color:#aeb1bb;font-size:13px}.status{display:flex;gap:10px;align-items:flex-start}.pill{display:inline-flex;align-items:center;border-radius:999px;padding:5px 10px;font-weight:800;font-size:12px;letter-spacing:.02em}.good{background:#123b29;color:#a7f3d0}.warn{background:#493812;color:#fde68a}.bad{background:#4a1d24;color:#fecaca}.neutral{background:#30333d;color:#e5e7eb}.status-copy{flex:1}.status-title{font-size:20px;font-weight:800;margin-bottom:4px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric{background:#111319;border:1px solid #2b2e37;border-radius:12px;padding:12px}.metric .label{color:#aeb1bb;font-size:12px}.metric .value{font-size:18px;font-weight:800;margin-top:3px;word-break:break-word}.metric .sub{color:#aeb1bb;font-size:12px;margin-top:4px;word-break:break-word}.meta-row{display:grid;grid-template-columns:90px 42px 1fr;gap:8px;padding:8px 0;border-bottom:1px solid #30333d;align-items:start}.meta-row:last-child{border-bottom:0}.meta-row .yes{color:#a7f3d0}.meta-row .no{color:#fca5a5}.meta-row small{color:#c7c9d1;word-break:break-word}.guide{font-size:15px;line-height:1.5}.event-card{border-top:1px solid #30333d;padding:14px 0}.event-card:first-child{border-top:0}.event-top{display:flex;gap:10px;justify-content:space-between;align-items:center;margin-bottom:8px}.event-top time{font-size:12px;color:#aeb1bb}.event-badge{display:inline-flex;align-items:center;border-radius:999px;padding:4px 8px;font-size:10px;font-weight:900;letter-spacing:.06em}.event-title{font-size:15px;font-weight:800;margin-bottom:2px;text-transform:none}.event-machine{display:block;color:#8f93a1;font-size:10px;margin-bottom:5px}.event-summary{font-size:13px;color:#d7d8dd;line-height:1.45;word-break:break-word}.event-metrics{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.event-metrics span{background:#111319;border:1px solid #292c34;border-radius:7px;padding:4px 7px;font-size:11px;word-break:break-word}.event-metrics b{color:#aeb1bb;font-weight:600;margin-right:3px}.event-raw{margin-top:8px}.event-raw>summary{font-size:11px;color:#aeb1bb;font-weight:700;padding:3px 0}.event-detail{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}.event-detail span{background:#0f1116;border-radius:7px;padding:4px 6px;font-size:11px;word-break:break-word}.event-detail b{color:#aeb1bb;font-weight:600}details summary{cursor:pointer;font-weight:800;padding:4px 0}code{color:#c9ffdc}@media(max-width:640px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.media-metric{grid-column:1/-1}.meta-row{grid-template-columns:82px 38px 1fr}.event-top{align-items:flex-start;flex-direction:column;gap:5px}}
 input{display:block;width:100%;max-width:430px;min-height:44px;margin:10px 0;padding:10px;background:#101116;color:#fff;border:1px solid #59606b;border-radius:8px}button{min-height:44px;padding:10px 18px;border:0;border-radius:9px;background:#3879d7;color:#fff;font-weight:bold}button:disabled{opacity:.5}.bad-text{color:#fecaca}.diag-control-row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.diag-control-row h2{margin:0}.diag-off-btn{background:#30333d;border:1px solid #59606b;font-size:12px;min-height:36px;padding:6px 12px;white-space:nowrap}
 </style></head><body><main class="wrap"><section class="card"><header class="diagnose-heading"><h1>SmartSubsV2 Diagnose</h1><div class="muted">${escapeHtml(formatMalaysiaTime(Date.now()))}</div></header><div class="status"><span class="pill neutral">OFF</span><div class="status-copy"><div class="status-title">Diagnostics recording is off</div><div class="muted">Translation, Queue and cache still work normally.</div></div></div></section>${controls}<p class="muted">Old events remain in KV until their existing 24-hour expiry. No diagnostic history is read while OFF.</p></main></body></html>`
   }
@@ -426,10 +561,19 @@ input{display:block;width:100%;max-width:430px;min-height:44px;margin:10px 0;pad
   const lastFailure = sorted.find(item =>
     ['translation-failed', 'queue-translation-failed', 'prefetch-failed'].includes(item.event)
   ) || null
-  const selectedId = lastSubtitle?.englishSelectedId || 'Not available'
-  // The log does not tag delivery/Queue-complete events with a media ID. Never
-  // reuse an older media's duration for the latest subtitle request.
+  // Translation events now retain the selected OpenSubtitles source ID in the
+  // same existing diagnostic record. This changes presentation context only;
+  // it does not add another KV event/read/write.
   const latestRequestTs = Number(lastSubtitle?.ts || 0)
+  const latestSourceEvent = lastSubtitle ? sorted.find(item =>
+    Number(item.ts || 0) >= latestRequestTs && item.sourceId && [
+      'translation-request', 'player-translation-queued', 'queue-enqueued',
+      'queue-translation-start', 'queue-translation-complete',
+      'translation-pending', 'translation-delivered', 'translation-failed'
+    ].includes(item.event)
+  ) : null
+  const selectedId = latestSourceEvent?.sourceId || lastSubtitle?.englishSelectedId || 'Not available'
+  // Never reuse an older media's duration for the latest subtitle request.
   const deliveryForRequest = lastSubtitle && lastDelivery && Number(lastDelivery.ts || 0) >= latestRequestTs
     ? lastDelivery : null
   const coldForRequest = lastSubtitle && lastTranslationComplete && Number(lastTranslationComplete.ts || 0) >= latestRequestTs
@@ -442,18 +586,12 @@ input{display:block;width:100%;max-width:430px;min-height:44px;margin:10px 0;pad
   const guidance = activeFailure
     ? 'A recent failure was recorded. See the failure details and recent events below.' : ''
 
-  const rawEvents = sorted.map(item => {
-    const detail = Object.entries(item)
-      .filter(([key]) => !['ts', 'event'].includes(key))
-      .map(([key, value]) => `<span><b>${escapeHtml(key)}</b>=${escapeHtml(Array.isArray(value) ? value.join(',') : value)}</span>`)
-      .join('')
-    return `<article class="event-card"><div class="event-head"><time>${escapeHtml(formatMalaysiaTime(item.ts))}</time><code>${escapeHtml(item.event)}</code></div><div class="event-detail">${detail || '<span>No details</span>'}</div></article>`
-  }).join('') || '<p class="muted">No request events recorded in the last 24 hours.</p>'
+  const rawEvents = sorted.map(renderTechnicalEvent).join('') || '<p class="muted">No request events recorded in the last 24 hours.</p>'
 
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SmartSubsV2 Diagnose</title>
 <style>
-:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101116;color:#f4f4f5;font-family:system-ui,-apple-system,sans-serif}.wrap{max-width:920px;margin:auto;padding:18px 12px 40px}.card{background:#181a21;border:1px solid #30333d;border-radius:16px;padding:16px;margin-bottom:12px}h1{font-size:24px;margin:0 0 8px}.diagnose-heading{text-align:center;margin-bottom:20px}.diagnose-heading h1{margin:0 0 6px}.diagnose-heading .muted{font-variant-numeric:tabular-nums}h2{font-size:17px;margin:0 0 12px}.muted{color:#aeb1bb;font-size:13px}.status{display:flex;gap:10px;align-items:flex-start}.pill{display:inline-flex;align-items:center;border-radius:999px;padding:5px 10px;font-weight:800;font-size:12px;letter-spacing:.02em}.good{background:#123b29;color:#a7f3d0}.warn{background:#493812;color:#fde68a}.bad{background:#4a1d24;color:#fecaca}.neutral{background:#30333d;color:#e5e7eb}.status-copy{flex:1}.status-title{font-size:20px;font-weight:800;margin-bottom:4px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric{background:#111319;border:1px solid #2b2e37;border-radius:12px;padding:12px}.metric .label{color:#aeb1bb;font-size:12px}.metric .value{font-size:18px;font-weight:800;margin-top:3px;word-break:break-word}.metric .sub{color:#aeb1bb;font-size:12px;margin-top:4px;word-break:break-word}.meta-row{display:grid;grid-template-columns:90px 42px 1fr;gap:8px;padding:8px 0;border-bottom:1px solid #30333d;align-items:start}.meta-row:last-child{border-bottom:0}.meta-row .yes{color:#a7f3d0}.meta-row .no{color:#fca5a5}.meta-row small{color:#c7c9d1;word-break:break-word}.guide{font-size:15px;line-height:1.5}.event-card{border-top:1px solid #30333d;padding:12px 0}.event-card:first-child{border-top:0}.event-head{display:flex;gap:10px;justify-content:space-between;align-items:center;margin-bottom:7px}.event-head time{font-size:12px;color:#aeb1bb}.event-head code{font-size:12px;color:#c9ffdc}.event-detail{display:flex;flex-wrap:wrap;gap:6px}.event-detail span{background:#111319;border-radius:7px;padding:4px 6px;font-size:11px;word-break:break-word}.event-detail b{color:#aeb1bb;font-weight:600}details summary{cursor:pointer;font-weight:800;padding:4px 0}code{color:#c9ffdc}input{display:block;width:100%;max-width:430px;min-height:44px;margin:10px 0;padding:10px;background:#101116;color:#fff;border:1px solid #59606b;border-radius:8px}button{min-height:44px;padding:10px 18px;border:0;border-radius:9px;background:#3879d7;color:#fff;font-weight:bold}button:disabled{opacity:.5}.bad-text{color:#fecaca}.diag-control-row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.diag-control-row h2{margin:0}.diag-off-btn{background:#30333d;border:1px solid #59606b;font-size:12px;min-height:36px;padding:6px 12px;white-space:nowrap}@media(max-width:640px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.media-metric{grid-column:1/-1}.meta-row{grid-template-columns:82px 38px 1fr}.event-head{align-items:flex-start;flex-direction:column;gap:4px}}
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101116;color:#f4f4f5;font-family:system-ui,-apple-system,sans-serif}.wrap{max-width:920px;margin:auto;padding:18px 12px 40px}.card{background:#181a21;border:1px solid #30333d;border-radius:16px;padding:16px;margin-bottom:12px}h1{font-size:24px;margin:0 0 8px}.diagnose-heading{text-align:center;margin-bottom:20px}.diagnose-heading h1{margin:0 0 6px}.diagnose-heading .muted{font-variant-numeric:tabular-nums}h2{font-size:17px;margin:0 0 12px}.muted{color:#aeb1bb;font-size:13px}.status{display:flex;gap:10px;align-items:flex-start}.pill{display:inline-flex;align-items:center;border-radius:999px;padding:5px 10px;font-weight:800;font-size:12px;letter-spacing:.02em}.good{background:#123b29;color:#a7f3d0}.warn{background:#493812;color:#fde68a}.bad{background:#4a1d24;color:#fecaca}.neutral{background:#30333d;color:#e5e7eb}.status-copy{flex:1}.status-title{font-size:20px;font-weight:800;margin-bottom:4px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric{background:#111319;border:1px solid #2b2e37;border-radius:12px;padding:12px}.metric .label{color:#aeb1bb;font-size:12px}.metric .value{font-size:18px;font-weight:800;margin-top:3px;word-break:break-word}.metric .sub{color:#aeb1bb;font-size:12px;margin-top:4px;word-break:break-word}.meta-row{display:grid;grid-template-columns:90px 42px 1fr;gap:8px;padding:8px 0;border-bottom:1px solid #30333d;align-items:start}.meta-row:last-child{border-bottom:0}.meta-row .yes{color:#a7f3d0}.meta-row .no{color:#fca5a5}.meta-row small{color:#c7c9d1;word-break:break-word}.guide{font-size:15px;line-height:1.5}.event-card{border-top:1px solid #30333d;padding:14px 0}.event-card:first-child{border-top:0}.event-top{display:flex;gap:10px;justify-content:space-between;align-items:center;margin-bottom:8px}.event-top time{font-size:12px;color:#aeb1bb}.event-badge{display:inline-flex;align-items:center;border-radius:999px;padding:4px 8px;font-size:10px;font-weight:900;letter-spacing:.06em}.event-title{font-size:15px;font-weight:800;margin-bottom:2px;text-transform:none}.event-machine{display:block;color:#8f93a1;font-size:10px;margin-bottom:5px}.event-summary{font-size:13px;color:#d7d8dd;line-height:1.45;word-break:break-word}.event-metrics{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.event-metrics span{background:#111319;border:1px solid #292c34;border-radius:7px;padding:4px 7px;font-size:11px;word-break:break-word}.event-metrics b{color:#aeb1bb;font-weight:600;margin-right:3px}.event-raw{margin-top:8px}.event-raw>summary{font-size:11px;color:#aeb1bb;font-weight:700;padding:3px 0}.event-detail{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}.event-detail span{background:#0f1116;border-radius:7px;padding:4px 6px;font-size:11px;word-break:break-word}.event-detail b{color:#aeb1bb;font-weight:600}details summary{cursor:pointer;font-weight:800;padding:4px 0}code{color:#c9ffdc}input{display:block;width:100%;max-width:430px;min-height:44px;margin:10px 0;padding:10px;background:#101116;color:#fff;border:1px solid #59606b;border-radius:8px}button{min-height:44px;padding:10px 18px;border:0;border-radius:9px;background:#3879d7;color:#fff;font-weight:bold}button:disabled{opacity:.5}.bad-text{color:#fecaca}.diag-control-row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.diag-control-row h2{margin:0}.diag-off-btn{background:#30333d;border:1px solid #59606b;font-size:12px;min-height:36px;padding:6px 12px;white-space:nowrap}@media(max-width:640px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.media-metric{grid-column:1/-1}.meta-row{grid-template-columns:82px 38px 1fr}.event-top{align-items:flex-start;flex-direction:column;gap:5px}}
 </style></head>
 <body><main class="wrap">
 <section class="card"><header class="diagnose-heading"><h1>SmartSubsV2 Diagnose</h1><div class="muted">${escapeHtml(formatMalaysiaTime(Date.now()))}</div></header><div class="status"><span class="pill ${status.tone}">${escapeHtml(status.tone === 'good' ? 'OK' : status.tone === 'bad' ? 'ERROR' : status.tone === 'warn' ? 'WAIT' : 'INFO')}</span><div class="status-copy"><div class="status-title">${escapeHtml(status.title)}</div><div class="muted">${escapeHtml(status.explanation)}</div></div></div><p class="muted">Latest subtitle request: ${escapeHtml(lastSubtitle ? formatMalaysiaTime(lastSubtitle.ts) : 'Not recorded')}</p></section>
@@ -497,6 +635,7 @@ async function prefetchTranslation(options = {}) {
   }
   if (!match) return null
 
+  let selectedSourceId = ''
   await diagnosticFn(env.SMARTSUBS_CACHE, configId, {
     event: 'prefetch-start',
     status: 'background'
@@ -505,9 +644,11 @@ async function prefetchTranslation(options = {}) {
   try {
     if (!env.SMARTSUBS_CACHE) throw new Error('SMARTSUBS_CACHE KV binding is not configured')
     const tokenData = decodeTranslationTokenData(match[1], secret)
+    selectedSourceId = tokenData.sourceId
     await diagnosticFn(env.SMARTSUBS_CACHE, configId, {
       event: 'translation-request',
-      status: 'prefetch'
+      status: 'prefetch',
+      sourceId: selectedSourceId
     }).catch(() => {})
     const result = await getOrTranslateFn({
       cache: getCache(env),
@@ -521,6 +662,7 @@ async function prefetchTranslation(options = {}) {
     const repair = result.translationStats || {}
     await diagnosticFn(env.SMARTSUBS_CACHE, configId, {
       event: 'prefetch-complete',
+      sourceId: selectedSourceId,
       cache: result.status,
       status: 'ready',
       totalMs,
@@ -556,6 +698,7 @@ async function prefetchTranslation(options = {}) {
     const totalMs = roundMs(nowMs() - startedAt)
     await diagnosticFn(env.SMARTSUBS_CACHE, configId, {
       event: 'prefetch-failed',
+      sourceId: selectedSourceId || undefined,
       status: 'background-failed',
       error: safeMessage(error, userConfig.apiKey),
       totalMs
@@ -1181,6 +1324,7 @@ async function enqueuePrefetchTranslation(options = {}) {
   const diagnosticFn = options.diagnosticFn || ((_kv, id, event) => recordConfiguredDiagnostic(env, id, event))
   const translationToken = parseAutoTranslationToken(autoUrl)
   const cacheKey = String(options.cacheKey || '')
+  const sourceId = String(options.sourceId || '')
   const requestedProfile = normaliseRequestedQueueProfile(options.queueProfile)
 
   if (!translationToken || !configToken || !configId) return false
@@ -1195,7 +1339,8 @@ async function enqueuePrefetchTranslation(options = {}) {
     if (queueJobActive(job) && job.state !== 'ready') {
       await diagnosticFn(env.SMARTSUBS_CACHE, configId, {
         event: 'queue-deduped',
-        status: job.state
+        status: job.state,
+        sourceId: sourceId || undefined
       }).catch(() => {})
       return true
     }
@@ -1211,7 +1356,8 @@ async function enqueuePrefetchTranslation(options = {}) {
     }
     await diagnosticFn(env.SMARTSUBS_CACHE, configId, {
       event: 'queue-enqueue-failed',
-      status: 'queue-missing'
+      status: 'queue-missing',
+      sourceId: sourceId || undefined
     }).catch(() => {})
     return false
   }
@@ -1238,6 +1384,7 @@ async function enqueuePrefetchTranslation(options = {}) {
     await diagnosticFn(env.SMARTSUBS_CACHE, configId, {
       event: 'queue-enqueued',
       status: 'queued',
+      sourceId: sourceId || undefined,
       profile: requestedProfile || 'background-default'
     }).catch(() => {})
     return true
@@ -1251,6 +1398,7 @@ async function enqueuePrefetchTranslation(options = {}) {
     await diagnosticFn(env.SMARTSUBS_CACHE, configId, {
       event: 'queue-enqueue-failed',
       status: 'queue-send-failed',
+      sourceId: sourceId || undefined,
       error: safeMessage(error, '')
     }).catch(() => {})
     return false
@@ -1285,9 +1433,11 @@ async function processQueueMessage(body, env, options = {}) {
 
   let userConfig = null
   let cacheKey = ''
+  let selectedSourceId = ''
   try {
     userConfig = decodeUserConfigToken(configToken, { secret })
     const tokenData = decodeTranslationTokenData(translationToken, secret)
+    selectedSourceId = tokenData.sourceId
     env.__kvUsageTracker?.setMedia(tokenData.media)
     const expectedCacheKey = translationCacheKey(tokenData, userConfig.model, env)
     const suppliedCacheKey = String(payload.cacheKey || '')
@@ -1313,6 +1463,7 @@ async function processQueueMessage(body, env, options = {}) {
 
     await diagnosticFn(env.SMARTSUBS_CACHE, configId, {
       event: 'queue-translation-start',
+      sourceId: selectedSourceId,
       status: 'consumer',
       attempts,
       profile: queueProfileName,
@@ -1364,6 +1515,7 @@ async function processQueueMessage(body, env, options = {}) {
 
     await diagnosticFn(env.SMARTSUBS_CACHE, configId, {
       event: 'queue-translation-complete',
+      sourceId: selectedSourceId,
       cache: result.status,
       status: 'ready',
       attempts,
@@ -1440,6 +1592,7 @@ async function processQueueMessage(body, env, options = {}) {
     const perf = error?.smartsubsPerf || {}
     await diagnosticFn(env.SMARTSUBS_CACHE, configId, {
       event: 'queue-translation-failed',
+      sourceId: selectedSourceId || undefined,
       status: 'consumer-failed',
       attempts,
       profile: queueProfileName,
@@ -1706,16 +1859,19 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
   const translationMatch = request.method === 'GET' && suffix.match(/^\/translated\/([A-Za-z0-9_.-]+)\.vtt$/)
   if (translationMatch) {
     const startedAt = nowMs()
-    await recordConfiguredDiagnostic(env, configId, {
-      event: 'translation-request',
-      status: 'player',
-      ...translationRequestProbe(request)
-    }).catch(() => {})
+    let selectedSourceId = ''
 
     try {
       if (!env.SMARTSUBS_CACHE) throw new Error('SMARTSUBS_CACHE KV binding is not configured')
 
       const tokenData = decodeTranslationTokenData(translationMatch[1], secret)
+      selectedSourceId = tokenData.sourceId
+      await recordConfiguredDiagnostic(env, configId, {
+        event: 'translation-request',
+        status: 'player',
+        sourceId: selectedSourceId,
+        ...translationRequestProbe(request)
+      }).catch(() => {})
       env.__kvUsageTracker?.setMedia(tokenData.media)
       const cache = getCache(env)
       const cacheKey = translationCacheKey(tokenData, userConfig.model, env)
@@ -1740,6 +1896,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
         if (queueJobActive(job)) {
           await recordConfiguredDiagnostic(env, configId, {
             event: 'queue-join-start',
+            sourceId: selectedSourceId,
             status: job.state
           }).catch(() => {})
 
@@ -1769,6 +1926,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
             }
             await recordConfiguredDiagnostic(env, configId, {
               event: 'queue-join-hit',
+              sourceId: selectedSourceId,
               status: joined.jobStatus,
               waitMs: joinWaitMs,
               polls: joinPolls,
@@ -1778,6 +1936,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
             if (joinGraceHit) {
               await recordConfiguredDiagnostic(env, configId, {
                 event: 'queue-grace-hit',
+                sourceId: selectedSourceId,
                 status: joined.jobStatus,
                 waitMs: joinWaitMs,
                 graceMs: joinGraceMs
@@ -1786,6 +1945,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
           } else if (joined.outcome !== 'failed') {
             await recordConfiguredDiagnostic(env, configId, {
               event: 'translation-pending',
+              sourceId: selectedSourceId,
               status: joined.jobStatus,
               waitMs: joinWaitMs,
               polls: joinPolls,
@@ -1810,12 +1970,14 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
           configToken: token,
           configId,
           cacheKey,
+          sourceId: selectedSourceId,
           queueProfile: 'user-selected-stable'
         })
 
         if (queued) {
           await recordConfiguredDiagnostic(env, configId, {
             event: 'player-translation-queued',
+            sourceId: selectedSourceId,
             status: 'queued'
           }).catch(() => {})
 
@@ -1841,6 +2003,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
             if (joinGraceHit) {
               await recordConfiguredDiagnostic(env, configId, {
                 event: 'queue-grace-hit',
+                sourceId: selectedSourceId,
                 status: joined.jobStatus || 'queued',
                 waitMs: joinWaitMs,
                 graceMs: joinGraceMs
@@ -1855,6 +2018,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
           } else if (joined.outcome !== 'failed') {
             await recordConfiguredDiagnostic(env, configId, {
               event: 'translation-pending',
+              sourceId: selectedSourceId,
               status: joined.jobStatus || 'queued',
               waitMs: joinWaitMs,
               polls: joinPolls,
@@ -1893,6 +2057,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
       const repair = result.translationStats || {}
       await recordConfiguredDiagnostic(env, configId, {
         event: 'translation-delivered',
+        sourceId: selectedSourceId,
         cache: result.status,
         totalMs,
         waitMs: joinWaitMs,
@@ -1934,6 +2099,7 @@ async function configuredRequest(request, env, token, suffix, executionCtx = nul
       const classified = classifyTranslationError(error)
       await recordConfiguredDiagnostic(env, configId, {
         event: 'translation-failed',
+        sourceId: selectedSourceId || undefined,
         status: classified.code,
         error: safeMessage(error, userConfig.apiKey),
         totalMs: roundMs(nowMs() - startedAt)
