@@ -68,7 +68,7 @@ function buildAutoSubtitles(englishSubtitles, options = {}) {
 function buildEnglishTracks(upstream) {
   return dedupeSubtitles(getEnglishSubtitles(upstream))
     .map((subtitle, index) => ({
-      id: `smartsubs-eng-${diagnosticSubtitleId(subtitle, index)}`,
+      id: `opensubtitles-eng-${diagnosticSubtitleId(subtitle, index)}`,
       url: String(subtitle.url),
       lang: 'eng'
     }))

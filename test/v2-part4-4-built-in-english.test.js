@@ -30,7 +30,7 @@ test('Part 4.4 exposes all upstream-order and deduplicated English tracks', () =
   })
 
   assert.equal(tracks.length, 6)
-  assert.equal(tracks[0].id, 'smartsubs-eng-wrong')
+  assert.equal(tracks[0].id, 'opensubtitles-eng-wrong')
   assert.deepEqual(new Set(tracks.map(item => item.url)).size, 6)
   assert.deepEqual(new Set(tracks.map(item => item.lang)), new Set(['eng']))
 })
@@ -56,8 +56,8 @@ test('Part 4.4 returns one on-demand Malay AI track per English source plus raw 
   assert.deepEqual(result.subtitles.slice(0, 2).map(item => item.id), ['gemini-ai-eng-one', 'gemini-ai-eng-two'])
   assert.deepEqual(result.subtitles.slice(2).map(item => item.lang), ['eng', 'eng'])
   assert.deepEqual(result.subtitles.slice(2).map(item => item.id), [
-    'smartsubs-eng-eng-one',
-    'smartsubs-eng-eng-two'
+    'opensubtitles-eng-eng-one',
+    'opensubtitles-eng-eng-two'
   ])
   assert.equal(result.autoPrefetch, false)
   assert.equal(result.autoPrefetchReason, 'on-demand-candidate-selection')
@@ -80,7 +80,7 @@ test('Part 4.4 keeps weak-native quota protection and adds English after Malay c
   })
 
   assert.deepEqual(result.subtitles.map(item => item.lang), ['msa', 'msa', 'eng'])
-  assert.equal(result.subtitles[2].id, 'smartsubs-eng-english-weak')
+  assert.equal(result.subtitles[2].id, 'opensubtitles-eng-english-weak')
   assert.equal(result.autoPrefetch, false)
   assert.equal(result.autoPrefetchReason, 'on-demand-candidate-selection')
 })
@@ -100,7 +100,7 @@ test('Part 4.4 can still return English when Malay Auto is unavailable', async (
   })
 
   assert.deepEqual(result.subtitles, [{
-    id: 'smartsubs-eng-english-direct',
+    id: 'opensubtitles-eng-english-direct',
     lang: 'eng',
     url: 'https://example.test/direct.srt'
   }])

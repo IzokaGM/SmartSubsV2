@@ -47,7 +47,7 @@ test('native Malay and on-demand Malay AI are both offered regardless of metadat
 test('invalid English URLs are skipped; lack of English or API key never fabricates Malay AI', async () => {
   const bad = { id: 'invalid', lang: 'eng' }
   const result = await handleSubtitles(args, options([bad, first, { ...first, id: 'duplicate' }]))
-  assert.deepEqual(result.subtitles.map(item => item.id), [result.subtitles[0].id, 'smartsubs-eng-en-1'])
+  assert.deepEqual(result.subtitles.map(item => item.id), [result.subtitles[0].id, 'opensubtitles-eng-en-1'])
   assert.equal(result.autoPrefetch, false)
   const noEnglish = await handleSubtitles(args, options([native]))
   assert.deepEqual(noEnglish.subtitles.map(item => item.id), ['ms-1'])
