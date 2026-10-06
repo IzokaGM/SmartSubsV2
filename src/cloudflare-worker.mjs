@@ -19,7 +19,7 @@ const { buildConfiguredUrls, validateGeminiApiKey, renderConfigurePage, escapeHt
 const { nowMs, roundMs, logPerf } = perfModule
 const { recordDiagnostic, readDiagnostics, deriveVerdict, sanitiseEvent } = diagnosticsModule
 
-const BUILD_ID = 'v2-multicandidate-ondemand-9'
+const BUILD_ID = 'v2-multicandidate-ondemand-10'
 const caches = new WeakMap()
 // Per-request memoization only. No cross-request stale state when the owner switches OFF.
 const diagnosticStateByEnv = new WeakMap()
@@ -609,35 +609,41 @@ function renderConfiguredDiagnosePage(configId, events, control = { enabled: tru
   const verdict = deriveVerdict(sorted)
   const status = verdictPresentation(verdict)
   const lastSubtitle = sorted.find(item => item.event === 'subtitle-result') || null
-  const lastDelivery = sorted.find(item => item.event === 'translation-delivered') || null
-  const lastQueueComplete = sorted.find(item => item.event === 'queue-translation-complete') || null
-  const lastTranslationComplete = lastQueueComplete ||
-    sorted.find(item => item.event === 'prefetch-complete') ||
-    null
-  const lastFailure = sorted.find(item =>
-    ['translation-failed', 'queue-translation-failed', 'prefetch-failed'].includes(item.event)
-  ) || null
-  // Translation events now retain the selected OpenSubtitles source ID in the
-  // same existing diagnostic record. This changes presentation context only;
-  // it does not add another KV event/read/write.
+  // Treat the latest player AI selection as a new lifecycle boundary even when
+  // the media/episode itself has not changed. This prevents an older source's
+  // delivery, queue completion or failure from keeping the hero/Overview stale.
   const latestRequestTs = Number(lastSubtitle?.ts || 0)
-  const latestSourceEvent = lastSubtitle ? sorted.find(item =>
+  const latestPlayerSelection = lastSubtitle ? sorted.find(item =>
+    item.event === 'translation-request' &&
+    item.status !== 'prefetch' &&
+    Number(item.ts || 0) >= latestRequestTs
+  ) || null : null
+  const fallbackSourceEvent = !latestPlayerSelection && lastSubtitle ? sorted.find(item =>
     Number(item.ts || 0) >= latestRequestTs && item.sourceId && [
-      'translation-request', 'player-translation-queued', 'queue-enqueued',
-      'queue-translation-start', 'queue-translation-complete',
-      'translation-pending', 'translation-delivered', 'translation-failed'
+      'player-translation-queued', 'queue-enqueued', 'queue-translation-start',
+      'queue-translation-complete', 'translation-pending', 'translation-delivered',
+      'translation-failed'
     ].includes(item.event)
-  ) : null
-  const selectedId = latestSourceEvent?.sourceId || lastSubtitle?.englishSelectedId || 'Not available'
-  // Never reuse an older media's duration for the latest subtitle request.
-  const deliveryForRequest = lastSubtitle && lastDelivery && Number(lastDelivery.ts || 0) >= latestRequestTs
-    ? lastDelivery : null
-  const coldForRequest = lastSubtitle && lastTranslationComplete && Number(lastTranslationComplete.ts || 0) >= latestRequestTs
-    ? lastTranslationComplete : null
+  ) || null : null
+  const selectedId = latestPlayerSelection?.sourceId || fallbackSourceEvent?.sourceId || lastSubtitle?.englishSelectedId || 'Not available'
+  const selectionStartTs = Number(latestPlayerSelection?.ts || latestRequestTs)
+  const matchesSelectedSource = item => {
+    if (!item || Number(item.ts || 0) < selectionStartTs) return false
+    if (selectedId === 'Not available' || !item.sourceId) return true
+    return String(item.sourceId) === String(selectedId)
+  }
+  const deliveryForRequest = lastSubtitle ? sorted.find(item =>
+    item.event === 'translation-delivered' && matchesSelectedSource(item)
+  ) || null : null
+  const coldForRequest = lastSubtitle ? sorted.find(item =>
+    ['queue-translation-complete', 'prefetch-complete'].includes(item.event) && matchesSelectedSource(item)
+  ) || null : null
+  const activeFailure = lastSubtitle ? sorted.find(item =>
+    ['translation-failed', 'queue-translation-failed', 'prefetch-failed'].includes(item.event) && matchesSelectedSource(item)
+  ) || null : null
   const deliveryTime = deliveryForRequest?.totalMs
   const coldTime = coldForRequest?.totalMs
   const hasNativeMalay = Number(lastSubtitle?.malayCount || 0) > 0
-  const activeFailure = lastFailure && (!lastDelivery || Number(lastFailure.ts || 0) > Number(lastDelivery.ts || 0)) ? lastFailure : null
   const aiTracks = Number(lastSubtitle?.aiCandidateCount ?? lastSubtitle?.englishTrackCount ?? lastSubtitle?.englishCandidateCount ?? 0)
   const englishTracks = Number(lastSubtitle?.englishTrackCount ?? lastSubtitle?.englishCandidateCount ?? 0)
   const nativeMalayTracks = Number(lastSubtitle?.malayCount || 0)
@@ -666,7 +672,12 @@ function renderConfiguredDiagnosePage(configId, events, control = { enabled: tru
   const heroTitle = waitingForSelection ? 'Ready for selection' : status.title
   const heroExplanation = waitingForSelection
     ? `${aiTracks} AI Malay · ${englishTracks} English${nativeMalayTracks > 0 ? ` · ${nativeMalayTracks} Native Malay` : ''} tracks available. Translation starts only after an AI track is selected.`
-    : status.explanation
+    : (sourceSelected
+        ? `OpenSubtitles source ${selectedId}. ${status.explanation}`
+        : status.explanation)
+  const heroMeta = latestPlayerSelection && sourceSelected
+    ? `Latest AI selection: ${formatMalaysiaTime(latestPlayerSelection.ts)} · Source ${selectedId}`
+    : `Latest subtitle request: ${lastSubtitle ? formatMalaysiaTime(lastSubtitle.ts) : 'Not recorded'}`
 
   const guidance = activeFailure
     ? 'A recent failure was recorded. See the failure details and recent events below.' : ''
@@ -719,7 +730,7 @@ function renderConfiguredDiagnosePage(configId, events, control = { enabled: tru
 :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101116;color:#f4f4f5;font-family:system-ui,-apple-system,sans-serif}.wrap{max-width:920px;margin:auto;padding:18px 12px 40px}.card{background:#181a21;border:1px solid #30333d;border-radius:16px;padding:16px;margin-bottom:12px}.hero-card{padding:20px 16px 16px}h1{font-size:24px;margin:0}h2{font-size:17px;margin:0}.diagnose-heading{text-align:center}.diagnose-heading h1{margin:0 0 6px}.diagnose-heading .muted{font-variant-numeric:tabular-nums}.muted{color:#aeb1bb;font-size:13px}.hero-state{text-align:center;margin:18px auto 8px;max-width:680px}.hero-state-title{font-size:21px;font-weight:850;margin-bottom:5px}.hero-state-copy{color:#c7c9d1;font-size:14px;line-height:1.45}.hero-state.tone-good .hero-state-title{color:#a7f3d0}.hero-state.tone-warn .hero-state-title{color:#fde68a}.hero-state.tone-bad .hero-state-title{color:#fecaca}.hero-meta{text-align:center;margin:10px 0 0}.hero-diagnostics{display:flex;align-items:center;justify-content:center;gap:10px;border-top:1px solid #30333d;padding-top:14px;margin-top:14px;font-size:18px}.hero-diagnostics form{margin:0}.diag-status-toggle{cursor:pointer;display:inline-flex;align-items:center;justify-content:center;border-radius:999px;min-width:62px;min-height:40px;padding:7px 14px;font-weight:900;font-size:15px;border:0}.diag-status-toggle.good{background:#123b29;color:#a7f3d0}.diag-status-toggle.neutral{background:#30333d;color:#e5e7eb}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:12px}.metric{background:#111319;border:1px solid #2b2e37;border-radius:12px;padding:12px}.metric .label{color:#aeb1bb;font-size:12px}.metric .value{font-size:18px;font-weight:800;margin-top:3px;word-break:break-word}.metric .sub{color:#aeb1bb;font-size:12px;margin-top:4px;word-break:break-word}.media-metric{grid-column:1/-1}.guide{font-size:15px;line-height:1.5}.technical-heading{display:flex;align-items:center;justify-content:space-between;gap:10px}.event-count{display:inline-flex;align-items:center;justify-content:center;min-width:26px;height:24px;padding:0 8px;margin-left:5px;border-radius:999px;background:#30333d;color:#e5e7eb;font-size:11px;vertical-align:middle}.event-card{border-top:1px solid #30333d;padding:14px 0}.event-card:first-child{border-top:0}.event-top{display:flex;gap:10px;justify-content:space-between;align-items:center;margin-bottom:8px}.event-top time{font-size:12px;color:#aeb1bb}.event-badge{display:inline-flex;align-items:center;border-radius:999px;padding:4px 8px;font-size:10px;font-weight:900;letter-spacing:.06em}.good{background:#123b29;color:#a7f3d0}.warn{background:#493812;color:#fde68a}.bad{background:#4a1d24;color:#fecaca}.neutral{background:#30333d;color:#e5e7eb}.event-title{font-size:15px;font-weight:800;margin-bottom:2px}.event-summary{font-size:13px;color:#d7d8dd;line-height:1.45;word-break:break-word}.event-metrics{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.event-metrics span{background:#111319;border:1px solid #292c34;border-radius:7px;padding:4px 7px;font-size:11px;word-break:break-word}.event-metrics b{color:#aeb1bb;font-weight:600;margin-right:3px}.event-detail{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}.event-detail span{background:#0f1116;border-radius:7px;padding:4px 6px;font-size:11px;word-break:break-word}.event-detail b{color:#aeb1bb;font-weight:600}code{color:#c9ffdc}.event-tabs{margin-top:10px}.event-toolbar{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:10px 0 12px}.event-tab-input{position:absolute;opacity:0;pointer-events:none}.event-tab-labels{display:flex;gap:8px;border-bottom:1px solid #30333d;margin-bottom:4px}.event-tab-label{display:inline-flex;align-items:center;justify-content:center;min-height:38px;padding:7px 14px;color:#aeb1bb;font-size:12px;font-weight:800;cursor:pointer;border-bottom:2px solid transparent}.event-tab-panel{display:none}.event-tab-input#events-summary:checked~.event-tab-labels label[for=events-summary],.event-tab-input#events-raw:checked~.event-tab-labels label[for=events-raw]{color:#fff;border-bottom-color:#6aa3ff}.event-tab-input#events-summary:checked~.summary-panel,.event-tab-input#events-raw:checked~.raw-panel{display:block}.secondary-btn{display:flex;align-items:center;justify-content:center;width:100%;background:#262a33;border:1px solid #4b5160;min-height:36px;padding:7px 8px;font-size:11px;color:#fff;font-weight:800;border-radius:9px;white-space:nowrap}.raw-event-card{border-top:1px solid #30333d;padding:14px 0}.raw-event-card:first-child{border-top:0}.raw-event-top{display:flex;gap:10px;justify-content:space-between;align-items:flex-start;margin-bottom:8px}.raw-event-top code{font-size:12px}.raw-event-top time{font-size:12px;color:#aeb1bb}.clear-menu{display:block;min-width:0}.clear-menu[open]{grid-column:1/-1}.clear-menu[open]>summary{max-width:180px}.clear-menu>summary{list-style:none;cursor:pointer}.clear-menu>summary::-webkit-details-marker{display:none}.danger-btn{background:#3a2528;border-color:#714249;color:#fecaca}.clear-confirm{margin-top:8px;padding:10px;border:1px solid #4b5160;border-radius:10px;background:#111319;max-width:360px}.clear-confirm p{margin:0 0 8px}.clear-confirm button{background:#7f1d1d;min-height:36px;padding:7px 11px;font-size:12px;color:#fff;border:0;border-radius:9px;font-weight:800}.technical-meta{margin:7px 0 0}.bad-text{color:#fecaca}@media(max-width:640px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.event-toolbar{gap:6px}.secondary-btn{font-size:10px;padding:7px 5px}.event-top{align-items:flex-start;flex-direction:column;gap:5px}.hero-state{margin-top:15px}.card{padding:14px}.hero-card{padding:18px 14px 14px}}
 </style></head>
 <body><main class="wrap">
-<section class="card hero-card"><header class="diagnose-heading"><h1>SmartSubsV2 Diagnose</h1><div class="muted">${escapeHtml(formatMalaysiaTime(Date.now()))}</div></header><div class="hero-state tone-${escapeHtml(status.tone)}"><div class="hero-state-title">${escapeHtml(heroTitle)}</div><div class="hero-state-copy">${escapeHtml(heroExplanation)}</div></div><p class="muted hero-meta">Latest subtitle request: ${escapeHtml(lastSubtitle ? formatMalaysiaTime(lastSubtitle.ts) : 'Not recorded')}</p><div class="hero-diagnostics"><span>Diagnostics:</span><form method="POST" action="diagnose/toggle" autocomplete="off"><button class="diag-status-toggle good" type="submit" name="action" value="off" aria-label="Turn Diagnostics off">ON</button></form></div>${control.error ? `<p class="bad-text">${escapeHtml(control.error)}</p>` : ''}</section>
+<section class="card hero-card"><header class="diagnose-heading"><h1>SmartSubsV2 Diagnose</h1><div class="muted">${escapeHtml(formatMalaysiaTime(Date.now()))}</div></header><div class="hero-state tone-${escapeHtml(status.tone)}"><div class="hero-state-title">${escapeHtml(heroTitle)}</div><div class="hero-state-copy">${escapeHtml(heroExplanation)}</div></div><p class="muted hero-meta">${escapeHtml(heroMeta)}</p><div class="hero-diagnostics"><span>Diagnostics:</span><form method="POST" action="diagnose/toggle" autocomplete="off"><button class="diag-status-toggle good" type="submit" name="action" value="off" aria-label="Turn Diagnostics off">ON</button></form></div>${control.error ? `<p class="bad-text">${escapeHtml(control.error)}</p>` : ''}</section>
 
 <section class="card"><h2>Overview</h2><div class="grid">
 <div class="metric media-metric"><div class="label">Latest media</div><div class="value">${escapeHtml(compactMediaLabel(lastSubtitle))}</div></div>

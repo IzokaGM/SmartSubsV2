@@ -46,7 +46,7 @@ test('Diagnose exports already-loaded events as client-side JSON/TXT without ano
   assert.ok(dataMatch, 'embedded export payload must exist')
   const payload = JSON.parse(decodeHtml(dataMatch[1]))
   assert.equal(payload.format, 'smartsubsv2-diagnose-log-v1')
-  assert.equal(payload.build, 'v2-multicandidate-ondemand-9')
+  assert.equal(payload.build, 'v2-multicandidate-ondemand-10')
   assert.equal(payload.overview.latestMedia, 'S1E2 · tt1196946:1:2')
   assert.equal(payload.overview.englishSource, '4374548')
   assert.equal(payload.overview.translationStatus, 'Cached')

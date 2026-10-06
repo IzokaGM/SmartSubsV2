@@ -90,23 +90,6 @@ async function readDiagnostics(kv, configId, limit = MAX_EVENTS) {
 function deriveVerdict(events = []) {
   const rows = [...events].sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0))
   const lastSubtitle = rows.find(item => item.event === 'subtitle-result')
-  const lastTranslationFailed = rows.find(item => item.event === 'translation-failed')
-  const lastTranslationDelivered = rows.find(item => item.event === 'translation-delivered')
-  const lastTranslationRequest = rows.find(
-    item => item.event === 'translation-request' && item.status !== 'prefetch'
-  )
-  const lastTranslationPending = rows.find(item => item.event === 'translation-pending')
-  const lastPlayerTranslationQueued = rows.find(item => item.event === 'player-translation-queued')
-  const lastPrefetchTranslationRequest = rows.find(
-    item => item.event === 'translation-request' && item.status === 'prefetch'
-  )
-  const lastPrefetchComplete = rows.find(item => item.event === 'prefetch-complete')
-  const lastPrefetchFailed = rows.find(item => item.event === 'prefetch-failed')
-  const lastQueueComplete = rows.find(item => item.event === 'queue-translation-complete')
-  const lastQueueFailed = rows.find(item => item.event === 'queue-translation-failed')
-  const lastQueueStart = rows.find(item => item.event === 'queue-translation-start')
-  const lastQueueEnqueued = rows.find(item => item.event === 'queue-enqueued')
-  const lastQueueJoinStart = rows.find(item => item.event === 'queue-join-start')
 
   if (!lastSubtitle) return 'NO_SUBTITLE_REQUEST_SEEN'
   if (lastSubtitle.result === 'native-malay') return 'NATIVE_MALAY_RETURNED'
@@ -116,19 +99,47 @@ function deriveVerdict(events = []) {
     if (lastSubtitle.byokConfigured === false) return 'BYOK_NOT_CONFIGURED'
     return 'SUBTITLE_REQUEST_RETURNED_ZERO'
   }
-  if (lastTranslationDelivered && Number(lastTranslationDelivered.ts) >= Number(lastSubtitle.ts)) return 'TRANSLATION_DELIVERED'
-  if (lastTranslationFailed && Number(lastTranslationFailed.ts) >= Number(lastSubtitle.ts)) return 'TRANSLATION_FAILED'
-  if (lastTranslationPending && Number(lastTranslationPending.ts) >= Number(lastSubtitle.ts)) return 'TRANSLATION_PREPARING_IN_QUEUE'
-  if (lastPlayerTranslationQueued && Number(lastPlayerTranslationQueued.ts) >= Number(lastSubtitle.ts)) return 'TRANSLATION_PREPARING_IN_QUEUE'
-  if (lastQueueJoinStart && Number(lastQueueJoinStart.ts) >= Number(lastSubtitle.ts)) return 'QUEUE_JOIN_WAITING'
-  if (lastTranslationRequest && Number(lastTranslationRequest.ts) >= Number(lastSubtitle.ts)) return 'TRANSLATION_REQUESTED_WAITING_FOR_RESULT'
-  if (lastQueueComplete && Number(lastQueueComplete.ts) >= Number(lastSubtitle.ts)) return 'QUEUE_PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION'
-  if (lastQueueFailed && Number(lastQueueFailed.ts) >= Number(lastSubtitle.ts)) return 'QUEUE_PREFETCH_FAILED_WAITING_FOR_PLAYER_SELECTION'
-  if (lastQueueStart && Number(lastQueueStart.ts) >= Number(lastSubtitle.ts)) return 'QUEUE_PREFETCH_TRANSLATING'
-  if (lastQueueEnqueued && Number(lastQueueEnqueued.ts) >= Number(lastSubtitle.ts)) return 'QUEUE_PREFETCH_QUEUED'
-  if (lastPrefetchComplete && Number(lastPrefetchComplete.ts) >= Number(lastSubtitle.ts)) return 'PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION'
-  if (lastPrefetchFailed && Number(lastPrefetchFailed.ts) >= Number(lastSubtitle.ts)) return 'PREFETCH_FAILED_WAITING_FOR_PLAYER_SELECTION'
-  if (lastPrefetchTranslationRequest && Number(lastPrefetchTranslationRequest.ts) >= Number(lastSubtitle.ts)) return 'PREFETCH_TRANSLATING'
+
+  const subtitleTs = Number(lastSubtitle.ts || 0)
+  const lastTranslationRequest = rows.find(item =>
+    item.event === 'translation-request' && item.status !== 'prefetch' && Number(item.ts || 0) >= subtitleTs
+  ) || null
+  const selectedSourceId = String(lastTranslationRequest?.sourceId || '')
+  const selectionTs = Number(lastTranslationRequest?.ts || subtitleTs)
+  const currentSelectionEvent = eventName => rows.find(item =>
+    item.event === eventName &&
+    Number(item.ts || 0) >= selectionTs &&
+    (!selectedSourceId || String(item.sourceId || '') === selectedSourceId)
+  ) || null
+
+  // Once the player selects another AI candidate in the same episode, that
+  // selection becomes the status boundary. Older delivery/queue events from a
+  // previously selected source must not keep the hero stuck on the old track.
+  if (lastTranslationRequest) {
+    if (currentSelectionEvent('translation-delivered')) return 'TRANSLATION_DELIVERED'
+    if (currentSelectionEvent('translation-failed')) return 'TRANSLATION_FAILED'
+    if (currentSelectionEvent('translation-pending')) return 'TRANSLATION_PREPARING_IN_QUEUE'
+    if (currentSelectionEvent('player-translation-queued')) return 'TRANSLATION_PREPARING_IN_QUEUE'
+    if (currentSelectionEvent('queue-join-start')) return 'QUEUE_JOIN_WAITING'
+    return 'TRANSLATION_REQUESTED_WAITING_FOR_RESULT'
+  }
+
+  const afterSubtitle = eventName => rows.find(item =>
+    item.event === eventName && Number(item.ts || 0) >= subtitleTs
+  ) || null
+  const lastPrefetchTranslationRequest = rows.find(item =>
+    item.event === 'translation-request' && item.status === 'prefetch' && Number(item.ts || 0) >= subtitleTs
+  ) || null
+
+  if (afterSubtitle('translation-delivered')) return 'TRANSLATION_DELIVERED'
+  if (afterSubtitle('translation-failed')) return 'TRANSLATION_FAILED'
+  if (afterSubtitle('queue-translation-complete')) return 'QUEUE_PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION'
+  if (afterSubtitle('queue-translation-failed')) return 'QUEUE_PREFETCH_FAILED_WAITING_FOR_PLAYER_SELECTION'
+  if (afterSubtitle('queue-translation-start')) return 'QUEUE_PREFETCH_TRANSLATING'
+  if (afterSubtitle('queue-enqueued')) return 'QUEUE_PREFETCH_QUEUED'
+  if (afterSubtitle('prefetch-complete')) return 'PREFETCH_READY_WAITING_FOR_PLAYER_SELECTION'
+  if (afterSubtitle('prefetch-failed')) return 'PREFETCH_FAILED_WAITING_FOR_PLAYER_SELECTION'
+  if (lastPrefetchTranslationRequest) return 'PREFETCH_TRANSLATING'
   if (lastSubtitle.result === 'native-malay-with-auto-fallback') return 'NATIVE_MALAY_WITH_AUTO_FALLBACK'
   if (lastSubtitle.autoReady) return 'SUBTITLE_RETURNED_WAITING_FOR_PLAYER_SELECTION'
   return 'SUBTITLE_RETURNED'
