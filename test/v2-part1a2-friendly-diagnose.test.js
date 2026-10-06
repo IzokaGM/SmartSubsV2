@@ -49,7 +49,7 @@ test('Compact diagnose keeps relevant status without a source-details disclosure
   assert.match(html, /9214195/)
   assert.doesNotMatch(html, /Source details|Source timing is not verified/)
   assert.match(html, /<div class=\"label\">Delivery<\/div>/)
-  assert.match(html, /<div class="label">Delivery<\/div><div class="value">HIT<\/div><div class="sub">411 ms · Delivered<\/div>/)
+  assert.match(html, /<div class="label">Delivery<\/div><div class="value">411 ms<\/div><div class="sub">Delivered · Cache hit<\/div>/)
   assert.match(html, /411 ms/)
   assert.doesNotMatch(html, /Verdict reference/)
   assert.doesNotMatch(html, /Player sync metadata<\/h2>/)

@@ -33,8 +33,8 @@ test('older source completion cannot override newer selected source hero and ove
     { ts: when(22, 2), event: 'translation-delivered', sourceId: '9822245', cache: 'HIT', totalMs: 420 }
   ]
   const html = renderConfiguredDiagnosePage('config', events)
-  assert.match(html, /OpenSubtitles source 9822246\./)
-  assert.match(html, /Latest AI selection: 06\/10\/2026, 4:22:00 pm MYT · Source 9822246/)
+  assert.doesNotMatch(html, /OpenSubtitles source 9822246\. The translated Malay VTT/)
+  assert.match(html, /Latest AI selection: 06\/10\/2026, 4:22:00 pm MYT<span class="hero-meta-source">Source 9822246<\/span>/)
   assert.match(html, /<div class="label">English source<\/div><div class="value">9822246<\/div><div class="sub">OpenSubtitles<\/div>/)
   assert.match(html, /<div class="label">Translation<\/div><div class="value">Preparing<\/div><div class="sub">Selected source is being prepared<\/div>/)
   assert.match(html, /<div class="label">Delivery<\/div><div class="value">—<\/div><div class="sub">Not started<\/div>/)
@@ -50,12 +50,13 @@ test('hero and lifecycle metrics move to second source after its delivery', asyn
     { ts: when(21, 21), event: 'translation-delivered', sourceId: '9822245', cache: 'MISS', totalMs: 1320 },
     { ts: when(22), event: 'translation-request', status: 'player', sourceId: '9822246' },
     { ts: when(22, 12), event: 'queue-translation-complete', sourceId: '9822246', totalMs: 12100, geminiTotalTokensTotal: 30210 },
-    { ts: when(22, 13), event: 'translation-delivered', sourceId: '9822246', cache: 'MISS', totalMs: 760 }
+    { ts: when(22, 13), event: 'translation-delivered', sourceId: '9822246', cache: 'DELIVERY_RELAY', totalMs: 760 }
   ]
   const html = renderConfiguredDiagnosePage('config', events)
   assert.match(html, /Malay subtitle delivered/)
-  assert.match(html, /OpenSubtitles source 9822246\. The translated Malay VTT was successfully returned to the player\./)
+  assert.match(html, /The translated Malay VTT was successfully returned to the player\./)
+  assert.doesNotMatch(html, /OpenSubtitles source 9822246\. The translated Malay VTT/)
   assert.match(html, /<div class="label">English source<\/div><div class="value">9822246<\/div>/)
-  assert.match(html, /<div class="label">Translation<\/div><div class="value">Ready<\/div><div class="sub">12\.1 s · 30,210 tokens<\/div>/)
-  assert.match(html, /<div class="label">Delivery<\/div><div class="value">MISS<\/div><div class="sub">760 ms · Delivered<\/div>/)
+  assert.match(html, /<div class="label">Translation<\/div><div class="value">12\.1 s<\/div><div class="sub">Ready · 30,210 tokens<\/div>/)
+  assert.match(html, /<div class="label">Delivery<\/div><div class="value">760 ms<\/div><div class="sub">Delivered · Relay<\/div>/)
 })

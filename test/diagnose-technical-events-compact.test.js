@@ -47,8 +47,8 @@ test('Technical events separate compact Summary and full Raw tabs', async () => 
   assert.match(html, />Save Log<\/button>/)
   assert.match(html, />Save Summary<\/button>/)
   assert.match(html, /<summary class="secondary-btn danger-btn">Clear<\/summary>/)
-  assert.match(html, /Build ondemand-10 · Malay subtitle delivered · 24h history/)
-  assert.match(rawPanel, /Build v2-multicandidate-ondemand-10 · Verdict <code>TRANSLATION_DELIVERED<\/code> · 24-hour history \(MYT\)/)
+  assert.match(html, /Build ondemand-11 · Malay subtitle delivered · 24h history/)
+  assert.match(rawPanel, /Build v2-multicandidate-ondemand-11 · Verdict <code>TRANSLATION_DELIVERED<\/code> · 24-hour history \(MYT\)/)
   assert.match(html, /<b>Selected<\/b> No source selected/)
 })
 

@@ -19,14 +19,14 @@ function memoryKv() {
 
 test('Nuvio diagnose build marker is exposed by production worker health', async () => {
   const { BUILD_ID, handleRequest } = await import('../src/cloudflare-worker.mjs')
-  assert.equal(BUILD_ID, 'v2-multicandidate-ondemand-10')
+  assert.equal(BUILD_ID, 'v2-multicandidate-ondemand-11')
   const response = await handleRequest(new Request('https://smartsubs.example/health'), {
     SMARTSUBS_SECRET: 'server-secret-for-tests',
     SMARTSUBS_CACHE: memoryKv()
   })
   assert.equal(response.status, 200)
   const body = await response.json()
-  assert.equal(body.build, 'v2-multicandidate-ondemand-10')
+  assert.equal(body.build, 'v2-multicandidate-ondemand-11')
   assert.equal(body.diagnose, true)
 })
 
