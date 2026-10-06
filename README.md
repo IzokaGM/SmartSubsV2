@@ -1,4 +1,4 @@
-# SmartSubsV2 - clean SmartSubsV2 test baseline
+# SmartSubsV2 - clean SmartSubsV2 test baseline 
 > Baseline: clean clone of the latest supplied SmartSubsV2 (`SmartSubsV2-main (14).zip`). Old SmartSubsV2-only features are intentionally not included. See `V2_BASELINE.md`.
 
 
