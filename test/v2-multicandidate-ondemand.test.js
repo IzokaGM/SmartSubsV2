@@ -12,7 +12,7 @@ function translationTokenFromUrl(url) {
   return match && match[1]
 }
 
-test('V2 exposes every eligible English candidate as a separate on-demand Malay AI track', async () => {
+test('V2 exposes up to five eligible English candidates as on-demand Malay AI tracks', async () => {
   const english = Array.from({ length: 7 }, (_, index) => ({
     id: `source-${index + 1}`,
     lang: index % 2 ? 'en' : 'eng',
@@ -44,21 +44,21 @@ test('V2 exposes every eligible English candidate as a separate on-demand Malay 
   const rawEnglish = result.subtitles.filter(item => item.lang === 'eng')
 
   assert.equal(upstreamFetches, 1)
-  assert.equal(ai.length, 7)
-  assert.equal(rawEnglish.length, 7) // Raw English is direct and no longer artificially capped.
-  assert.deepEqual(ai.map(item => item.id), english.map(item => `gemini-ai-${item.id}`))
-  assert.equal(new Set(ai.map(item => item.url)).size, 7)
+  assert.equal(ai.length, 5)
+  assert.equal(rawEnglish.length, 5) // Both AI and raw English have independent five-track caps.
+  assert.deepEqual(ai.map(item => item.id), english.slice(0, 5).map(item => `gemini-ai-${item.id}`))
+  assert.equal(new Set(ai.map(item => item.url)).size, 5)
   assert.equal(result.autoPrefetch, false)
   assert.equal(result.autoPrefetchReason, 'on-demand-candidate-selection')
 
   const tokenData = ai.map(item => decodeTranslationTokenData(translationTokenFromUrl(item.url), 'test-secret'))
-  assert.deepEqual(tokenData.map(item => item.sourceId), english.map(item => item.id))
-  assert.deepEqual(tokenData.map(item => item.url), english.map(item => item.url))
+  assert.deepEqual(tokenData.map(item => item.sourceId), english.slice(0, 5).map(item => item.id))
+  assert.deepEqual(tokenData.map(item => item.url), english.slice(0, 5).map(item => item.url))
 
   const event = events.find(item => item.event === 'subtitle-result')
-  assert.equal(event.aiCandidateCount, 7)
+  assert.equal(event.aiCandidateCount, 5)
   assert.equal(event.englishCandidateCount, 7)
-  assert.equal(event.englishTrackCount, 7)
+  assert.equal(event.englishTrackCount, 5)
   assert.equal(event.englishSelectedId, '')
 })
 
@@ -76,7 +76,7 @@ test('V2 subtitle-list route never enqueues background translation', async () =>
   assert.match(subtitleListTail, /auto-prefetch-skipped/)
 })
 
-test('V2 exposes every deduplicated Native Malay candidate without a five-track cap', async () => {
+test('V2 caps deduplicated Native Malay candidates at five tracks', async () => {
   const malay = Array.from({ length: 7 }, (_, index) => ({
     id: `malay-${index + 1}`,
     lang: index % 2 ? 'ms' : 'msa',
@@ -96,11 +96,11 @@ test('V2 exposes every deduplicated Native Malay candidate without a five-track 
     onDiagnostic: async event => events.push(event)
   })
 
-  assert.equal(result.subtitles.length, 7)
-  assert.deepEqual(result.subtitles.map(item => item.url), malay.map(item => item.url))
-  assert.equal(new Set(result.subtitles.map(item => item.url)).size, 7)
+  assert.equal(result.subtitles.length, 5)
+  assert.deepEqual(result.subtitles.map(item => item.url), malay.slice(0, 5).map(item => item.url))
+  assert.equal(new Set(result.subtitles.map(item => item.url)).size, 5)
 
   const event = events.find(item => item.event === 'subtitle-result')
-  assert.equal(event.malayCount, 7)
-  assert.equal(event.subtitleCount, 7)
+  assert.equal(event.malayCount, 5)
+  assert.equal(event.subtitleCount, 5)
 })

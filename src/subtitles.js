@@ -7,6 +7,8 @@ const { isSupportedRequest, fetchOpenSubtitles } = require('./opensubtitles')
 const { getMalaySubtitles, getEnglishSubtitles, toNativeMalay } = require('./languages')
 const { createTranslationToken } = require('./token')
 
+const MAX_SUBTITLE_TRACKS = 5
+
 async function emitDiagnostic(options, payload) {
   if (typeof options.onDiagnostic !== 'function') return
   try { await options.onDiagnostic(payload) } catch {}
@@ -37,7 +39,7 @@ function englishSelectionDiagnostics(upstream, selectedEnglish) {
   return {
     englishCandidateCount: candidates.length,
     englishSelectedId: selectedEnglish ? diagnosticSubtitleId(selectedEnglish) : '',
-    englishSourceIds: candidates.slice(0, 5).map((subtitle, index) => diagnosticSubtitleId(subtitle, index))
+    englishSourceIds: candidates.slice(0, MAX_SUBTITLE_TRACKS).map((subtitle, index) => diagnosticSubtitleId(subtitle, index))
   }
 }
 
@@ -61,12 +63,14 @@ function buildAutoSubtitle(englishSubtitle, options = {}) {
 
 function buildAutoSubtitles(englishSubtitles, options = {}) {
   return dedupeSubtitles(englishSubtitles)
+    .slice(0, MAX_SUBTITLE_TRACKS)
     .map(subtitle => buildAutoSubtitle(subtitle, options))
     .filter(Boolean)
 }
 
 function buildEnglishTracks(upstream) {
   return dedupeSubtitles(getEnglishSubtitles(upstream))
+    .slice(0, MAX_SUBTITLE_TRACKS)
     .map((subtitle, index) => ({
       id: `opensubtitles-eng-${diagnosticSubtitleId(subtitle, index)}`,
       url: String(subtitle.url),
@@ -89,11 +93,12 @@ async function handleSubtitles(args, options = {}) {
     const upstreamStartedAt = nowMs()
     const upstream = await fetchOpenSubtitles(args, options)
     const upstreamMs = roundMs(nowMs() - upstreamStartedAt)
-    const malay = dedupeSubtitles(getMalaySubtitles(upstream)).map(toNativeMalay)
+    const malay = dedupeSubtitles(getMalaySubtitles(upstream))
+      .slice(0, MAX_SUBTITLE_TRACKS).map(toNativeMalay)
     const englishCandidates = dedupeSubtitles(getEnglishSubtitles(upstream))
     const english = englishCandidates[0] || null
     const apiKey = options.apiKey || ''
-    // V2 multi-candidate mode: every eligible English source gets its own Malay AI
+    // V2 multi-candidate mode: up to five eligible English sources get Malay AI
     // translation URL. Creating these signed URLs does not fetch or translate anything.
     // Translation starts only when the player requests the selected /translated/*.vtt URL.
     const aiTracks = apiKey ? buildAutoSubtitles(englishCandidates, options) : []

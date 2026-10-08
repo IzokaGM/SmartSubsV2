@@ -14,7 +14,7 @@ function responseFor(subtitles) {
   })
 }
 
-test('Part 4.4 exposes all upstream-order and deduplicated English tracks', () => {
+test('Part 4.4 caps upstream-order and deduplicated English tracks at five', () => {
   const upstream = [
     { id: 'wrong', lang: 'eng', url: 'https://example.test/Show.720p.HDTV-WRONG.srt' },
     { id: 'best', lang: 'eng', url: 'https://example.test/Show.1080p.WEB-DL.x265-GROUP.srt' },
@@ -29,9 +29,13 @@ test('Part 4.4 exposes all upstream-order and deduplicated English tracks', () =
     filename: 'Show.1080p.WEB-DL.x265-GROUP.mkv'
   })
 
-  assert.equal(tracks.length, 6)
+  assert.equal(tracks.length, 5)
   assert.equal(tracks[0].id, 'opensubtitles-eng-wrong')
-  assert.deepEqual(new Set(tracks.map(item => item.url)).size, 6)
+  assert.deepEqual(tracks.map(item => item.id), [
+    'opensubtitles-eng-wrong', 'opensubtitles-eng-best', 'opensubtitles-eng-third',
+    'opensubtitles-eng-fourth', 'opensubtitles-eng-fifth'
+  ])
+  assert.deepEqual(new Set(tracks.map(item => item.url)).size, 5)
   assert.deepEqual(new Set(tracks.map(item => item.lang)), new Set(['eng']))
 })
 
