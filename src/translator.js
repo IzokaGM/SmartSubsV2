@@ -29,7 +29,28 @@ const SDH_VOCAL_RE = /\b(?:pant(?:s|ing)?|breath(?:es|ing|lessly|heavily)?|sigh(
 const SDH_MUSIC_RE = /\b(?:music|musical\s+score|score|theme\s+music|song\s+playing|instrumental|singing|humming)\b/i
 const SDH_AMBIENT_STANDALONE_RE = /\b(?:applause|clapping|footsteps?|knocking|gunshots?|thunder|sirens?|beeping|buzzing|rustling|static|explosions?|barking|chirping)\b/i
 const SDH_AMBIENT_SUBJECT_RE = /\b(?:door|doors|phone|telephone|cellphone|bell|alarm|footstep|footsteps|knock|knocking|gunshot|gunshots|thunder|applause|clapping|engine|engines|tire|tires|tyre|tyres|horn|sirens?|beep|beeping|buzz|buzzing|rustling|wind|rain|glass|crowd|car|vehicle|dog|dogs|bird|birds)\b/i
-const SDH_AMBIENT_ACTION_RE = /\b(?:open(?:s|ing)?|close(?:s|d|ing)?|ring(?:s|ing)?|sound(?:s|ing)?|blow(?:s|ing)?|rev(?:s|ving)?|screech(?:es|ing)?|crash(?:es|ed|ing)?|beep(?:s|ing)?|buzz(?:es|ing)?|rustl(?:es|ing)?|shatter(?:s|ed|ing)?|cheer(?:s|ing)?|chant(?:s|ing)?|roar(?:s|ing)?|rumbl(?:es|ing)?|honk(?:s|ing)?|bark(?:s|ing)?|chirp(?:s|ing)?)\b/i
+const SDH_AMBIENT_ACTION_RE = /\b(?:open(?:s|ing)?|close(?:s|d|ing)?|slam(?:s|med|ming)?|ring(?:s|ing)?|sound(?:s|ing)?|blow(?:s|ing)?|rev(?:s|ving)?|screech(?:es|ing)?|crash(?:es|ed|ing)?|beep(?:s|ing)?|buzz(?:es|ing)?|rustl(?:es|ing)?|shatter(?:s|ed|ing)?|cheer(?:s|ing)?|chant(?:s|ing)?|roar(?:s|ing)?|rumbl(?:es|ing)?|honk(?:s|ing)?|bark(?:s|ing)?|chirp(?:s|ing)?)\b/i
+
+// Square brackets are already treated as SDH metadata. Parentheses need a
+// stricter test because they often contain real dialogue or explanations.
+const SDH_PAREN_VOCAL_RE = /^(?:(?:a|an|soft|quiet|loud|small|heavy|deep|faint|nervous|awkward|brief|stifled|gentle|dry|hysterical|softly|quietly|loudly|nervously|awkwardly|deeply|heavily|gently|briefly)\s+)*(?:sighs?|sighing|chuckles?|chuckling|chuckled|laughs?|laughing|laughter|giggles?|giggling|gasps?|gasping|pants?|panting|breathes?|breathing|groans?|groaning|grunts?|grunting|sobs?|sobbing|cries|crying|coughs?|coughing|sneezes?|sneezing|screams?|screaming|whimpers?|whimpering|moans?|moaning|hums?|humming|sniffs?|sniffing|singing|sings|clears?\s+(?:his|her|their)\s+throat)(?:\s+(?:softly|quietly|loudly|nervously|awkwardly|deeply|heavily|gently|briefly|uncontrollably|slightly|weakly|hysterically))?$/i
+const SDH_PAREN_MALAY_RE = /^(?:mengeluh|ketawa(?:\s+(?:kecil|perlahan|kuat|sinis))?|tergelak|terkekeh(?:-kekeh)?|mendengus|mengerang|menangis|tersedu(?:-sedu)?|tercungap(?:-cungap)?|batuk|bersin|menjerit|merintih|berdehem|menghela\s+nafas|menarik\s+nafas\s+panjang)(?:\s+(?:perlahan|kuat|kecil))?$/i
+const SDH_PAREN_SOUND_ONLY_RE = /^(?:(?:faint|distant|loud|soft|background|gentle|suspenseful|dramatic|piano|upbeat|ominous)\s+)*(?:music|musical\s+score|instrumental|song\s+playing|applause|clapping|footsteps?|knocking|gunshots?|thunder|sirens?|beeping|buzzing|rustling|static|explosions?|barking|chirping)(?:\s+(?:plays?|playing|fades?|fading|swells?|swelling|continues?|stops?|starting|starts|loudly|softly))?$/i
+const SDH_PAREN_SOUND_SUBJECT_RE = /^(?:(?:faint|distant|loud|soft|background|gentle)\s+)*(?:door|doors|phone|telephone|bell|alarm|engine|horn|glass|crowd|car|dog|bird)\b/i
+
+function isParentheticalSdhDescription(label) {
+  const value = String(label == null ? '' : label)
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!value || value.length > 100 || /[?!"“”]/u.test(value)) return false
+  // Allow lists of actions such as (sighs, chuckles) without accepting
+  // sentences such as (I laugh when I'm nervous).
+  if (value.split(/\s*(?:[,;]|\band\b)\s*/i).every(part =>
+    SDH_PAREN_VOCAL_RE.test(part) || SDH_PAREN_MALAY_RE.test(part))) return true
+  if (SDH_PAREN_SOUND_ONLY_RE.test(value)) return true
+  return SDH_PAREN_SOUND_SUBJECT_RE.test(value) && isSdhDescription(value)
+}
 
 function isSdhDescription(label) {
   const value = String(label == null ? '' : label)
@@ -88,6 +109,12 @@ function cleanSdhCueText(value) {
   let removed = 0
   let text = source.replace(/\[([^\]\n]{1,160})\]/g, (whole, label) => {
     if (!isSdhDescription(label)) return whole
+    removed++
+    return ''
+  })
+
+  text = text.replace(/\(([^()\n]{1,160})\)/g, (whole, label) => {
+    if (!isParentheticalSdhDescription(label)) return whole
     removed++
     return ''
   })
@@ -857,7 +884,12 @@ async function translateCues(cues, options = {}) {
   }))
 }
 function cuesToVtt(cues) {
-  return `WEBVTT\n\n${cues.map(cue => `${cue.time}\n${stripAssOverrideTags(cue.text)}`).join('\n\n')}\n`
+  // Defensive final pass: Gemini may reintroduce a short SDH label, including
+  // a translated one. Do not emit empty cues; timestamps of dialogue stay put.
+  const rendered = cues
+    .map(cue => ({ time: cue.time, text: cleanSdhCueText(cue.text).text }))
+    .filter(cue => cue.text)
+  return `WEBVTT\n\n${rendered.map(cue => `${cue.time}\n${cue.text}`).join('\n\n')}\n`
 }
 
 async function fetchSubtitleText(url, options = {}) {
