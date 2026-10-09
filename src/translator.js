@@ -41,8 +41,50 @@ function isSdhDescription(label) {
   return SDH_AMBIENT_SUBJECT_RE.test(value) && SDH_AMBIENT_ACTION_RE.test(value)
 }
 
+// ASS/SSA override blocks are layout/style metadata, not spoken dialogue.
+// Only remove braces that start with an ASS backslash command; preserve normal {text}.
+function stripAssOverrideTags(value) {
+  return String(value == null ? '' : value)
+    .replace(/\{\\[^{}\r\n]*\}/g, '')
+}
+
+// Only explicit music markers are strong enough to skip translation. Italics,
+// rhyme, short sentences and the mere presence of background music are not.
+// Check visible text so <i>♪ lyric ♪</i> is also recognised.
+function isMarkedLyricLine(value) {
+  const visible = stripAssOverrideTags(value)
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/gi, ' ')
+    .trim()
+  const lyricStart = /^(?:[-–—]\s*)?(?:\[[\w .'-]{1,40}\]\s*)?[♪♫♬♩]/u.test(visible)
+  const lyricEnd = /[♪♫♬♩]\s*$/u.test(visible)
+  if (!lyricStart && !lyricEnd) return false
+
+  // A whole marked line must not hide an obvious spoken fragment, such as
+  // "♪ song ♪ - Wait!" or "Wait! ♪ song ♪". Leave ambiguous mixed lines to
+  // normal translation rather than dropping their dialogue.
+  const notes = [...visible.matchAll(/[♪♫♬♩]/gu)]
+  if (notes.length >= 2) {
+    const finalNote = notes[notes.length - 1]
+    if (visible.slice(finalNote.index + finalNote[0].length).trim()) return false
+    if (!lyricStart && visible.slice(0, notes[0].index).trim()) return false
+  }
+  return true
+}
+
+// An inline [singing] label is also explicit evidence for a single-line lyric.
+// Keep this private hint through the existing SDH cleanup, which removes that
+// label; never infer that an entire multi-line cue is a song.
+const SINGLE_LINE_SINGING_LYRIC = Symbol('single-line-singing-lyric')
+
+function isExplicitSingingLyric(value) {
+  const source = stripAssOverrideTags(value).trim()
+  return !source.includes('\n') &&
+    /^(?:[-–—]\s*)?(?:\[(?:singing|sings|song lyrics|lyrics)\]|\((?:singing|sings)\))\s*\S/i.test(source)
+}
+
 function cleanSdhCueText(value) {
-  const source = String(value == null ? '' : value)
+  const source = stripAssOverrideTags(value)
   let removed = 0
   let text = source.replace(/\[([^\]\n]{1,160})\]/g, (whole, label) => {
     if (!isSdhDescription(label)) return whole
@@ -77,10 +119,14 @@ function prepareCuesForTranslation(cues) {
     const cleaned = cleanSdhCueText(cue?.text)
     sdhRemoved += cleaned.removed
     if (!cleaned.text) continue
-    prepared.push({
+    const preparedCue = {
       ...cue,
       text: cleaned.text
-    })
+    }
+    if (isExplicitSingingLyric(cue?.text)) {
+      Object.defineProperty(preparedCue, SINGLE_LINE_SINGING_LYRIC, { value: true })
+    }
+    prepared.push(preparedCue)
   }
 
   return { cues: prepared, sdhRemoved }
@@ -102,6 +148,48 @@ function chunkCues(cues, maxItems = config.translationChunkItems, maxChars = con
   }
   if (current.length) chunks.push(current)
   return chunks
+}
+
+// Record original lyric text outside the Gemini payload. For cues containing
+// both song and speech, translate only the contiguous speech lines and put the
+// untouched lyric lines back in their original positions after translation.
+function separateLyricLines(cues) {
+  const translatable = []
+  const layouts = []
+  let skippedLyricLines = 0
+
+  for (const cue of cues) {
+    const lines = String(cue.text).split('\n')
+    const lyricLines = lines.map(line => isMarkedLyricLine(line))
+    if (cue[SINGLE_LINE_SINGING_LYRIC]) lyricLines[0] = true
+
+    if (!lyricLines.some(Boolean)) {
+      layouts.push([{ index: translatable.push(cue) - 1 }])
+      continue
+    }
+
+    const layout = []
+    let dialogue = []
+    const flushDialogue = () => {
+      if (!dialogue.length) return
+      layout.push({ index: translatable.push({ ...cue, text: dialogue.join('\n') }) - 1 })
+      dialogue = []
+    }
+
+    for (let i = 0; i < lines.length; i++) {
+      if (lyricLines[i]) {
+        flushDialogue()
+        layout.push({ literal: lines[i] })
+        skippedLyricLines++
+      } else {
+        dialogue.push(lines[i])
+      }
+    }
+    flushDialogue()
+    layouts.push(layout)
+  }
+
+  return { translatable, layouts, skippedLyricLines }
 }
 
 function extractGeminiText(body) {
@@ -492,8 +580,10 @@ function sumNumericMetrics(values) {
 }
 
 async function translateCues(cues, options = {}) {
-  const plan = createTranslationPlan(cues, options)
-  const chunks = chunkCues(cues, plan.maxItems, plan.maxChars)
+  const lyricProtection = separateLyricLines(cues)
+  const workCues = lyricProtection.translatable
+  const plan = createTranslationPlan(workCues, options)
+  const chunks = chunkCues(workCues, plan.maxItems, plan.maxChars)
   const concurrency = plan.concurrency
   const translateFn = options.translateTextsFn || translateTexts
   const results = new Array(chunks.length)
@@ -728,16 +818,16 @@ async function translateCues(cues, options = {}) {
 
   const translated = results.flat()
 
-  if (translated.length !== cues.length) {
+  if (translated.length !== workCues.length) {
     const error = new Error(
-      `Gemini translation count mismatch after chunk merge: expected ${cues.length}, got ${translated.length}`
+      `Gemini translation count mismatch after chunk merge: expected ${workCues.length}, got ${translated.length}`
     )
     error.smartsubsPerf = perfSnapshot()
     throw error
   }
 
   if (typeof options.onTranslationStats === 'function') {
-    const aggregate = aggregateTranslationStats(chunkStats, cues.length)
+    const aggregate = aggregateTranslationStats(chunkStats, workCues.length)
 
     await options.onTranslationStats({
       ...aggregate,
@@ -754,17 +844,20 @@ async function translateCues(cues, options = {}) {
       chunkItems: plan.maxItems,
       chunkChars: plan.maxChars,
       concurrency,
+      lyricLinesSkipped: lyricProtection.skippedLyricLines,
       ...perfSnapshot()
     })
   }
 
   return cues.map((cue, index) => ({
     ...cue,
-    text: translated[index]
+    text: lyricProtection.layouts[index]
+      .map(part => Object.hasOwn(part, 'literal') ? part.literal : translated[part.index])
+      .join('\n')
   }))
 }
 function cuesToVtt(cues) {
-  return `WEBVTT\n\n${cues.map(cue => `${cue.time}\n${cue.text}`).join('\n\n')}\n`
+  return `WEBVTT\n\n${cues.map(cue => `${cue.time}\n${stripAssOverrideTags(cue.text)}`).join('\n\n')}\n`
 }
 
 async function fetchSubtitleText(url, options = {}) {
@@ -850,6 +943,8 @@ module.exports = {
   parseTimedCues,
   isSdhDescription,
   cleanSdhCueText,
+  stripAssOverrideTags,
+  isMarkedLyricLine,
   prepareCuesForTranslation,
   chunkCues,
   extractGeminiText,
