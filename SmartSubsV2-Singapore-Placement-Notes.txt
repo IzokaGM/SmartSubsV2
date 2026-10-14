@@ -1,0 +1,18 @@
+SmartSubsV2 — Singapore placement trial
+Base: SmartSubsV2-main (5).zip
+Only change: wrangler.jsonc adds placement.region = aws:ap-southeast-1.
+Original Worker name, KV, Queue, rate-limit namespaces, Durable Object migrations,
+model, chunking, translation and cache settings are preserved from this repo.
+No files copied from VUEO or the other SmartSubs repository.
+
+Validation: npm run check passed; npm test passed all 225 tests.
+JSON parsed and every other configuration field checked identical to supplied base.
+All other source files remain byte-identical to the supplied base.
+Placement success has not been tested on this live worker.
+Placement hints affect web fetch handling, not Queue execution, and do not guarantee an outgoing IP.
+
+Apply this archive only to the matching SmartSubsV2 repository.
+Paths are relative to root; no enclosing folder and no YML.
+A successful apply workflow does not prove Cloudflare deployment.
+After deployment, retry configure using your Gemini key. Existing signed manifest/token URLs are unchanged.
+Rollback: remove the placement object and redeploy.

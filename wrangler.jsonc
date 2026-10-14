@@ -2,6 +2,9 @@
   "name": "smartsubsv2",
   "main": "src/cloudflare-worker.mjs",
   "compatibility_date": "2026-08-20",
+  "placement": {
+    "region": "aws:ap-southeast-1"
+  },
   "compatibility_flags": [
     "nodejs_compat"
   ],
